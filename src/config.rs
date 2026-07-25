@@ -91,6 +91,7 @@ pub struct Config {
     pub webhook_secret: String,
     pub webhook_retry_attempts: u32,
     pub webhook_retry_delay_ms: u64,
+    pub allowed_webhook_schemes: Vec<String>,
     /// Per-attempt timeout for outbound webhook POSTs, in seconds. Each
     /// delivery attempt is bounded independently, so a slow receiver can't
     /// hold up the retry loop (or the reconciler) for more than this value.
@@ -161,6 +162,7 @@ pub struct Config {
     /// `408 Request Timeout`, so a slow client or a stuck handler can't tie up
     /// a connection indefinitely. Defaults to 30 seconds.
     pub request_timeout_secs: u64,
+    pub allowed_webhook_schemes: Vec<String>
 }
 
 impl Config {
@@ -173,6 +175,15 @@ impl Config {
         let gateway_public =
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
+        let allowed_webhook_schemes: Vec<String> = {
+            let raw_schemes = std::env::var("ALLOWED_WEBHOOK_SCHEMES")
+                .unwrap_or_else(|_| "https".to_string());
+            raw_schemes
+                .split(',)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
 
         let cors_allowed_origins: Vec<String> = {
             let raw_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
@@ -219,6 +230,7 @@ impl Config {
                 }
             },
             webhook_secret,
+            allowed_webhook_schemes,
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000)?,
             webhook_timeout_secs: parse_env("WEBHOOK_TIMEOUT_SECS", 10)?,
