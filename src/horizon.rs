@@ -33,6 +33,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -67,6 +68,10 @@ pub struct HorizonPayment {
     /// processed token so polling resumes from it instead of re-scanning.
     #[serde(default)]
     pub paging_token: Option<String>,
+    /// RFC 3339 timestamp of the operation (ledger close time), used to
+    /// measure how far behind the poller/stream cursor is running.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -203,6 +208,14 @@ fn delta_str(a: &str, b: &str) -> Option<String> {
     Some(money::stroops_to_string((va - vb).abs()))
 }
 
+/// Seconds elapsed between an RFC 3339 timestamp and now. Used to observe
+/// cursor age (how stale the poller/stream cursor is) and settlement latency
+/// (how long an intent took to settle). Returns `None` if `ts` doesn't parse.
+fn elapsed_secs(ts: &str) -> Option<i64> {
+    let then = OffsetDateTime::parse(ts, &Rfc3339).ok()?;
+    Some((OffsetDateTime::now_utc() - then).whole_seconds())
+}
+
 /// Fetch the most recent payments into `account` from Horizon, newest first,
 /// with their transactions joined so memos are available.
 pub async fn fetch_recent_payments(
@@ -303,6 +316,14 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
                 Ok(false) => {}
                 Err(e) => warn!(error = %e, "failed to reconcile polled payment"),
             }
+        }
+
+        if let Some(cursor_age_secs) = page
+            .last()
+            .and_then(|hp| hp.created_at.as_deref())
+            .and_then(elapsed_secs)
+        {
+            info!(cursor_age_secs, "poller cursor advanced");
         }
 
         /* Checkpoint after the whole page is processed. If we crash mid-page the
@@ -453,7 +474,14 @@ async fn settle(
         }
         Ok(true) => {}
     }
-    info!(payment_id = %payment.id, status, %tx_hash, "payment settled");
+    let settlement_latency_secs = elapsed_secs(&payment.created_at);
+    info!(
+        payment_id = %payment.id,
+        status,
+        %tx_hash,
+        ?settlement_latency_secs,
+        "payment settled"
+    );
 
     // Reflect the new state in the copy we hand to the webhook.
     let mut settled = payment.clone();
@@ -665,6 +693,9 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
 
     match serde_json::from_str::<HorizonPayment>(&ev.data) {
         Ok(hp) => {
+            if let Some(cursor_age_secs) = hp.created_at.as_deref().and_then(elapsed_secs) {
+                info!(cursor_age_secs, "stream cursor advanced");
+            }
             if let Err(e) = reconcile_payment(state, &hp).await {
                 warn!(error = %e, "failed to reconcile streamed payment");
             }
@@ -710,6 +741,7 @@ mod tests {
                 memo_type: Some("text".into()),
             }),
             paging_token: Some("1".into()),
+            created_at: None,
         }
     }
 
@@ -860,6 +892,7 @@ mod tests {
                 memo_type: Some("text".into()),
             }),
             paging_token: Some("1".into()),
+            created_at: None,
         };
         assert!(matches!(
             verify(&p, &hp, &test_assets(), 0),
@@ -883,6 +916,7 @@ mod tests {
                 memo_type: Some("text".into()),
             }),
             paging_token: Some("1".into()),
+            created_at: None,
         };
         assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
         // Sanity: with the right issuer it would have matched.
