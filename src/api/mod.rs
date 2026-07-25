@@ -8,10 +8,10 @@ use axum::{
     Json,
 };
 use serde_json::json;
-use std::collections::HashMap;
+use moka::sync::Cache;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{
     cors::CorsLayer,
@@ -30,17 +30,39 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 #[derive(Clone)]
 pub struct AuthenticatedMerchant(pub String);
 
+/// Maximum number of distinct IP+bucket keys tracked at once.
+/// Once this is reached, moka evicts the least-recently-used entry,
+/// bounding resident memory regardless of key cardinality.
+const RATE_LIMITER_MAX_KEYS: u64 = 10_000;
+
+/// How long a per-key limiter is retained after its last access.
+/// Keys for IPs that go quiet are automatically reclaimed.
+const RATE_LIMITER_IDLE_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 struct RateLimitState {
     requests_per_sec: u32,
-    limiters: Arc<Mutex<HashMap<String, governor::DefaultDirectRateLimiter>>>,
+    /// Bounded, TTL-evicting cache of per-(bucket, IP) rate limiters.
+    ///
+    /// Replaces the previous `Mutex<HashMap<...>>`:
+    /// - Capacity is capped at `RATE_LIMITER_MAX_KEYS` entries (moka evicts
+    ///   via a W-TinyLFU policy when the cap is hit).
+    /// - Each entry expires `RATE_LIMITER_IDLE_TTL` after its last access,
+    ///   so limiter state for quiet IPs is automatically reclaimed.
+    /// - moka uses internal sharding, eliminating the single global lock that
+    ///   the old `Mutex` imposed.
+    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter>>,
 }
 
 impl RateLimitState {
     fn new(requests_per_sec: u32) -> Self {
+        let limiters = Cache::builder()
+            .max_capacity(RATE_LIMITER_MAX_KEYS)
+            .time_to_idle(RATE_LIMITER_IDLE_TTL)
+            .build();
         Self {
             requests_per_sec: requests_per_sec.max(1),
-            limiters: Arc::new(Mutex::new(HashMap::new())),
+            limiters,
         }
     }
 }
@@ -202,17 +224,19 @@ async fn rate_limit_middleware(
 ) -> axum::response::Response {
     if let Some(bucket) = rate_limited_bucket(&req) {
         let key = rate_limit_key(bucket, &req);
-        let limited = {
-            let mut map = rate_limit.limiters.lock().unwrap();
-            let limiter = map.entry(key).or_insert_with(|| {
-                governor::RateLimiter::direct(governor::Quota::per_second(
-                    NonZeroU32::new(rate_limit.requests_per_sec).unwrap(),
-                ))
+        let rps = rate_limit.requests_per_sec;
+        // `get_with` returns the existing limiter for this key or inserts a
+        // freshly-created one atomically. moka's internal sharding means this
+        // never needs a single global lock.
+        let limiter = rate_limit
+            .limiters
+            .get_with(key, move || {
+                Arc::new(governor::RateLimiter::direct(governor::Quota::per_second(
+                    NonZeroU32::new(rps).unwrap(),
+                )))
             });
-            limiter.check().is_err()
-        };
 
-        if limited {
+        if limiter.check().is_err() {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, HeaderValue::from_static("1"))],
