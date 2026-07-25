@@ -30,6 +30,10 @@ impl AppError {
     pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, code, message)
     }
+
+    pub fn unsupported_media_type(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, code, message)
+    }
 }
 
 impl IntoResponse for AppError {
@@ -71,19 +75,26 @@ where
             Ok(Json(value)) => Ok(JsonBody(value)),
             Err(rejection) => {
                 use axum::extract::rejection::JsonRejection;
-                let message = match &rejection {
-                    JsonRejection::JsonDataError(_) => {
-                        format!("invalid request body: {}", rejection.body_text())
-                    }
-                    JsonRejection::JsonSyntaxError(_) => {
-                        "request body contains malformed JSON".to_string()
-                    }
+                match &rejection {
+                    JsonRejection::JsonDataError(_) => Err(AppError::bad_request(
+                        "invalid_request",
+                        format!("invalid request body: {}", rejection.body_text()),
+                    )),
+                    JsonRejection::JsonSyntaxError(_) => Err(AppError::bad_request(
+                        "invalid_request",
+                        "request body contains malformed JSON",
+                    )),
                     JsonRejection::MissingJsonContentType(_) => {
-                        "Content-Type must be application/json".to_string()
+                        Err(AppError::unsupported_media_type(
+                            "unsupported_media_type",
+                            "Content-Type must be application/json",
+                        ))
                     }
-                    _ => "invalid request body".to_string(),
-                };
-                Err(AppError::bad_request("invalid_request", message))
+                    _ => Err(AppError::bad_request(
+                        "invalid_request",
+                        "invalid request body",
+                    )),
+                }
             }
         }
     }
