@@ -113,8 +113,22 @@ pub struct Config {
     /// exceed the worst-case inline delivery time
     /// (`webhook_retry_attempts * (webhook_timeout_secs + webhook_retry_delay_ms)`)
     /// so the worker never races a `dispatch()` call that is still in flight
-    /// for the same row.
+    /// for the same row. Acts as a hard floor under the exponential backoff
+    /// below — a row is never touched sooner than this, even on its very
+    /// first redrive attempt.
     pub webhook_redrive_grace_secs: i64,
+    /// Starting delay (seconds) of the exponential backoff applied to a
+    /// delivery's *redrive* attempts after it has failed at least once
+    /// (`initial * 2^(attempts-1)`, capped by `webhook_redrive_backoff_max_secs`).
+    /// A row that has never been attempted (`attempts == 0`, left behind by a
+    /// crash between insert and its first send) is exempt from this backoff
+    /// and is only gated by `webhook_redrive_grace_secs`. Set to `0` to
+    /// disable growth and redrive purely on the fixed grace window.
+    pub webhook_redrive_backoff_initial_secs: i64,
+    /// Upper bound (seconds) on the exponential backoff above, so a delivery
+    /// that has failed many times still gets retried at a bounded cadence
+    /// rather than being pushed further and further out.
+    pub webhook_redrive_backoff_max_secs: i64,
     pub poll_interval_secs: u64,
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
@@ -212,6 +226,11 @@ impl Config {
             webhook_redrive_concurrency: parse_env("WEBHOOK_REDRIVE_CONCURRENCY", 4)?,
             webhook_redrive_max_attempts: parse_env("WEBHOOK_REDRIVE_MAX_ATTEMPTS", 8)?,
             webhook_redrive_grace_secs: parse_env("WEBHOOK_REDRIVE_GRACE_SECS", 60)?,
+            webhook_redrive_backoff_initial_secs: parse_env(
+                "WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS",
+                30,
+            )?,
+            webhook_redrive_backoff_max_secs: parse_env("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS", 900)?,
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
@@ -274,6 +293,9 @@ impl Config {
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
     /// - `REQUEST_TIMEOUT_SECS == 0` → every request is aborted immediately
+    /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
+    ///   → the cap would silently override the starting delay, so backoff
+    ///   never actually grows
     fn validate_timing(&self) -> Result<()> {
         if self.poll_interval_secs == 0 {
             return Err(anyhow::anyhow!(
@@ -318,6 +340,16 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "REQUEST_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would abort every request immediately."
+            ));
+        }
+
+        if self.webhook_redrive_backoff_max_secs < self.webhook_redrive_backoff_initial_secs {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS ({}) must be >= WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS ({}). \
+                 With the current settings the cap would override the starting delay and backoff \
+                 would never actually grow.",
+                self.webhook_redrive_backoff_max_secs,
+                self.webhook_redrive_backoff_initial_secs
             ));
         }
 
@@ -396,6 +428,14 @@ impl std::fmt::Debug for Config {
                 "webhook_redrive_grace_secs",
                 &self.webhook_redrive_grace_secs,
             )
+            .field(
+                "webhook_redrive_backoff_initial_secs",
+                &self.webhook_redrive_backoff_initial_secs,
+            )
+            .field(
+                "webhook_redrive_backoff_max_secs",
+                &self.webhook_redrive_backoff_max_secs,
+            )
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("payment_ttl_secs", &self.payment_ttl_secs)
             .field(
@@ -464,6 +504,8 @@ mod tests {
             webhook_redrive_concurrency: 4,
             webhook_redrive_max_attempts: 8,
             webhook_redrive_grace_secs: 60,
+            webhook_redrive_backoff_initial_secs: 30,
+            webhook_redrive_backoff_max_secs: 900,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
@@ -533,6 +575,8 @@ mod tests {
             webhook_redrive_concurrency: 4,
             webhook_redrive_max_attempts: 8,
             webhook_redrive_grace_secs: 60,
+            webhook_redrive_backoff_initial_secs: 30,
+            webhook_redrive_backoff_max_secs: 900,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
@@ -831,6 +875,35 @@ mod tests {
         let mut cfg = timing_config();
         cfg.webhook_retry_attempts = 1;
         cfg.webhook_retry_delay_ms = 0; // no retries, so no burst
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn timing_rejects_backoff_max_below_initial() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = 300;
+        cfg.webhook_redrive_backoff_max_secs = 30;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS")
+                && err.contains("WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_allows_backoff_max_equal_to_initial() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = 30;
+        cfg.webhook_redrive_backoff_max_secs = 30;
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn timing_allows_zero_backoff_initial_to_disable_growth() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = 0;
+        cfg.webhook_redrive_backoff_max_secs = 0;
         assert!(cfg.validate_timing().is_ok());
     }
 

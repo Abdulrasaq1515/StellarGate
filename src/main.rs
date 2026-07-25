@@ -9,7 +9,7 @@ use stellargate::{
     config::{Config, ListenerMode},
     db, expiry, horizon,
     metrics::WebhookMetrics,
-    webhook, AppState,
+    webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
         http,
         webhook_http,
         webhook_metrics: WebhookMetrics::new(),
-        task_health: crate::TaskHealth::new(),
+        task_health: TaskHealth::new(),
     });
 
     if cfg.gateway_configured() {
@@ -152,10 +152,6 @@ async fn main() -> Result<()> {
         if let Some(h) = stream_handle {
             join_task!(h);
         }
-        join_task!(poller_handle);
-        join_task!(sweeper_handle);
-        join_task!(redrive_handle);
-        if let Some(h) = stream_handle { join_task!(h); }
     };
     if tokio::time::timeout(timeout, bg).await.is_err() {
         info!("background tasks did not finish within 30s; forcing exit");

@@ -31,6 +31,8 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         webhook_redrive_concurrency: 4,
         webhook_redrive_max_attempts: 8,
         webhook_redrive_grace_secs: 60,
+        webhook_redrive_backoff_initial_secs: 0,
+        webhook_redrive_backoff_max_secs: 0,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
         rate_limit_requests_per_sec,

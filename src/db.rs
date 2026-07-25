@@ -763,23 +763,40 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
 /// row never attempted) that a row must clear before being considered stuck
 /// rather than merely in flight — callers must size it comfortably above the
 /// worst-case inline delivery time so this worker never races a live
-/// `dispatch()` for the same row.
+/// `dispatch()` for the same row. It is also the hard floor under the
+/// exponential backoff below, so a row is never touched sooner than this
+/// regardless of `attempts`.
+///
+/// A row that has failed at least once (`attempts > 0`) additionally has to
+/// clear an exponential backoff — `backoff_initial_secs * 2^(attempts-1)`,
+/// capped at `backoff_max_secs` — before it is considered eligible again.
+/// A row with `attempts == 0` (left behind by a crash between insert and its
+/// first send, not a delivery failure) is exempt from this backoff and is
+/// gated by `grace_secs` alone.
 pub async fn list_redrivable_deliveries(
     pool: &Db,
     max_attempts: i64,
     grace_secs: i64,
+    backoff_initial_secs: i64,
+    backoff_max_secs: i64,
 ) -> Result<Vec<WebhookDelivery>> {
-    let grace_modifier = format!("-{grace_secs} seconds");
     let rows = sqlx::query(
         "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
          FROM webhook_deliveries
          WHERE status IN ('pending', 'failed')
            AND attempts < ?
-           AND COALESCE(last_attempt, created_at) <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)
+           AND datetime(COALESCE(last_attempt, created_at), '+' || (
+                 CASE WHEN attempts = 0 THEN ?
+                      ELSE MAX(?, MIN(? * (1 << MIN(attempts - 1, 32)), ?))
+                 END
+               ) || ' seconds') <= datetime('now')
          ORDER BY created_at ASC",
     )
     .bind(max_attempts)
-    .bind(&grace_modifier)
+    .bind(grace_secs)
+    .bind(grace_secs)
+    .bind(backoff_initial_secs)
+    .bind(backoff_max_secs)
     .fetch_all(pool)
     .await?;
 
@@ -1024,7 +1041,7 @@ mod tests {
         .await
         .unwrap();
 
-        let candidates = list_redrivable_deliveries(&pool, 8, 0).await.unwrap();
+        let candidates = list_redrivable_deliveries(&pool, 8, 0, 0, 0).await.unwrap();
         let ids: Vec<&str> = candidates.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1108,14 +1125,78 @@ mod tests {
             .unwrap();
 
         // Freshly inserted, so a large grace window makes it ineligible...
-        assert!(list_redrivable_deliveries(&pool, 8, 3600)
+        assert!(list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
             .await
             .unwrap()
             .is_empty());
         // ...while a zero grace window makes it immediately eligible.
         assert_eq!(
-            list_redrivable_deliveries(&pool, 8, 0).await.unwrap().len(),
+            list_redrivable_deliveries(&pool, 8, 0, 0, 0)
+                .await
+                .unwrap()
+                .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn list_redrivable_deliveries_exempts_never_attempted_rows_from_backoff() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOR3", 3600))
+            .await
+            .unwrap();
+        save_webhook_delivery(
+            &pool,
+            "crashed",
+            "p1",
+            "http://x",
+            "{}",
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+
+        // attempts == 0 (never sent) is gated by grace_secs alone, not the
+        // exponential backoff, even with a huge backoff floor configured.
+        assert_eq!(
+            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn list_redrivable_deliveries_backs_off_exponentially_after_a_failure() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOR4", 3600))
+            .await
+            .unwrap();
+        save_webhook_delivery(&pool, "flaky", "p1", "http://x", "{}", "payment.completed")
+            .await
+            .unwrap();
+        update_webhook_delivery(&pool, "flaky", "failed", 1)
+            .await
+            .unwrap();
+
+        // One failed attempt (attempts=1): backoff = initial * 2^0 = initial.
+        // A huge initial delay makes it ineligible even with grace_secs=0.
+        assert!(
+            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a row with a recent failure must wait out the backoff delay"
+        );
+        // grace_secs is a floor under the backoff: even with backoff disabled
+        // (initial=max=0), a large grace_secs still holds the row back.
+        assert!(
+            list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "grace_secs must floor eligibility even when backoff computes to 0"
         );
     }
 }

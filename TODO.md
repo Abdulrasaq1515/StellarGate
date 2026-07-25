@@ -38,7 +38,9 @@
   - redrive interval (`WEBHOOK_REDRIVE_INTERVAL_SECS`)
   - concurrency (`WEBHOOK_REDRIVE_CONCURRENCY`)
   - max attempts (`WEBHOOK_REDRIVE_MAX_ATTEMPTS`)
-  - backoff initial/max (`WEBHOOK_REDRIVE_GRACE_SECS` — the idle window before a stuck row is retried)
+  - grace window (`WEBHOOK_REDRIVE_GRACE_SECS` — the idle floor before a stuck row is retried)
+  - backoff initial/max (`WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` / `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS`,
+    issue #144 — exponential backoff for rows that have already failed at least once)
 
 ## Step 7: Tests
 - [x] Add test for “settle/poller not blocked by slow webhook”

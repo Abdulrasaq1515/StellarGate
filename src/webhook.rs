@@ -239,6 +239,8 @@ pub async fn redrive_once(state: &Arc<AppState>) -> usize {
         &state.pool,
         state.config.webhook_redrive_max_attempts as i64,
         state.config.webhook_redrive_grace_secs,
+        state.config.webhook_redrive_backoff_initial_secs,
+        state.config.webhook_redrive_backoff_max_secs,
     )
     .await
     {

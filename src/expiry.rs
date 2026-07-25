@@ -81,6 +81,8 @@ mod tests {
             webhook_redrive_concurrency: 4,
             webhook_redrive_max_attempts: 8,
             webhook_redrive_grace_secs: 60,
+            webhook_redrive_backoff_initial_secs: 0,
+            webhook_redrive_backoff_max_secs: 0,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 1000,
@@ -111,6 +113,7 @@ mod tests {
             http: reqwest::Client::new(),
             webhook_http: reqwest::Client::new(),
             webhook_metrics: crate::metrics::WebhookMetrics::new(),
+            task_health: crate::TaskHealth::new(),
         }
     }
 
