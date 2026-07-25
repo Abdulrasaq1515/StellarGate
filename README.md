@@ -144,6 +144,37 @@ signing, and the HTTP API (create, fetch, list/filter, validation).
 
 ## API Reference
 
+### Error codes
+
+All public error responses use the same envelope:
+
+```json
+{
+  "error": "A human-readable explanation",
+  "code": "stable_machine_readable_code"
+}
+```
+
+The `code` field is stable and should be handled programmatically. The table below documents the public error codes currently returned by the API.
+
+| Code | HTTP status | Meaning | Typical condition | Endpoints |
+|---|---|---|---|---|
+| `unauthorized` | `401 Unauthorized` | Missing or invalid authentication. | Missing or invalid `Authorization` header, invalid API key, or invalid admin secret. | `POST /merchants`, `POST /payments`, `GET /payments`, `GET /payments/:id/webhooks`, `POST /payments/:id/webhooks/:delivery_id/redeliver` |
+| `internal_error` | `500 Internal Server Error` | Unexpected server-side failure. | An internal error occurred while processing the request. | All endpoints that hit server-side execution paths |
+| `invalid_request` | `400 Bad Request` | The request body is invalid. | Malformed JSON, missing content type, or another deserialization failure. | `POST /payments` |
+| `unsupported_asset` | `400 Bad Request` | The requested asset is not accepted by the gateway. | The asset is not one of the configured accepted assets. | `POST /payments` |
+| `invalid_amount` | `400 Bad Request` | The amount is invalid. | The amount is not a positive decimal value with at most 7 decimal places. | `POST /payments` |
+| `invalid_webhook_url` | `400 Bad Request` | The webhook URL is invalid or rejected. | The webhook URL is not a valid URL or is rejected by the SSRF validation rules. | `POST /payments` |
+| `invalid_status` | `400 Bad Request` | The requested status filter is not valid. | The `status` query parameter is not one of the supported values. | `GET /payments` |
+| `invalid_cursor` | `400 Bad Request` | The pagination cursor is malformed. | The `cursor` query parameter cannot be decoded. | `GET /payments` |
+| `payment_not_found` | `404 Not Found` | The requested payment does not exist or is not owned by the caller. | The payment ID does not exist or belongs to a different merchant. | `GET /payments/:id`, `GET /payments/:id/webhooks` |
+| `delivery_not_found` | `404 Not Found` | The requested webhook delivery does not exist or is not related to the payment. | The delivery ID does not exist or does not belong to the payment. | `POST /payments/:id/webhooks/:delivery_id/redeliver` |
+| `rate_limit_exceeded` | `429 Too Many Requests` | The client exceeded the per-bucket rate limit. | Too many requests hit the same rate-limit bucket within the configured window. | `POST /payments`, `POST /merchants`, `POST /payments/:id/webhooks/:delivery_id/redeliver` |
+| `not_found` | `404 Not Found` | No matching route was found. | The request path does not match any known route. | Unmatched routes |
+| `webhook_target_blocked` | `400 Bad Request` | The redelivery target is not allowed. | The redelivery URL is blocked by the SSRF guard. | `POST /payments/:id/webhooks/:delivery_id/redeliver` |
+| `webhook_delivery_failed` | `502 Bad Gateway` | The webhook redelivery failed. | The downstream webhook endpoint returned a non-success response. | `POST /payments/:id/webhooks/:delivery_id/redeliver` |
+| `idempotency_conflict` | `500 Internal Server Error` | A concurrent create request conflicted on the same idempotency key. | Two concurrent `POST /payments` requests reused the same idempotency key. | `POST /payments` |
+
 ### `POST /merchants`
 
 Provision a new merchant and return its API key. This is an **admin-only**
