@@ -322,11 +322,16 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
 
     if origins.is_empty() {
         if cfg.network == "public" {
-            tracing::warn!(
+            tracing::error!(
                 "CORS_ALLOWED_ORIGINS is not set on a public-network deployment. \
-                 All origins are allowed — set CORS_ALLOWED_ORIGINS in production."
+                 Denying all origins by default."
             );
+            return CorsLayer::new();
         }
+        tracing::warn!(
+            "CORS_ALLOWED_ORIGINS is not set on a testnet deployment. \
+             Falling back to permissive CORS for development and test environments."
+        );
         return CorsLayer::permissive();
     }
 
