@@ -72,7 +72,6 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             horizon_url: String::new(),
             // A real-looking Stellar strkey so Config::validate_addresses passes.
             gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
-            gateway_secret: String::new(),
             accepted_assets,
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,

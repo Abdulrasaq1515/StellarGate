@@ -18,7 +18,6 @@ fn make_config() -> Config {
         network: "testnet".into(),
         horizon_url: String::new(),
         gateway_public: "UNCONFIGURED".into(),
-        gateway_secret: String::new(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
