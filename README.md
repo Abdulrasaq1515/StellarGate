@@ -68,7 +68,6 @@ cp .env.example .env
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet |
 | `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key (`G...`). Validated as a Stellar strkey at startup; an invalid value aborts boot. | — |
-| `STELLAR_GATEWAY_SECRET` | Your gateway wallet secret key | — |
 | `ACCEPTED_ASSETS` | Comma-separated assets to accept. Format: `CODE` for native (e.g. `XLM`) or `CODE:ISSUER` for non-native (e.g. `USDC:GISSUER`). Adding an asset is config-only — no code changes needed. Each `ISSUER` is validated as a Stellar strkey at startup. | `XLM,USDC:<testnet-issuer>` |
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the Horizon poller reconciles | `10` |
@@ -94,6 +93,12 @@ cp .env.example .env
 > The poller pages forward through payments from a cursor persisted in the
 > database, so it never misses an intent regardless of on-chain volume and
 > resumes from where it left off after a restart.
+>
+> The gateway never holds a secret key and never signs or submits Stellar
+> transactions — it only watches `STELLAR_GATEWAY_PUBLIC` for incoming payments.
+> Overpayment refunds are the merchant's responsibility, triggered by the
+> `payment.overpaid` webhook event (see below); the gateway does not perform them
+> automatically.
 
 ### Run
 

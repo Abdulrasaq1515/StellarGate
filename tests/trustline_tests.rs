@@ -40,7 +40,6 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             network: "testnet".into(),
             horizon_url,
             gateway_public: GATEWAY.into(),
-            gateway_secret: String::new(),
             accepted_assets: vec![
                 AcceptedAsset {
                     code: "XLM".into(),

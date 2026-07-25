@@ -8,10 +8,10 @@ use axum::{
     Json,
 };
 use serde_json::json;
-use std::collections::HashMap;
+use moka::sync::Cache;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{
     cors::CorsLayer,
@@ -30,17 +30,39 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 #[derive(Clone)]
 pub struct AuthenticatedMerchant(pub String);
 
+/// Maximum number of distinct IP+bucket keys tracked at once.
+/// Once this is reached, moka evicts the least-recently-used entry,
+/// bounding resident memory regardless of key cardinality.
+const RATE_LIMITER_MAX_KEYS: u64 = 10_000;
+
+/// How long a per-key limiter is retained after its last access.
+/// Keys for IPs that go quiet are automatically reclaimed.
+const RATE_LIMITER_IDLE_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 struct RateLimitState {
     requests_per_sec: u32,
-    limiters: Arc<Mutex<HashMap<String, governor::DefaultDirectRateLimiter>>>,
+    /// Bounded, TTL-evicting cache of per-(bucket, IP) rate limiters.
+    ///
+    /// Replaces the previous `Mutex<HashMap<...>>`:
+    /// - Capacity is capped at `RATE_LIMITER_MAX_KEYS` entries (moka evicts
+    ///   via a W-TinyLFU policy when the cap is hit).
+    /// - Each entry expires `RATE_LIMITER_IDLE_TTL` after its last access,
+    ///   so limiter state for quiet IPs is automatically reclaimed.
+    /// - moka uses internal sharding, eliminating the single global lock that
+    ///   the old `Mutex` imposed.
+    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter>>,
 }
 
 impl RateLimitState {
     fn new(requests_per_sec: u32) -> Self {
+        let limiters = Cache::builder()
+            .max_capacity(RATE_LIMITER_MAX_KEYS)
+            .time_to_idle(RATE_LIMITER_IDLE_TTL)
+            .build();
         Self {
             requests_per_sec: requests_per_sec.max(1),
-            limiters: Arc::new(Mutex::new(HashMap::new())),
+            limiters,
         }
     }
 }
@@ -204,15 +226,16 @@ async fn rate_limit_middleware(
         let key = rate_limit_key(bucket, &req);
         let limited = {
             let mut map = rate_limit.limiters.lock().unwrap();
+            let base_rps = rate_limit.requests_per_sec;
+            let effective_rps =
+                base_rps.saturating_mul(bucket_rate_multiplier(bucket)).max(1);
             let limiter = map.entry(key).or_insert_with(|| {
                 governor::RateLimiter::direct(governor::Quota::per_second(
-                    NonZeroU32::new(rate_limit.requests_per_sec).unwrap(),
+                    NonZeroU32::new(effective_rps).unwrap(),
                 ))
             });
-            limiter.check().is_err()
-        };
 
-        if limited {
+        if limiter.check().is_err() {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, HeaderValue::from_static("1"))],
@@ -228,22 +251,43 @@ async fn rate_limit_middleware(
     next.run(req).await
 }
 
-/// Identifies which rate-limit bucket (if any) a request falls into. Returns
-/// `None` for everything else, so unrelated routes aren't limited at all.
+/// Identifies which rate-limit bucket a request falls into.
+///
+/// Every request is assigned a bucket so all routes are protected by default.
+/// Write and sensitive routes use named buckets that receive the base quota
+/// (`requests_per_sec × 1`). Read-only routes fall into the `"default"` bucket
+/// which receives a more generous quota (`requests_per_sec × 5`) to avoid
+/// throttling normal polling.
 ///
 /// Redelivery is bucketed by shape rather than by path: the URL carries a
 /// payment and delivery id, and keying on those would let every id mint its
 /// own limiter entry — both an unbounded map and a trivially bypassed limit.
 fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
-    if req.method() != axum::http::Method::POST {
-        return None;
-    }
     let path = req.uri().path();
-    match path {
-        "/payments" => Some("payments"),
-        "/merchants" => Some("merchants"),
-        _ if path.starts_with("/payments/") && path.ends_with("/redeliver") => Some("redeliver"),
-        _ => None,
+    if req.method() == axum::http::Method::POST {
+        return match path {
+            "/payments" => Some("payments"),
+            "/merchants" => Some("merchants"),
+            _ if path.starts_with("/payments/") && path.ends_with("/redeliver") => {
+                Some("redeliver")
+            }
+            _ => Some("default"),
+        };
+    }
+    // All non-POST requests (GET, etc.) fall into the default bucket so that
+    // payment enumeration, webhook listing, and health/ready probes are all
+    // covered by a baseline limit.
+    Some("default")
+}
+
+/// Returns the rate multiplier for a bucket.
+///
+/// Write/sensitive buckets get the base rate (× 1). Read-only traffic gets a
+/// higher allowance (× 5) so normal API consumers aren't throttled by polling.
+fn bucket_rate_multiplier(bucket: &str) -> u32 {
+    match bucket {
+        "payments" | "merchants" | "redeliver" => 1,
+        _ => 5,
     }
 }
 

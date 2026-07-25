@@ -85,7 +85,6 @@ pub struct Config {
     pub network: String,
     pub horizon_url: String,
     pub gateway_public: String,
-    pub gateway_secret: String,
     /// Assets the gateway will accept, validated on POST /payments and in verify().
     /// Configure via ACCEPTED_ASSETS=XLM,USDC:GISSUER (comma-separated).
     pub accepted_assets: Vec<AcceptedAsset>,
@@ -159,10 +158,6 @@ impl Config {
             .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
         let gateway_public =
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
-        let gateway_secret = Self::validate_gateway_secret(
-            std::env::var("STELLAR_GATEWAY_SECRET").unwrap_or_default(),
-            &gateway_public,
-        )?;
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
 
         let cors_allowed_origins: Vec<String> = {
@@ -201,7 +196,6 @@ impl Config {
             network,
             horizon_url,
             gateway_public,
-            gateway_secret,
             accepted_assets: {
                 let raw = std::env::var("ACCEPTED_ASSETS").unwrap_or_default();
                 if raw.is_empty() {
@@ -371,45 +365,6 @@ impl Config {
 
         Ok(secret)
     }
-
-    /// Validate `STELLAR_GATEWAY_SECRET` at boot.
-    ///
-    /// - Empty is allowed when the gateway public key is also unconfigured
-    ///   (development / read-only mode).
-    /// - The placeholder value from `.env.example` (`SXXX…` or `REPLACE_ME_*`) is always
-    ///   rejected — it would silently sign nothing but gives operators false
-    ///   confidence that the key is set.
-    fn validate_gateway_secret(secret: String, gateway_public: &str) -> Result<String> {
-        let configured = !gateway_public.is_empty() && gateway_public != "UNCONFIGURED";
-
-        // Reject the classic .env.example placeholder: starts with 'S' and
-        // the rest are all 'X's (e.g. SXXXXXXX…56 chars).
-        if !secret.is_empty() && secret.starts_with('S') && secret.chars().skip(1).all(|c| c == 'X') {
-            return Err(anyhow::anyhow!(
-                "STELLAR_GATEWAY_SECRET is set to a placeholder value from .env.example. \
-                 Replace it with your real Stellar secret key."
-            ));
-        }
-
-        // Reject any REPLACE_ME_ placeholder.
-        if secret.starts_with("REPLACE_ME_") {
-            return Err(anyhow::anyhow!(
-                "STELLAR_GATEWAY_SECRET is set to a placeholder value ({:?}). \
-                 Replace it with your real Stellar secret key.",
-                secret
-            ));
-        }
-
-        // If a real public key has been configured, a secret key must also be present.
-        if configured && secret.is_empty() {
-            return Err(anyhow::anyhow!(
-                "STELLAR_GATEWAY_SECRET is required when STELLAR_GATEWAY_PUBLIC is set. \
-                 Set STELLAR_GATEWAY_SECRET to the corresponding secret key."
-            ));
-        }
-
-        Ok(secret)
-    }
 }
 
 impl std::fmt::Debug for Config {
@@ -420,7 +375,6 @@ impl std::fmt::Debug for Config {
             .field("network", &self.network)
             .field("horizon_url", &self.horizon_url)
             .field("gateway_public", &self.gateway_public)
-            .field("gateway_secret", &"***")
             .field("accepted_assets", &self.accepted_assets)
             .field("webhook_secret", &"***")
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
@@ -501,7 +455,6 @@ mod tests {
             network: "testnet".into(),
             horizon_url: "https://horizon-testnet.stellar.org".into(),
             gateway_public: "GPUBLIC".into(),
-            gateway_secret: "super-secret-key".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "webhook-hmac-secret".into(),
             webhook_retry_attempts: 3,
@@ -523,10 +476,6 @@ mod tests {
             request_timeout_secs: 30,
         };
         let output = format!("{cfg:?}");
-        assert!(
-            !output.contains("super-secret-key"),
-            "gateway_secret must not appear in Debug output"
-        );
         assert!(
             !output.contains("webhook-hmac-secret"),
             "webhook_secret must not appear in Debug output"
@@ -575,7 +524,6 @@ mod tests {
             network: "testnet".into(),
             horizon_url: "https://horizon-testnet.stellar.org".into(),
             gateway_public: "UNCONFIGURED".into(),
-            gateway_secret: String::new(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: String::new(),
             webhook_retry_attempts: 3,
@@ -937,46 +885,5 @@ mod tests {
             err.contains("streem"),
             "error should echo the bad value; got: {err}"
         );
-    }
-
-    // ── validate_gateway_secret ──────────────────────────────────────────────
-
-    #[test]
-    fn gateway_secret_empty_allowed_when_unconfigured() {
-        let res = Config::validate_gateway_secret(String::new(), "UNCONFIGURED");
-        assert!(res.is_ok());
-    }
-
-    #[test]
-    fn gateway_secret_placeholder_rejected() {
-        let placeholder = "S".to_string() + &"X".repeat(55);
-        let err = Config::validate_gateway_secret(placeholder, "UNCONFIGURED")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("placeholder value"), "got: {err}");
-    }
-
-    #[test]
-    fn gateway_secret_required_when_public_key_set() {
-        let err = Config::validate_gateway_secret(
-            String::new(),
-            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("STELLAR_GATEWAY_SECRET is required"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn gateway_secret_valid_accepted() {
-        // A real-looking secret key (not all-X after S)
-        let res = Config::validate_gateway_secret(
-            "SCZANGBA5RLKJHTBF4RJNRJMZWI4VKTHCRKOVAH7LRZZPZHHZWATAWBN".into(),
-            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
-        );
-        assert!(res.is_ok());
     }
 }

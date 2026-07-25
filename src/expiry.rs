@@ -72,7 +72,6 @@ mod tests {
             network: "testnet".into(),
             horizon_url: String::new(),
             gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
-            gateway_secret: String::new(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,
