@@ -68,7 +68,6 @@ cp .env.example .env
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet |
 | `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key (`G...`). Validated as a Stellar strkey at startup; an invalid value aborts boot. | — |
-| `STELLAR_GATEWAY_SECRET` | Your gateway wallet secret key | — |
 | `ACCEPTED_ASSETS` | Comma-separated assets to accept. Format: `CODE` for native (e.g. `XLM`) or `CODE:ISSUER` for non-native (e.g. `USDC:GISSUER`). Adding an asset is config-only — no code changes needed. Each `ISSUER` is validated as a Stellar strkey at startup. | `XLM,USDC:<testnet-issuer>` |
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the Horizon poller reconciles | `10` |
@@ -77,9 +76,16 @@ cp .env.example .env
 | `WEBHOOK_RETRY_ATTEMPTS` | Webhook delivery attempts | `3` |
 | `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
 | `WEBHOOK_TIMEOUT_SECS` | Per-attempt timeout (seconds) for outbound webhook POSTs. Each retry is bounded independently; a slow receiver cannot block the reconciler for longer than this value × retries. | `10` |
+| `WEBHOOK_REDRIVE_INTERVAL_SECS` | How often the background redrive worker scans for stuck webhook deliveries (rows left `pending`/`failed` by a process that exited mid-delivery). Its first pass runs immediately on startup, so a restart redrives without waiting a full interval. | `30` |
+| `WEBHOOK_REDRIVE_CONCURRENCY` | Maximum redrive HTTP attempts in flight at once. | `4` |
+| `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | Total attempts (inline + redrive) before a delivery is left `failed` permanently. | `8` |
+| `WEBHOOK_REDRIVE_GRACE_SECS` | How long (seconds) a delivery must sit idle since its last attempt before the redrive worker will touch it, so it never races a still-in-flight inline delivery for the same row. Also the floor under the backoff below. | `60` |
+| `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Starting delay (seconds) of the exponential backoff applied to redrive attempts once a delivery has failed at least once (`initial * 2^(attempts-1)`, capped by `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS`). A row never attempted (crash before its first send) is exempt and gated by `WEBHOOK_REDRIVE_GRACE_SECS` alone. Set to `0` to disable growth. | `30` |
+| `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Upper bound (seconds) on the backoff above. Must be `>= WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`. | `900` |
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` | Bypasses the SSRF guard's loopback/link-local/private/reserved IP check on `webhook_url` (still requires http(s) and a resolvable host). For local development and tests only — never enable in production. | `false` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` and `POST /merchants` (requests per second per IP, tracked independently per route) | `10` |
+| `REQUEST_TIMEOUT_SECS` | Per-request timeout for the whole API. A request without a response within this window is aborted with `408 Request Timeout`. | `30` |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite connection pool size. WAL mode allows one writer + many concurrent readers. | `10` |
 | `DB_BUSY_TIMEOUT_MS` | How long (ms) SQLite waits to acquire a write lock before returning an error. Must be `> 0` under concurrent load. | `5000` |
 | `ADMIN_PROVISIONING_SECRET` | Shared secret required via the `X-Admin-Secret` header to call `POST /merchants`. Unset disables provisioning entirely (every request gets `401`). | _(unset — provisioning disabled)_ |
@@ -89,6 +95,12 @@ cp .env.example .env
 > The poller pages forward through payments from a cursor persisted in the
 > database, so it never misses an intent regardless of on-chain volume and
 > resumes from where it left off after a restart.
+>
+> The gateway never holds a secret key and never signs or submits Stellar
+> transactions — it only watches `STELLAR_GATEWAY_PUBLIC` for incoming payments.
+> Overpayment refunds are the merchant's responsibility, triggered by the
+> `payment.overpaid` webhook event (see below); the gateway does not perform them
+> automatically.
 
 ### Run
 
@@ -131,6 +143,37 @@ Tests cover amount/stroops handling, Horizon payment verification, webhook
 signing, and the HTTP API (create, fetch, list/filter, validation).
 
 ## API Reference
+
+### Error codes
+
+All public error responses use the same envelope:
+
+```json
+{
+  "error": "A human-readable explanation",
+  "code": "stable_machine_readable_code"
+}
+```
+
+The `code` field is stable and should be handled programmatically. The table below documents the public error codes currently returned by the API.
+
+| Code | HTTP status | Meaning | Typical condition | Endpoints |
+|---|---|---|---|---|
+| `unauthorized` | `401 Unauthorized` | Missing or invalid authentication. | Missing or invalid `Authorization` header, invalid API key, or invalid admin secret. | `POST /merchants`, `POST /payments`, `GET /payments`, `GET /payments/:id/webhooks`, `POST /payments/:id/webhooks/:delivery_id/redeliver` |
+| `internal_error` | `500 Internal Server Error` | Unexpected server-side failure. | An internal error occurred while processing the request. | All endpoints that hit server-side execution paths |
+| `invalid_request` | `400 Bad Request` | The request body is invalid. | Malformed JSON, missing content type, or another deserialization failure. | `POST /payments` |
+| `unsupported_asset` | `400 Bad Request` | The requested asset is not accepted by the gateway. | The asset is not one of the configured accepted assets. | `POST /payments` |
+| `invalid_amount` | `400 Bad Request` | The amount is invalid. | The amount is not a positive decimal value with at most 7 decimal places. | `POST /payments` |
+| `invalid_webhook_url` | `400 Bad Request` | The webhook URL is invalid or rejected. | The webhook URL is not a valid URL or is rejected by the SSRF validation rules. | `POST /payments` |
+| `invalid_status` | `400 Bad Request` | The requested status filter is not valid. | The `status` query parameter is not one of the supported values. | `GET /payments` |
+| `invalid_cursor` | `400 Bad Request` | The pagination cursor is malformed. | The `cursor` query parameter cannot be decoded. | `GET /payments` |
+| `payment_not_found` | `404 Not Found` | The requested payment does not exist or is not owned by the caller. | The payment ID does not exist or belongs to a different merchant. | `GET /payments/:id`, `GET /payments/:id/webhooks` |
+| `delivery_not_found` | `404 Not Found` | The requested webhook delivery does not exist or is not related to the payment. | The delivery ID does not exist or does not belong to the payment. | `POST /payments/:id/webhooks/:delivery_id/redeliver` |
+| `rate_limit_exceeded` | `429 Too Many Requests` | The client exceeded the per-bucket rate limit. | Too many requests hit the same rate-limit bucket within the configured window. | `POST /payments`, `POST /merchants`, `POST /payments/:id/webhooks/:delivery_id/redeliver` |
+| `not_found` | `404 Not Found` | No matching route was found. | The request path does not match any known route. | Unmatched routes |
+| `webhook_target_blocked` | `400 Bad Request` | The redelivery target is not allowed. | The redelivery URL is blocked by the SSRF guard. | `POST /payments/:id/webhooks/:delivery_id/redeliver` |
+| `webhook_delivery_failed` | `502 Bad Gateway` | The webhook redelivery failed. | The downstream webhook endpoint returned a non-success response. | `POST /payments/:id/webhooks/:delivery_id/redeliver` |
+| `idempotency_conflict` | `500 Internal Server Error` | A concurrent create request conflicted on the same idempotency key. | Two concurrent `POST /payments` requests reused the same idempotency key. | `POST /payments` |
 
 ### `POST /merchants`
 
@@ -374,10 +417,9 @@ Fired when a payment is received but falls short of the requested amount. `delta
 }
 ```
 
-Event types: `payment.success` (paid in full), `payment.failed` (underpaid or
-verification failed), and `payment.expired` (the intent's TTL elapsed before
-payment arrived). The `event` field carries the type; `status` carries the
-matching payment status.
+**See [WEBHOOK_REFERENCE.md](WEBHOOK_REFERENCE.md) for the canonical webhook documentation**, including all event types, signature verification, and integration examples.
+
+⚠️ **Event types in code:** `payment.completed` (paid in full), `payment.overpaid` (excess payment), `payment.underpaid` (shortfall remaining), and `payment.expired` (TTL elapsed). The `event` field in the signed body carries the authoritative type.
 
 ### Verifying webhooks
 
@@ -457,7 +499,7 @@ src/
 ├── strkey.rs        # Stellar address (strkey) validation
 ├── horizon.rs       # Horizon polling listener + payment verification
 ├── expiry.rs        # Background sweeper that expires overdue pending intents
-├── webhook.rs       # HMAC-SHA256 signed webhook dispatch
+├── webhook.rs       # HMAC-SHA256 signed webhook dispatch + background redrive worker
 └── api/
     ├── mod.rs       # Axum router, layers (CORS/trace/body-limit), 404 fallback
     └── payments.rs  # Payment handlers (create, get, list)
@@ -480,7 +522,7 @@ sqlx records applied migrations in a `_sqlx_migrations` table so each file is ru
 
 ## Contributing
 
-This project is open to contributors. See the [Wave Program](https://github.com/StellarGateLabs/StellarGate/issues) for scoped issues you can pick up.
+This project is open to contributors. See the [Wave Program](https://github.com/StellarGateLabs/StellarGate/issues) for scoped issues you can pick up, and read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, standards, and the PR process. Participation is governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 **To contribute:**
 
@@ -489,6 +531,8 @@ This project is open to contributors. See the [Wave Program](https://github.com/
 3. Make your changes and add tests
 4. Run `cargo test` — all tests must pass
 5. Open a pull request
+
+Found a security vulnerability? Please report it privately — see [SECURITY.md](SECURITY.md).
 
 ## License
 

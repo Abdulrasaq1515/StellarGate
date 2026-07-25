@@ -8,14 +8,16 @@ use axum::{
     Json,
 };
 use serde_json::json;
-use std::collections::HashMap;
+use moka::sync::Cache;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 
@@ -28,17 +30,39 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 #[derive(Clone)]
 pub struct AuthenticatedMerchant(pub String);
 
+/// Maximum number of distinct IP+bucket keys tracked at once.
+/// Once this is reached, moka evicts the least-recently-used entry,
+/// bounding resident memory regardless of key cardinality.
+const RATE_LIMITER_MAX_KEYS: u64 = 10_000;
+
+/// How long a per-key limiter is retained after its last access.
+/// Keys for IPs that go quiet are automatically reclaimed.
+const RATE_LIMITER_IDLE_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 struct RateLimitState {
     requests_per_sec: u32,
-    limiters: Arc<Mutex<HashMap<String, governor::DefaultDirectRateLimiter>>>,
+    /// Bounded, TTL-evicting cache of per-(bucket, IP) rate limiters.
+    ///
+    /// Replaces the previous `Mutex<HashMap<...>>`:
+    /// - Capacity is capped at `RATE_LIMITER_MAX_KEYS` entries (moka evicts
+    ///   via a W-TinyLFU policy when the cap is hit).
+    /// - Each entry expires `RATE_LIMITER_IDLE_TTL` after its last access,
+    ///   so limiter state for quiet IPs is automatically reclaimed.
+    /// - moka uses internal sharding, eliminating the single global lock that
+    ///   the old `Mutex` imposed.
+    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter>>,
 }
 
 impl RateLimitState {
     fn new(requests_per_sec: u32) -> Self {
+        let limiters = Cache::builder()
+            .max_capacity(RATE_LIMITER_MAX_KEYS)
+            .time_to_idle(RATE_LIMITER_IDLE_TTL)
+            .build();
         Self {
             requests_per_sec: requests_per_sec.max(1),
-            limiters: Arc::new(Mutex::new(HashMap::new())),
+            limiters,
         }
     }
 }
@@ -46,11 +70,13 @@ impl RateLimitState {
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
     let rate_limit = RateLimitState::new(state.config.rate_limit_requests_per_sec);
+    let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
     axum::Router::new()
-        .route("/", get(|| async { "StellarGate API v0.1.0" }))
+        .route("/", get(|| async { concat!("StellarGate API v", env!("CARGO_PKG_VERSION")) }))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics_handler))
         /* Merchant provisioning — returns a one-time plaintext API key. Gated
         behind ADMIN_PROVISIONING_SECRET so it can't be used to mint
         unlimited credentials anonymously. */
@@ -92,14 +118,28 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             rate_limit_middleware,
         ))
         .layer(cors)
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        ))
         .with_state(state)
 }
 
+/// Authenticates via the `Authorization: Bearer <key>` header, injecting
+/// [`AuthenticatedMerchant`] into request extensions on success.
+///
+/// Every outcome is both logged (`source_ip` + `reason`, at a level matched
+/// to severity — failures visible by default, success at `debug` to avoid
+/// flooding logs) and counted in `AuthMetrics` (issue #139), so
+/// credential-stuffing or a misconfigured client shows up in logs/metrics
+/// instead of silently returning 401s.
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut req: Request,
     next: Next,
 ) -> axum::response::Response {
+    let source_ip = client_ip_key(&req);
+
     let raw_key = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -110,6 +150,12 @@ async fn auth_middleware(
         .map(str::to_string);
 
     let Some(key) = raw_key else {
+        tracing::warn!(
+            %source_ip,
+            reason = "missing_key",
+            "auth denied: missing or malformed Authorization header"
+        );
+        state.auth_metrics.record_failure_missing_key();
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "missing or invalid Authorization header", "code": "unauthorized" })),
@@ -119,20 +165,34 @@ async fn auth_middleware(
 
     match db::find_merchant_by_key(&state.pool, &key).await {
         Ok(Some(merchant_id)) => {
+            tracing::debug!(%source_ip, %merchant_id, "auth succeeded");
+            state.auth_metrics.record_success();
             req.extensions_mut()
                 .insert(AuthenticatedMerchant(merchant_id));
             next.run(req).await
         }
-        Ok(None) => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "invalid API key", "code": "unauthorized" })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "internal server error", "code": "internal_error" })),
-        )
-            .into_response(),
+        Ok(None) => {
+            tracing::warn!(
+                %source_ip,
+                reason = "invalid_key",
+                "auth denied: API key did not match any merchant"
+            );
+            state.auth_metrics.record_failure_invalid_key();
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid API key", "code": "unauthorized" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(%source_ip, error = %e, "auth errored: merchant key lookup failed");
+            state.auth_metrics.record_failure_internal_error();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal server error", "code": "internal_error" })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -196,15 +256,16 @@ async fn rate_limit_middleware(
         let key = rate_limit_key(bucket, &req);
         let limited = {
             let mut map = rate_limit.limiters.lock().unwrap();
+            let base_rps = rate_limit.requests_per_sec;
+            let effective_rps =
+                base_rps.saturating_mul(bucket_rate_multiplier(bucket)).max(1);
             let limiter = map.entry(key).or_insert_with(|| {
                 governor::RateLimiter::direct(governor::Quota::per_second(
-                    NonZeroU32::new(rate_limit.requests_per_sec).unwrap(),
+                    NonZeroU32::new(effective_rps).unwrap(),
                 ))
             });
-            limiter.check().is_err()
-        };
 
-        if limited {
+        if limiter.check().is_err() {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, HeaderValue::from_static("1"))],
@@ -220,22 +281,43 @@ async fn rate_limit_middleware(
     next.run(req).await
 }
 
-/// Identifies which rate-limit bucket (if any) a request falls into. Returns
-/// `None` for everything else, so unrelated routes aren't limited at all.
+/// Identifies which rate-limit bucket a request falls into.
+///
+/// Every request is assigned a bucket so all routes are protected by default.
+/// Write and sensitive routes use named buckets that receive the base quota
+/// (`requests_per_sec × 1`). Read-only routes fall into the `"default"` bucket
+/// which receives a more generous quota (`requests_per_sec × 5`) to avoid
+/// throttling normal polling.
 ///
 /// Redelivery is bucketed by shape rather than by path: the URL carries a
 /// payment and delivery id, and keying on those would let every id mint its
 /// own limiter entry — both an unbounded map and a trivially bypassed limit.
 fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
-    if req.method() != axum::http::Method::POST {
-        return None;
-    }
     let path = req.uri().path();
-    match path {
-        "/payments" => Some("payments"),
-        "/merchants" => Some("merchants"),
-        _ if path.starts_with("/payments/") && path.ends_with("/redeliver") => Some("redeliver"),
-        _ => None,
+    if req.method() == axum::http::Method::POST {
+        return match path {
+            "/payments" => Some("payments"),
+            "/merchants" => Some("merchants"),
+            _ if path.starts_with("/payments/") && path.ends_with("/redeliver") => {
+                Some("redeliver")
+            }
+            _ => Some("default"),
+        };
+    }
+    // All non-POST requests (GET, etc.) fall into the default bucket so that
+    // payment enumeration, webhook listing, and health/ready probes are all
+    // covered by a baseline limit.
+    Some("default")
+}
+
+/// Returns the rate multiplier for a bucket.
+///
+/// Write/sensitive buckets get the base rate (× 1). Read-only traffic gets a
+/// higher allowance (× 5) so normal API consumers aren't throttled by polling.
+fn bucket_rate_multiplier(bucket: &str) -> u32 {
+    match bucket {
+        "payments" | "merchants" | "redeliver" => 1,
+        _ => 5,
     }
 }
 
@@ -270,11 +352,16 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
 
     if origins.is_empty() {
         if cfg.network == "public" {
-            tracing::warn!(
+            tracing::error!(
                 "CORS_ALLOWED_ORIGINS is not set on a public-network deployment. \
-                 All origins are allowed — set CORS_ALLOWED_ORIGINS in production."
+                 Denying all origins by default."
             );
+            return CorsLayer::new();
         }
+        tracing::warn!(
+            "CORS_ALLOWED_ORIGINS is not set on a testnet deployment. \
+             Falling back to permissive CORS for development and test environments."
+        );
         return CorsLayer::permissive();
     }
 
@@ -306,15 +393,66 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
+/// Readiness probe — returns 200 only when both the database AND Horizon are
+/// reachable. A pod that cannot reach Horizon cannot detect on-chain payments;
+/// routing traffic to it is worse than routing it elsewhere (issue #172).
+///
+/// Uses a 3-second timeout on the Horizon check so a slow node never hangs
+/// the probe. The check is skipped when no gateway is configured
+/// (STELLAR_GATEWAY_PUBLIC=UNCONFIGURED) since without a gateway there is no
+/// on-chain work to do.
 async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match db::ping(&state.pool).await {
-        Ok(()) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
-        Err(_) => (
+    // 1. Database must respond.
+    if db::ping(&state.pool).await.is_err() {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "unavailable" })),
+            Json(json!({ "status": "unavailable", "reason": "database unreachable" })),
         )
-            .into_response(),
+            .into_response();
     }
+
+    // 2. Horizon must respond (only when a gateway wallet is configured).
+    if state.config.gateway_configured() {
+        if let Err(reason) = check_horizon_ready(&state).await {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "status": "unavailable", "reason": reason })),
+            )
+                .into_response();
+        }
+    }
+
+    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
+}
+
+/// Probe Horizon with a hard 3-second timeout.
+/// Returns Ok(()) when reachable (any non-5xx response), or an error string.
+async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
+    let url = state.config.horizon_url.trim_end_matches('/').to_string();
+    let result = tokio::time::timeout(
+        Duration::from_millis(3_000),
+        state.http.get(&url).header("Accept", "application/json").send(),
+    )
+    .await;
+    match result {
+        Ok(Ok(resp)) if resp.status().as_u16() < 500 => Ok(()),
+        Ok(Ok(resp)) => Err(format!("Horizon returned {}", resp.status())),
+        Ok(Err(e))   => Err(format!("Horizon unreachable: {e}")),
+        Err(_)       => Err("Horizon health check timed out".to_string()),
+    }
+}
+
+/// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let body = crate::metrics::render(&state.webhook_metrics, &state.auth_metrics);
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        body,
+    )
 }
 
 async fn not_found() -> impl IntoResponse {
@@ -322,4 +460,43 @@ async fn not_found() -> impl IntoResponse {
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "not found", "code": "not_found" })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum_test::TestServer;
+    use tower_http::timeout::TimeoutLayer;
+
+    /// Exercises the exact `TimeoutLayer` construction used in `router()`,
+    /// against a router small enough to run with millisecond durations —
+    /// `request_timeout_secs` itself is whole seconds, too coarse for a fast test.
+    fn timeout_test_router(timeout: Duration) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }),
+            )
+            .route("/fast", get(|| async { "ok" }))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                timeout,
+            ))
+    }
+
+    #[tokio::test]
+    async fn slow_handler_is_aborted_with_408() {
+        let server = TestServer::new(timeout_test_router(Duration::from_millis(20))).unwrap();
+        let response = server.get("/slow").await;
+        response.assert_status(StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn fast_handler_is_unaffected() {
+        let server = TestServer::new(timeout_test_router(Duration::from_millis(200))).unwrap();
+        let response = server.get("/fast").await;
+        response.assert_status_ok();
+    }
 }

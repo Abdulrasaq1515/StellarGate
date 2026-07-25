@@ -21,13 +21,18 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
         horizon_url: String::new(),
-        gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
-        gateway_secret: String::new(),
+        gateway_public: "UNCONFIGURED".into(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
         webhook_timeout_secs: 10,
+        webhook_redrive_interval_secs: 30,
+        webhook_redrive_concurrency: 4,
+        webhook_redrive_max_attempts: 8,
+        webhook_redrive_grace_secs: 60,
+        webhook_redrive_backoff_initial_secs: 0,
+        webhook_redrive_backoff_max_secs: 0,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
         rate_limit_requests_per_sec,
@@ -37,6 +42,7 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         listener_mode: ListenerMode::Poll,
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
+        request_timeout_secs: 30,
     }
 }
 
@@ -58,6 +64,9 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         config: cfg,
         http,
         webhook_http: reqwest::Client::new(),
+        webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
+        auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
     (TestServer::new(router).unwrap(), pool)

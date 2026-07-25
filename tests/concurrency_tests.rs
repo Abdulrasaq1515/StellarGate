@@ -72,12 +72,17 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             horizon_url: String::new(),
             // A real-looking Stellar strkey so Config::validate_addresses passes.
             gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
-            gateway_secret: String::new(),
             accepted_assets,
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,
             webhook_retry_delay_ms: 0,
             webhook_timeout_secs: 10,
+            webhook_redrive_interval_secs: 30,
+            webhook_redrive_concurrency: 4,
+            webhook_redrive_max_attempts: 8,
+            webhook_redrive_grace_secs: 60,
+            webhook_redrive_backoff_initial_secs: 0,
+            webhook_redrive_backoff_max_secs: 0,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10000,
@@ -88,9 +93,13 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             // Allow loopback targets so we can use wiremock's 127.0.0.1 server.
             webhook_allow_private_targets: true,
             admin_provisioning_secret: String::new(),
+            request_timeout_secs: 30,
         },
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
+        webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
+        auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        task_health: stellargate::TaskHealth::new(),
     })
 }
 
@@ -129,6 +138,7 @@ fn make_horizon_payment() -> HorizonPayment {
         transaction: Some(TransactionRef {
             memo: Some("ABCD1234".into()),
             memo_type: Some("text".into()),
+            successful: Some(true),
         }),
         paging_token: Some("1".into()),
     }
@@ -221,8 +231,8 @@ async fn double_concurrent_reconcile_settles_exactly_once() {
 }
 
 /// A second `reconcile_payment` call for a transaction whose intent is already
-/// `completed` must be a no-op: the tx_hash equality guard inside
-/// `reconcile_payment` catches re-processing of the same record.
+/// `completed` must be a no-op: a completed intent is no longer watchable, so
+/// `find_pending_by_memo` returns nothing and the record is ignored.
 ///
 /// This covers the common poller-after-stream scenario: the stream settles the
 /// intent, then the next poll cycle revisits the same Horizon record.
@@ -249,7 +259,8 @@ async fn sequential_reconcile_is_idempotent() {
         .expect("first reconcile must not error");
     assert!(first, "first reconcile_payment call must settle the intent");
 
-    // Second call for the same tx_hash — the tx_hash guard must reject it.
+    // Second call for the same tx_hash — the completed intent is no longer
+    // watchable, so this must be a no-op.
     let second = reconcile_payment(&state, &hp)
         .await
         .expect("second reconcile must not error");
@@ -279,4 +290,79 @@ async fn sequential_reconcile_is_idempotent() {
         "idempotent re-reconcile must not send a second HTTP webhook; got {}",
         received.len()
     );
+}
+
+/// A native-XLM Horizon payment for the seeded intent (`memo = ABCD1234`) with
+/// an explicit transaction hash and amount.
+fn payment_with(tx_hash: &str, amount: &str) -> HorizonPayment {
+    HorizonPayment {
+        kind: "payment".into(),
+        amount: Some(amount.into()),
+        asset_type: Some("native".into()),
+        asset_code: None,
+        asset_issuer: None,
+        to: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
+        transaction_hash: Some(tx_hash.into()),
+        transaction: Some(TransactionRef {
+            memo: Some("ABCD1234".into()),
+            memo_type: Some("text".into()),
+            successful: Some(true),
+        }),
+        paging_token: Some("1".into()),
+    }
+}
+
+/// Re-processing any previously-seen transaction is a no-op regardless of the
+/// order records arrive in — the cumulative ledger is the SUM over the
+/// `processed_transactions` set, not the single most-recent `tx_hash`
+/// (issue #119).
+///
+/// Reproduces the exact failure the old single-`tx_hash` dedup allowed: two
+/// partial payments land, then the *first* one is re-seen. The old guard only
+/// remembered the latest hash, so it would re-credit the earlier transaction.
+#[tokio::test]
+async fn reprocessing_past_transactions_never_double_credits() {
+    let pool = memory_pool().await;
+    // Seeded intent expects 10 XLM (see `seed_pending_payment`). No webhook URL,
+    // so `settle` fires no outbound request.
+    let payment_id = seed_pending_payment(&pool, None).await;
+    let state = make_state(pool.clone(), None);
+
+    let tx_a = payment_with("TX_A", "4.0000000");
+    let tx_b = payment_with("TX_B", "3.0000000");
+    let tx_c = payment_with("TX_C", "3.0000000");
+
+    // Helper: assert the intent's persisted status and cumulative paid amount.
+    async fn assert_state(pool: &db::Db, id: &str, status: &str, paid: &str) {
+        let p = db::get_payment(pool, id).await.unwrap().unwrap();
+        assert_eq!(p.status, status, "status");
+        assert_eq!(p.paid_amount.as_deref(), Some(paid), "paid_amount");
+    }
+
+    // First partial: 4 of 10 — underpaid.
+    reconcile_payment(&state, &tx_a).await.unwrap();
+    assert_state(&pool, &payment_id, "underpaid", "4").await;
+
+    // Second partial: +3 → 7 of 10 — still underpaid.
+    reconcile_payment(&state, &tx_b).await.unwrap();
+    assert_state(&pool, &payment_id, "underpaid", "7").await;
+
+    // Re-seeing the FIRST transaction (the case the old dedup got wrong) must be
+    // a no-op — not a re-credit to 11.
+    assert!(!reconcile_payment(&state, &tx_a).await.unwrap());
+    assert_state(&pool, &payment_id, "underpaid", "7").await;
+
+    // Re-seeing the second, too, in the "wrong" order — still a no-op.
+    assert!(!reconcile_payment(&state, &tx_b).await.unwrap());
+    assert_state(&pool, &payment_id, "underpaid", "7").await;
+
+    // A genuine third partial completes the intent exactly: 7 + 3 = 10.
+    reconcile_payment(&state, &tx_c).await.unwrap();
+    assert_state(&pool, &payment_id, "completed", "10").await;
+
+    // Every past transaction re-seen after completion, in any order, is a no-op.
+    for tx in [&tx_c, &tx_a, &tx_b] {
+        assert!(!reconcile_payment(&state, tx).await.unwrap());
+        assert_state(&pool, &payment_id, "completed", "10").await;
+    }
 }

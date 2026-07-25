@@ -44,12 +44,29 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_amount:
+                  summary: Invalid amount
+                  value:
+                    error: amount must be a positive number with at most 7 decimal places
+                    code: invalid_amount
+                unsupported_asset:
+                  summary: Unsupported asset
+                  value:
+                    error: "unsupported asset 'EURC'; supported: XLM, USDC"
+                    code: unsupported_asset
         "429":
           description: Rate limit exceeded
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                rate_limit_exceeded:
+                  summary: Rate limit exceeded
+                  value:
+                    error: rate limit exceeded
+                    code: rate_limit_exceeded
 
     get:
       operationId: listPayments
@@ -170,12 +187,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                delivery_not_found:
+                  summary: Delivery not found
+                  value:
+                    error: delivery not found
+                    code: delivery_not_found
         "502":
           description: Webhook endpoint returned an error
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                webhook_delivery_failed:
+                  summary: Redelivery failed
+                  value:
+                    error: webhook delivery failed
+                    code: webhook_delivery_failed
 
 components:
   schemas:
@@ -331,9 +360,24 @@ components:
 
     ErrorResponse:
       type: object
+      description: Standard error envelope for public API failures.
       required: [error, code]
+      example:
+        error: The provided amount is invalid
+        code: invalid_amount
       properties:
         error:
           type: string
+          description: Human-readable explanation of the failure.
+          example: The provided amount is invalid
         code:
           type: string
+          description: >-
+            Stable machine-readable error code for programmatic handling. Public
+            values currently include unauthorized, internal_error,
+            invalid_request, unsupported_asset, invalid_amount,
+            invalid_webhook_url, invalid_status, invalid_cursor,
+            payment_not_found, delivery_not_found, rate_limit_exceeded,
+            not_found, webhook_target_blocked, webhook_delivery_failed, and
+            idempotency_conflict.
+          example: invalid_amount

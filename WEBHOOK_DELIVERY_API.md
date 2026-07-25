@@ -1,8 +1,13 @@
 # Webhook Delivery Management API
 
+> This document details the webhook delivery management endpoints. For complete webhook documentation including event types, signature verification, and integration examples, see [WEBHOOK_REFERENCE.md](WEBHOOK_REFERENCE.md) (**canonical source**).
+
 ## Overview
 
-Added two new endpoints to expose webhook delivery history and enable manual redelivery of failed webhooks. These endpoints provide merchants with full visibility into webhook attempt history and recovery capabilities — standard for production payment gateways.
+Two endpoints expose webhook delivery history and enable manual redelivery of failed webhooks. These provide merchants with full visibility into webhook attempt history and recovery capabilities — standard for production payment gateways.
+
+- `GET /payments/:id/webhooks` — List all webhook delivery attempts for a payment
+- `POST /payments/:id/webhooks/:delivery_id/redeliver` — Manually re-attempt a failed delivery
 
 ## Database Schema
 

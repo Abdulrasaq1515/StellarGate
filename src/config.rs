@@ -12,14 +12,22 @@ pub enum ListenerMode {
 }
 
 impl ListenerMode {
-    fn parse(raw: &str) -> Self {
+    /// Parse `STELLAR_LISTENER_MODE` from a raw env-var value.
+    ///
+    /// - Empty / unset → defaults to `Stream` (no error).
+    /// - `"stream"` or `"poll"` (case-insensitive) → the chosen mode.
+    /// - Any other non-empty value → `Err`, which aborts boot with a clear
+    ///   message rather than silently falling back to a different mode.
+    fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "poll" => Self::Poll,
-            "stream" => Self::Stream,
-            other => {
-                tracing::warn!("invalid STELLAR_LISTENER_MODE={other:?}, using \"stream\"");
-                Self::Stream
-            }
+            "" => Ok(Self::Stream),
+            "stream" => Ok(Self::Stream),
+            "poll" => Ok(Self::Poll),
+            other => Err(anyhow::anyhow!(
+                "STELLAR_LISTENER_MODE={other:?} is not a recognised value. \
+                 Valid values are \"stream\" or \"poll\". \
+                 Fix the environment variable or remove it to use the default (\"stream\")."
+            )),
         }
     }
 }
@@ -77,19 +85,51 @@ pub struct Config {
     pub network: String,
     pub horizon_url: String,
     pub gateway_public: String,
-    pub gateway_secret: String,
     /// Assets the gateway will accept, validated on POST /payments and in verify().
     /// Configure via ACCEPTED_ASSETS=XLM,USDC:GISSUER (comma-separated).
     pub accepted_assets: Vec<AcceptedAsset>,
     pub webhook_secret: String,
     pub webhook_retry_attempts: u32,
     pub webhook_retry_delay_ms: u64,
+    pub allowed_webhook_schemes: Vec<String>,
     /// Per-attempt timeout for outbound webhook POSTs, in seconds. Each
     /// delivery attempt is bounded independently, so a slow receiver can't
     /// hold up the retry loop (or the reconciler) for more than this value.
     /// Defaults to 10 seconds — short enough to keep retries responsive while
     /// giving receivers a fair window to process the request.
     pub webhook_timeout_secs: u64,
+    /// How often (seconds) the background redrive worker scans for stuck
+    /// webhook deliveries (`pending`/`failed` rows left behind by a process
+    /// that exited mid-delivery, or a receiver that was down when retries
+    /// were exhausted). The worker's first pass runs immediately on startup,
+    /// so a restart redrives without waiting a full interval.
+    pub webhook_redrive_interval_secs: u64,
+    /// Maximum number of redrive HTTP attempts in flight at once.
+    pub webhook_redrive_concurrency: usize,
+    /// Total attempts (inline + redrive) before a delivery is left `failed`
+    /// permanently.
+    pub webhook_redrive_max_attempts: u32,
+    /// How long (seconds) a delivery must sit idle since its last attempt (or
+    /// creation) before the redrive worker will touch it. Must comfortably
+    /// exceed the worst-case inline delivery time
+    /// (`webhook_retry_attempts * (webhook_timeout_secs + webhook_retry_delay_ms)`)
+    /// so the worker never races a `dispatch()` call that is still in flight
+    /// for the same row. Acts as a hard floor under the exponential backoff
+    /// below — a row is never touched sooner than this, even on its very
+    /// first redrive attempt.
+    pub webhook_redrive_grace_secs: i64,
+    /// Starting delay (seconds) of the exponential backoff applied to a
+    /// delivery's *redrive* attempts after it has failed at least once
+    /// (`initial * 2^(attempts-1)`, capped by `webhook_redrive_backoff_max_secs`).
+    /// A row that has never been attempted (`attempts == 0`, left behind by a
+    /// crash between insert and its first send) is exempt from this backoff
+    /// and is only gated by `webhook_redrive_grace_secs`. Set to `0` to
+    /// disable growth and redrive purely on the fixed grace window.
+    pub webhook_redrive_backoff_initial_secs: i64,
+    /// Upper bound (seconds) on the exponential backoff above, so a delivery
+    /// that has failed many times still gets retried at a bounded cadence
+    /// rather than being pushed further and further out.
+    pub webhook_redrive_backoff_max_secs: i64,
     pub poll_interval_secs: u64,
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
@@ -117,6 +157,12 @@ pub struct Config {
     /// `POST /merchants`. Empty disables provisioning entirely — the endpoint
     /// rejects every request rather than falling back to an open default.
     pub admin_provisioning_secret: String,
+    /// Per-request timeout for the whole API, in seconds. A request whose
+    /// handler hasn't produced a response within this window is aborted with
+    /// `408 Request Timeout`, so a slow client or a stuck handler can't tie up
+    /// a connection indefinitely. Defaults to 30 seconds.
+    pub request_timeout_secs: u64,
+    pub allowed_webhook_schemes: Vec<String>
 }
 
 impl Config {
@@ -128,8 +174,16 @@ impl Config {
             .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
         let gateway_public =
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
-        let gateway_secret = std::env::var("STELLAR_GATEWAY_SECRET").unwrap_or_default();
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
+        let allowed_webhook_schemes: Vec<String> = {
+            let raw_schemes = std::env::var("ALLOWED_WEBHOOK_SCHEMES")
+                .unwrap_or_else(|_| "https".to_string());
+            raw_schemes
+                .split(',)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
 
         let cors_allowed_origins: Vec<String> = {
             let raw_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
@@ -154,13 +208,19 @@ impl Config {
             raw_origins
         };
 
+        if network == "public" && cors_allowed_origins.is_empty() {
+            return Err(anyhow::anyhow!(
+                "CORS_ALLOWED_ORIGINS must be set when STELLAR_NETWORK=public. \
+                 Leaving it unset would allow any browser origin to access the public API."
+            ));
+        }
+
         let config = Self {
             port: parse_env("PORT", 3000)?,
             database_url,
             network,
             horizon_url,
             gateway_public,
-            gateway_secret,
             accepted_assets: {
                 let raw = std::env::var("ACCEPTED_ASSETS").unwrap_or_default();
                 if raw.is_empty() {
@@ -170,8 +230,19 @@ impl Config {
                 }
             },
             webhook_secret,
+            allowed_webhook_schemes,
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000)?,
+            webhook_timeout_secs: parse_env("WEBHOOK_TIMEOUT_SECS", 10)?,
+            webhook_redrive_interval_secs: parse_env("WEBHOOK_REDRIVE_INTERVAL_SECS", 30)?,
+            webhook_redrive_concurrency: parse_env("WEBHOOK_REDRIVE_CONCURRENCY", 4)?,
+            webhook_redrive_max_attempts: parse_env("WEBHOOK_REDRIVE_MAX_ATTEMPTS", 8)?,
+            webhook_redrive_grace_secs: parse_env("WEBHOOK_REDRIVE_GRACE_SECS", 60)?,
+            webhook_redrive_backoff_initial_secs: parse_env(
+                "WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS",
+                30,
+            )?,
+            webhook_redrive_backoff_max_secs: parse_env("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS", 900)?,
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
@@ -180,9 +251,10 @@ impl Config {
             cors_allowed_origins,
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
-            ),
+            )?,
             webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
             admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
+            request_timeout_secs: parse_env("REQUEST_TIMEOUT_SECS", 30)?,
         };
         config.validate_addresses()?;
         config.validate_timing()?;
@@ -232,6 +304,10 @@ impl Config {
     /// - `WEBHOOK_RETRY_ATTEMPTS == 0` → webhooks are never delivered
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
+    /// - `REQUEST_TIMEOUT_SECS == 0` → every request is aborted immediately
+    /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
+    ///   → the cap would silently override the starting delay, so backoff
+    ///   never actually grows
     fn validate_timing(&self) -> Result<()> {
         if self.poll_interval_secs == 0 {
             return Err(anyhow::anyhow!(
@@ -272,6 +348,23 @@ impl Config {
             ));
         }
 
+        if self.request_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "REQUEST_TIMEOUT_SECS must be > 0 (got 0). \
+                 A zero timeout would abort every request immediately."
+            ));
+        }
+
+        if self.webhook_redrive_backoff_max_secs < self.webhook_redrive_backoff_initial_secs {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS ({}) must be >= WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS ({}). \
+                 With the current settings the cap would override the starting delay and backoff \
+                 would never actually grow.",
+                self.webhook_redrive_backoff_max_secs,
+                self.webhook_redrive_backoff_initial_secs
+            ));
+        }
+
         Ok(())
     }
 
@@ -293,9 +386,18 @@ impl Config {
                 "WEBHOOK_SECRET cannot contain only whitespace"
             ));
         }
-        if secret == "default-secret" {
+        // Reject known placeholder values that might be copied verbatim from
+        // .env.example or documentation.
+        const WEBHOOK_PLACEHOLDERS: &[&str] = &[
+            "default-secret",
+            "your_webhook_signing_secret",
+            "REPLACE_ME_webhook_signing_secret",
+        ];
+        if WEBHOOK_PLACEHOLDERS.contains(&secret.as_str()) || secret.starts_with("REPLACE_ME_") {
             return Err(anyhow::anyhow!(
-                "WEBHOOK_SECRET cannot equal \"default-secret\""
+                "WEBHOOK_SECRET is set to a known placeholder value ({:?}). \
+                 Replace it with a strong, randomly-generated secret.",
+                secret
             ));
         }
         if secret.len() < 32 {
@@ -317,12 +419,35 @@ impl std::fmt::Debug for Config {
             .field("network", &self.network)
             .field("horizon_url", &self.horizon_url)
             .field("gateway_public", &self.gateway_public)
-            .field("gateway_secret", &"***")
             .field("accepted_assets", &self.accepted_assets)
             .field("webhook_secret", &"***")
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
             .field("webhook_timeout_secs", &self.webhook_timeout_secs)
+            .field(
+                "webhook_redrive_interval_secs",
+                &self.webhook_redrive_interval_secs,
+            )
+            .field(
+                "webhook_redrive_concurrency",
+                &self.webhook_redrive_concurrency,
+            )
+            .field(
+                "webhook_redrive_max_attempts",
+                &self.webhook_redrive_max_attempts,
+            )
+            .field(
+                "webhook_redrive_grace_secs",
+                &self.webhook_redrive_grace_secs,
+            )
+            .field(
+                "webhook_redrive_backoff_initial_secs",
+                &self.webhook_redrive_backoff_initial_secs,
+            )
+            .field(
+                "webhook_redrive_backoff_max_secs",
+                &self.webhook_redrive_backoff_max_secs,
+            )
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("payment_ttl_secs", &self.payment_ttl_secs)
             .field(
@@ -338,6 +463,7 @@ impl std::fmt::Debug for Config {
                 &self.webhook_allow_private_targets,
             )
             .field("admin_provisioning_secret", &"***")
+            .field("request_timeout_secs", &self.request_timeout_secs)
             .finish()
     }
 }
@@ -381,12 +507,17 @@ mod tests {
             network: "testnet".into(),
             horizon_url: "https://horizon-testnet.stellar.org".into(),
             gateway_public: "GPUBLIC".into(),
-            gateway_secret: "super-secret-key".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "webhook-hmac-secret".into(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
             webhook_timeout_secs: 10,
+            webhook_redrive_interval_secs: 30,
+            webhook_redrive_concurrency: 4,
+            webhook_redrive_max_attempts: 8,
+            webhook_redrive_grace_secs: 60,
+            webhook_redrive_backoff_initial_secs: 30,
+            webhook_redrive_backoff_max_secs: 900,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
@@ -396,12 +527,9 @@ mod tests {
             listener_mode: ListenerMode::Stream,
             webhook_allow_private_targets: false,
             admin_provisioning_secret: "admin-super-secret".into(),
+            request_timeout_secs: 30,
         };
         let output = format!("{cfg:?}");
-        assert!(
-            !output.contains("super-secret-key"),
-            "gateway_secret must not appear in Debug output"
-        );
         assert!(
             !output.contains("webhook-hmac-secret"),
             "webhook_secret must not appear in Debug output"
@@ -450,12 +578,17 @@ mod tests {
             network: "testnet".into(),
             horizon_url: "https://horizon-testnet.stellar.org".into(),
             gateway_public: "UNCONFIGURED".into(),
-            gateway_secret: String::new(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: String::new(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
             webhook_timeout_secs: 10,
+            webhook_redrive_interval_secs: 30,
+            webhook_redrive_concurrency: 4,
+            webhook_redrive_max_attempts: 8,
+            webhook_redrive_grace_secs: 60,
+            webhook_redrive_backoff_initial_secs: 30,
+            webhook_redrive_backoff_max_secs: 900,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
@@ -465,6 +598,7 @@ mod tests {
             listener_mode: ListenerMode::Stream,
             webhook_allow_private_targets: false,
             admin_provisioning_secret: String::new(),
+            request_timeout_secs: 30,
         }
     }
 
@@ -533,10 +667,7 @@ mod tests {
         let err = Config::validate_webhook_secret(Ok("default-secret".into()))
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("cannot equal \"default-secret\""),
-            "got: {err}"
-        );
+        assert!(err.contains("known placeholder value"), "got: {err}");
     }
 
     #[test]
@@ -631,6 +762,14 @@ mod tests {
                     "STELLAR_GATEWAY_PUBLIC",
                     Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"),
                 ),
+                (
+                    "STELLAR_GATEWAY_SECRET",
+                    Some("SCZANGBA5RLKJHTBF4RJNRJMZWI4VKTHCRKOVAH7LRZZPZHHZWATAWBN"),
+                ),
+                (
+                    "CORS_ALLOWED_ORIGINS",
+                    Some("https://example.com"),
+                ),
             ],
             || {
                 let cfg = Config::from_env().unwrap();
@@ -638,6 +777,37 @@ mod tests {
                 assert_eq!(
                     cfg.webhook_secret,
                     "a-very-long-and-secure-webhook-signing-secret-32-chars"
+                );
+                assert_eq!(cfg.cors_allowed_origins, vec!["https://example.com"]);
+            },
+        );
+    }
+
+    #[test]
+    fn startup_fails_on_public_without_cors_allowed_origins() {
+        run_with_env(
+            &[
+                ("STELLAR_NETWORK", Some("public")),
+                (
+                    "WEBHOOK_SECRET",
+                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
+                ),
+                ("DATABASE_URL", Some("sqlite::memory:")),
+                (
+                    "STELLAR_GATEWAY_PUBLIC",
+                    Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"),
+                ),
+                (
+                    "STELLAR_GATEWAY_SECRET",
+                    Some("SCZANGBA5RLKJHTBF4RJNRJMZWI4VKTHCRKOVAH7LRZZPZHHZWATAWBN"),
+                ),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("CORS_ALLOWED_ORIGINS must be set") ||
+                    err.contains("CORS_ALLOWED_ORIGINS must be set when STELLAR_NETWORK=public"),
+                    "got: {err}"
                 );
             },
         );
@@ -721,6 +891,35 @@ mod tests {
     }
 
     #[test]
+    fn timing_rejects_backoff_max_below_initial() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = 300;
+        cfg.webhook_redrive_backoff_max_secs = 30;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS")
+                && err.contains("WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_allows_backoff_max_equal_to_initial() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = 30;
+        cfg.webhook_redrive_backoff_max_secs = 30;
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn timing_allows_zero_backoff_initial_to_disable_growth() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = 0;
+        cfg.webhook_redrive_backoff_max_secs = 0;
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
     fn startup_fails_on_ttl_shorter_than_poll_interval_via_env() {
         run_with_env(
             &[
@@ -738,6 +937,38 @@ mod tests {
                     "got: {err}"
                 );
             },
+        );
+    }
+
+    // ── ListenerMode::parse ──────────────────────────────────────────────────
+
+    #[test]
+    fn listener_mode_empty_defaults_to_stream() {
+        assert_eq!(ListenerMode::parse("").unwrap(), ListenerMode::Stream);
+    }
+
+    #[test]
+    fn listener_mode_stream_parses() {
+        assert_eq!(ListenerMode::parse("stream").unwrap(), ListenerMode::Stream);
+        assert_eq!(ListenerMode::parse("STREAM").unwrap(), ListenerMode::Stream);
+    }
+
+    #[test]
+    fn listener_mode_poll_parses() {
+        assert_eq!(ListenerMode::parse("poll").unwrap(), ListenerMode::Poll);
+        assert_eq!(ListenerMode::parse("POLL").unwrap(), ListenerMode::Poll);
+    }
+
+    #[test]
+    fn listener_mode_invalid_aborts_boot() {
+        let err = ListenerMode::parse("streem").unwrap_err().to_string();
+        assert!(
+            err.contains("STELLAR_LISTENER_MODE"),
+            "error should name the variable; got: {err}"
+        );
+        assert!(
+            err.contains("streem"),
+            "error should echo the bad value; got: {err}"
         );
     }
 }

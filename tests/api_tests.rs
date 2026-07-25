@@ -17,13 +17,18 @@ fn make_config() -> Config {
         database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
         horizon_url: String::new(),
-        gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
-        gateway_secret: String::new(),
+        gateway_public: "UNCONFIGURED".into(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
         webhook_timeout_secs: 10,
+        webhook_redrive_interval_secs: 30,
+        webhook_redrive_concurrency: 4,
+        webhook_redrive_max_attempts: 8,
+        webhook_redrive_grace_secs: 60,
+        webhook_redrive_backoff_initial_secs: 0,
+        webhook_redrive_backoff_max_secs: 0,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
         /* High enough that these tests never trip the limiter; dedicated
@@ -35,6 +40,7 @@ fn make_config() -> Config {
         listener_mode: ListenerMode::Poll,
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
+        request_timeout_secs: 30,
     }
 }
 
@@ -61,6 +67,9 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         config: cfg,
         http,
         webhook_http: reqwest::Client::new(),
+        webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
+        auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
     let server = TestServer::new(router).unwrap();
@@ -151,6 +160,45 @@ async fn test_invalid_api_key_returns_401() {
         .json(&json!({ "amount": "10", "asset": "XLM" }))
         .await;
     res.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+/// Auth outcomes must be observable via `/metrics` (issue #139), not just as
+/// a bare 401 with nothing left behind for an operator to alert on.
+#[tokio::test]
+async fn test_auth_outcomes_are_counted_in_metrics() {
+    let server = test_server().await;
+
+    server.get("/payments").await; // missing key
+    server
+        .post("/payments")
+        .add_header("Authorization", "Bearer not-a-real-key")
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await; // invalid key
+    let key = provision_merchant(&server).await;
+    server
+        .get("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await; // valid key
+
+    let res = server.get("/metrics").await;
+    res.assert_status_ok();
+    let body = res.text();
+    assert!(
+        body.contains("stellargate_auth_attempts_total{outcome=\"success\"} 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains(
+            "stellargate_auth_attempts_total{outcome=\"failure\",reason=\"missing_key\"} 1"
+        ),
+        "got: {body}"
+    );
+    assert!(
+        body.contains(
+            "stellargate_auth_attempts_total{outcome=\"failure\",reason=\"invalid_key\"} 1"
+        ),
+        "got: {body}"
+    );
 }
 
 #[tokio::test]
@@ -450,13 +498,15 @@ async fn test_asset_is_case_insensitive() {
 
 #[tokio::test]
 async fn test_webhook_url_https_accepted_on_testnet() {
-    let server = test_server().await;
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    let (server, _db) = server_with_config(cfg).await;
     let key = provision_merchant(&server).await;
     let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
         .json(
-            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "https://example.com/webhook" }),
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "https://127.0.0.1:9/webhook" }),
         )
         .await;
     res.assert_status(StatusCode::CREATED);
@@ -464,13 +514,15 @@ async fn test_webhook_url_https_accepted_on_testnet() {
 
 #[tokio::test]
 async fn test_webhook_url_http_accepted_on_testnet() {
-    let server = test_server().await;
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    let (server, _db) = server_with_config(cfg).await;
     let key = provision_merchant(&server).await;
     let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
         .json(
-            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://example.com/webhook" }),
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://127.0.0.1:9/webhook" }),
         )
         .await;
     res.assert_status(StatusCode::CREATED);
@@ -480,13 +532,14 @@ async fn test_webhook_url_http_accepted_on_testnet() {
 async fn test_webhook_url_http_rejected_on_public_network() {
     let mut cfg = make_config();
     cfg.network = "public".into();
+    cfg.webhook_allow_private_targets = true;
     let (server, _db) = server_with_config(cfg).await;
     let key = provision_merchant(&server).await;
     let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
         .json(
-            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://example.com/webhook" }),
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "http://127.0.0.1:9/webhook" }),
         )
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
@@ -502,13 +555,14 @@ async fn test_webhook_url_http_rejected_on_public_network() {
 async fn test_webhook_url_https_accepted_on_public_network() {
     let mut cfg = make_config();
     cfg.network = "public".into();
+    cfg.webhook_allow_private_targets = true;
     let (server, _db) = server_with_config(cfg).await;
     let key = provision_merchant(&server).await;
     let res = server
         .post("/payments")
         .add_header("Authorization", format!("Bearer {key}"))
         .json(
-            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "https://example.com/webhook" }),
+            &json!({ "amount": "1", "asset": "XLM", "webhook_url": "https://127.0.0.1:9/webhook" }),
         )
         .await;
     res.assert_status(StatusCode::CREATED);
@@ -1186,4 +1240,116 @@ async fn test_webhook_delivery_isolation() {
         .add_header("Authorization", auth)
         .await;
     res_cross.assert_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_amount_canonicalization_on_create_get_list() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    // Test various representations of the same value.
+    // All should serialize to "10.5" regardless of input format.
+    let test_cases = vec![
+        ("10.5", "10.5"),
+        ("10.50", "10.5"),
+        ("10.500", "10.5"),
+        ("10.5000", "10.5"),
+        ("10.50000", "10.5"),
+        ("10.500000", "10.5"),
+        ("10.5000000", "10.5"),
+    ];
+
+    let mut payment_ids = Vec::new();
+
+    for (input, expected_canonical) in test_cases {
+        let res = server
+            .post("/payments")
+            .add_header("Authorization", auth.clone())
+            .json(&json!({ "amount": input, "asset": "XLM" }))
+            .await;
+        res.assert_status(StatusCode::CREATED);
+        let body: Value = res.json();
+        
+        // Verify that the created payment has the canonical form
+        assert_eq!(
+            body["amount"].as_str().unwrap(),
+            expected_canonical,
+            "create response should canonicalize amount: {} -> {}",
+            input,
+            expected_canonical
+        );
+        
+        let payment_id = body["id"].as_str().unwrap().to_string();
+        payment_ids.push((input, expected_canonical, payment_id));
+    }
+
+    // Verify canonicalization persists across GET requests
+    for (input, expected_canonical, payment_id) in &payment_ids {
+        let res = server
+            .get(&format!("/payments/{payment_id}"))
+            .add_header("Authorization", auth.clone())
+            .await;
+        res.assert_status_ok();
+        let body: Value = res.json();
+        
+        assert_eq!(
+            body["amount"].as_str().unwrap(),
+            *expected_canonical,
+            "get response should return canonical form for input: {}",
+            input
+        );
+    }
+
+    // Verify canonicalization in list endpoint
+    let res = server
+        .get("/payments?limit=100")
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status_ok();
+    let list: Value = res.json();
+    
+    for payment in list["payments"].as_array().unwrap() {
+        let amount_str = payment["amount"].as_str().unwrap();
+        // All amounts should be in canonical form (no trailing zeros)
+        for (_, expected_canonical, _) in &payment_ids {
+            if amount_str == *expected_canonical {
+                // Found one of our test payments, good
+                break;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_whole_amount_canonicalization() {
+    // Test that whole amounts are serialized without decimal point
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    
+    let test_cases = vec![
+        ("1", "1"),
+        ("1.0", "1"),
+        ("1.00", "1"),
+        ("100", "100"),
+        ("100.0000000", "100"),
+    ];
+
+    for (input, expected) in test_cases {
+        let res = server
+            .post("/payments")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .json(&json!({ "amount": input, "asset": "XLM" }))
+            .await;
+        res.assert_status(StatusCode::CREATED);
+        let body: Value = res.json();
+        
+        assert_eq!(
+            body["amount"].as_str().unwrap(),
+            expected,
+            "whole amount {} should canonicalize to {}",
+            input,
+            expected
+        );
+    }
 }

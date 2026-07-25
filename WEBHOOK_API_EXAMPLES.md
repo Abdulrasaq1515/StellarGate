@@ -1,5 +1,7 @@
 # Webhook Delivery API — Usage Examples
 
+> This document provides practical examples. For complete webhook documentation including all event types, signature verification details, and configuration options, see [WEBHOOK_REFERENCE.md](WEBHOOK_REFERENCE.md) (**canonical source**).
+
 ## 1. List Webhook Deliveries
 
 Retrieve all delivery attempts for a payment.
@@ -110,44 +112,10 @@ curl -X POST http://localhost:3000/payments/550e8400-e29b-41d4-a716-446655440000
 
 ## Webhook Signature Verification
 
-When a webhook is delivered (or redelivered), the merchant receives:
-
-**Headers:**
-- `Content-Type: application/json`
-- `X-StellarGate-Signature: <hex-encoded-hmac-sha256>`
-- `X-StellarGate-Event: payment.completed`
-
-**Body (example):**
-```json
-{
-  "event": "payment.completed",
-  "payment_id": "550e8400-e29b-41d4-a716-446655440000",
-  "merchant_id": "merchant-123",
-  "tx_hash": "abc123def456...",
-  "amount": "100.0",
-  "paid_amount": "100.0",
-  "asset": "XLM",
-  "status": "completed"
-}
-```
-
-**To verify the signature:**
-```python
-import hmac
-import hashlib
-
-webhook_secret = "your-webhook-secret"
-request_body = b'{"event":"payment.completed",...}'  # Exact bytes received
-signature_header = "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
-
-computed_sig = hmac.new(
-    webhook_secret.encode(),
-    request_body,
-    hashlib.sha256
-).hexdigest()
-
-assert computed_sig == signature_header, "Signature verification failed"
-```
+See [WEBHOOK_REFERENCE.md — Verifying Webhooks](WEBHOOK_REFERENCE.md#verifying-webhooks) for complete verification guidance with examples in Node.js and Python, including:
+- Timestamp freshness validation
+- Exact signature computation
+- Constant-time comparison patterns
 
 ---
 

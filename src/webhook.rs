@@ -24,8 +24,10 @@ use crate::{db, AppState};
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{watch, Semaphore};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -64,18 +66,37 @@ pub(crate) fn current_timestamp() -> i64 {
 /// `delta` carries the absolute difference between the requested and received
 /// amounts, and is included in the payload for `payment.overpaid` (excess to
 /// refund) and `payment.underpaid` (shortfall still owed) events.
+///
+/// Amounts are canonicalized to ensure consistent serialization: "10.00", "10.0",
+/// and "10" all serialize as "10". This handles both new payments (already
+/// canonicalized on write) and any legacy data.
 pub fn build_payload(payment: &db::Payment, event: &str, delta: Option<&str>) -> serde_json::Value {
+    // Canonicalize the requested amount
+    let canonical_amount = crate::money::parse_stroops(&payment.amount)
+        .map(crate::money::stroops_to_string)
+        .unwrap_or_else(|| payment.amount.clone());
+
+    // Canonicalize the received amount
+    let canonical_paid_amount = payment.paid_amount.as_ref().and_then(|pa| {
+        crate::money::parse_stroops(pa).map(crate::money::stroops_to_string)
+    });
+
+    // Canonicalize delta if present (it's a price difference)
+    let canonical_delta = delta.and_then(|d| {
+        crate::money::parse_stroops(d).map(|s| crate::money::stroops_to_string(s))
+    });
+
     let mut payload = json!({
         "event": event,
         "payment_id": payment.id,
         "merchant_id": payment.merchant_id,
         "tx_hash": payment.tx_hash,
-        "amount": payment.amount,
-        "paid_amount": payment.paid_amount,
+        "amount": canonical_amount,
+        "paid_amount": canonical_paid_amount,
         "asset": payment.asset,
         "status": payment.status,
     });
-    if let Some(d) = delta {
+    if let Some(d) = canonical_delta {
         payload["delta"] = json!(d);
     }
     payload
@@ -135,16 +156,19 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
 
     let attempts = state.config.webhook_retry_attempts.max(1);
     let delay = Duration::from_millis(state.config.webhook_retry_delay_ms);
+    let start = Instant::now();
 
     for attempt in 1..=attempts {
+        // Every attempt after the first is a retry — record it.
+        if attempt > 1 {
+            state.webhook_metrics.record_retry();
+        }
+
         let result = client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("X-StellarGate-Signature", &signature)
             .header("X-StellarGate-Timestamp", timestamp.to_string())
-            // Convenience header — mirrors the `event` field already present in
-            // the signed body. NOT covered by the HMAC; receivers must route on
-            // the authenticated body field, not this header.
             .header("X-StellarGate-Event", event)
             .body(body.clone())
             .send()
@@ -153,6 +177,10 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         match result {
             Ok(resp) if resp.status().is_success() => {
                 info!(payment_id = %payment.id, %url, attempt, "webhook delivered");
+                state.webhook_metrics.record_delivered();
+                state
+                    .webhook_metrics
+                    .record_latency_ms(start.elapsed().as_millis() as u64);
                 let _ = db::update_webhook_delivery(
                     &state.pool,
                     &delivery_id,
@@ -176,6 +204,10 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     }
 
     warn!(payment_id = %payment.id, %url, "webhook delivery exhausted all retries");
+    state.webhook_metrics.record_failed();
+    state
+        .webhook_metrics
+        .record_latency_ms(start.elapsed().as_millis() as u64);
     let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", attempts as i64).await;
 }
 
@@ -190,6 +222,163 @@ pub(crate) async fn safe_client(state: &AppState, url: &str) -> anyhow::Result<r
         &target,
         Duration::from_secs(state.config.webhook_timeout_secs),
     )?)
+}
+
+/// Re-attempt every webhook delivery left `pending` or `failed` by a process
+/// that exited mid-delivery (or a receiver that was down when retries were
+/// exhausted), bounded to `webhook_redrive_concurrency` requests in flight at
+/// once. Returns how many deliveries were attempted.
+///
+/// This is the safety net behind `dispatch()`'s inline retry loop: dispatch
+/// already delivers the common case synchronously, but a crash between
+/// recording a delivery and reaching a terminal status otherwise leaves that
+/// row stuck forever. Called once immediately on worker startup (see
+/// [`run_redrive_worker`]) so a restart redrives without waiting a full tick.
+pub async fn redrive_once(state: &Arc<AppState>) -> usize {
+    let candidates = match db::list_redrivable_deliveries(
+        &state.pool,
+        state.config.webhook_redrive_max_attempts as i64,
+        state.config.webhook_redrive_grace_secs,
+        state.config.webhook_redrive_backoff_initial_secs,
+        state.config.webhook_redrive_backoff_max_secs,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, "failed to list redrivable webhook deliveries");
+            return 0;
+        }
+    };
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let semaphore = Arc::new(Semaphore::new(
+        state.config.webhook_redrive_concurrency.max(1),
+    ));
+    let mut tasks = Vec::with_capacity(candidates.len());
+    for delivery in candidates {
+        let state = state.clone();
+        let semaphore = semaphore.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
+            redrive_one(&state, delivery).await;
+        }));
+    }
+
+    let attempted = tasks.len();
+    for task in tasks {
+        let _ = task.await;
+    }
+    attempted
+}
+
+/// Re-send one delivery's stored payload and record the outcome. Mirrors the
+/// manual `POST /payments/:id/webhook_deliveries/:id/redeliver` path, but is
+/// driven by the background worker instead of a merchant request, and re-signs
+/// with a fresh timestamp on every attempt (the receiver's replay-tolerance
+/// window is measured from when the request actually lands).
+async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
+    let event = delivery.event();
+    let attempt = delivery.attempts + 1;
+
+    let client = match safe_client(state, &delivery.url).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(delivery_id = %delivery.id, url = %delivery.url, error = %e, "redrive blocked by SSRF guard");
+            let _ =
+                db::update_webhook_delivery(&state.pool, &delivery.id, "failed", delivery.attempts)
+                    .await;
+            return;
+        }
+    };
+
+    let body = delivery.payload.as_bytes();
+    let timestamp = current_timestamp();
+    let signature = sign(&state.config.webhook_secret, timestamp, body);
+    let start = Instant::now();
+
+    // Every redrive attempt is effectively a retry.
+    state.webhook_metrics.record_retry();
+
+    let result = client
+        .post(&delivery.url)
+        .header("Content-Type", "application/json")
+        .header("X-StellarGate-Signature", &signature)
+        .header("X-StellarGate-Timestamp", timestamp.to_string())
+        .header("X-StellarGate-Event", &event)
+        .body(body.to_vec())
+        .send()
+        .await;
+
+    let outcome = match result {
+        Ok(resp) if resp.status().is_success() => {
+            info!(delivery_id = %delivery.id, %attempt, "webhook redriven successfully");
+            state.webhook_metrics.record_delivered();
+            state
+                .webhook_metrics
+                .record_latency_ms(start.elapsed().as_millis() as u64);
+            "delivered"
+        }
+        Ok(resp) => {
+            warn!(delivery_id = %delivery.id, status = %resp.status(), %attempt, "redrive attempt rejected");
+            if attempt >= state.config.webhook_redrive_max_attempts as i64 {
+                state.webhook_metrics.record_failed();
+                state
+                    .webhook_metrics
+                    .record_latency_ms(start.elapsed().as_millis() as u64);
+                "failed"
+            } else {
+                "pending"
+            }
+        }
+        Err(e) => {
+            warn!(delivery_id = %delivery.id, error = %e, %attempt, "redrive attempt failed");
+            if attempt >= state.config.webhook_redrive_max_attempts as i64 {
+                state.webhook_metrics.record_failed();
+                state
+                    .webhook_metrics
+                    .record_latency_ms(start.elapsed().as_millis() as u64);
+                "failed"
+            } else {
+                "pending"
+            }
+        }
+    };
+
+    let _ = db::update_webhook_delivery(&state.pool, &delivery.id, outcome, attempt).await;
+}
+
+/// Background loop that periodically redrives stuck webhook deliveries until
+/// the process shuts down. Runs one pass immediately on startup — before the
+/// first sleep — so a restart repairs any deliveries left `pending`/`failed`
+/// by the previous process without waiting a full interval.
+pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+    let interval = Duration::from_secs(state.config.webhook_redrive_interval_secs.max(1));
+    info!(
+        interval_secs = state.config.webhook_redrive_interval_secs,
+        "webhook redrive worker started"
+    );
+
+    loop {
+        match redrive_once(&state).await {
+            0 => debug!("redrive: nothing to redrive"),
+            n => info!(redriven = n, "redrive tick processed deliveries"),
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => {
+                info!("webhook redrive worker shutting down");
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
