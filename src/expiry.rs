@@ -113,6 +113,7 @@ mod tests {
             http: reqwest::Client::new(),
             webhook_http: reqwest::Client::new(),
             webhook_metrics: crate::metrics::WebhookMetrics::new(),
+            auth_metrics: crate::metrics::AuthMetrics::new(),
             task_health: crate::TaskHealth::new(),
         }
     }

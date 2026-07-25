@@ -125,11 +125,21 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .with_state(state)
 }
 
+/// Authenticates via the `Authorization: Bearer <key>` header, injecting
+/// [`AuthenticatedMerchant`] into request extensions on success.
+///
+/// Every outcome is both logged (`source_ip` + `reason`, at a level matched
+/// to severity — failures visible by default, success at `debug` to avoid
+/// flooding logs) and counted in `AuthMetrics` (issue #139), so
+/// credential-stuffing or a misconfigured client shows up in logs/metrics
+/// instead of silently returning 401s.
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut req: Request,
     next: Next,
 ) -> axum::response::Response {
+    let source_ip = client_ip_key(&req);
+
     let raw_key = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -140,6 +150,12 @@ async fn auth_middleware(
         .map(str::to_string);
 
     let Some(key) = raw_key else {
+        tracing::warn!(
+            %source_ip,
+            reason = "missing_key",
+            "auth denied: missing or malformed Authorization header"
+        );
+        state.auth_metrics.record_failure_missing_key();
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "missing or invalid Authorization header", "code": "unauthorized" })),
@@ -149,20 +165,34 @@ async fn auth_middleware(
 
     match db::find_merchant_by_key(&state.pool, &key).await {
         Ok(Some(merchant_id)) => {
+            tracing::debug!(%source_ip, %merchant_id, "auth succeeded");
+            state.auth_metrics.record_success();
             req.extensions_mut()
                 .insert(AuthenticatedMerchant(merchant_id));
             next.run(req).await
         }
-        Ok(None) => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "invalid API key", "code": "unauthorized" })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "internal server error", "code": "internal_error" })),
-        )
-            .into_response(),
+        Ok(None) => {
+            tracing::warn!(
+                %source_ip,
+                reason = "invalid_key",
+                "auth denied: API key did not match any merchant"
+            );
+            state.auth_metrics.record_failure_invalid_key();
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid API key", "code": "unauthorized" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(%source_ip, error = %e, "auth errored: merchant key lookup failed");
+            state.auth_metrics.record_failure_internal_error();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal server error", "code": "internal_error" })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -414,7 +444,7 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
 
 /// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let body = crate::metrics::render(&state.webhook_metrics);
+    let body = crate::metrics::render(&state.webhook_metrics, &state.auth_metrics);
     (
         StatusCode::OK,
         [(

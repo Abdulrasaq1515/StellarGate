@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
         http,
         webhook_http,
         webhook_metrics: WebhookMetrics::new(),
+        auth_metrics: stellargate::metrics::AuthMetrics::new(),
         task_health: TaskHealth::new(),
     });
 

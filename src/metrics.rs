@@ -129,11 +129,85 @@ impl Default for WebhookMetrics {
     }
 }
 
+/// Outcome counters for `auth_middleware`, so credential-stuffing or
+/// misconfigured-client traffic is visible in the `/metrics` scrape rather
+/// than only in logs.
+#[derive(Clone)]
+pub struct AuthMetrics {
+    inner: Arc<AuthMetricsInner>,
+}
+
+struct AuthMetricsInner {
+    /// Requests that presented a valid API key.
+    success: AtomicU64,
+    /// Requests with no (or a malformed) `Authorization: Bearer` header.
+    failure_missing_key: AtomicU64,
+    /// Requests with a well-formed key that didn't match any merchant.
+    failure_invalid_key: AtomicU64,
+    /// Requests that failed the key lookup itself (database error).
+    failure_internal_error: AtomicU64,
+}
+
+impl Default for AuthMetricsInner {
+    fn default() -> Self {
+        Self {
+            success: AtomicU64::new(0),
+            failure_missing_key: AtomicU64::new(0),
+            failure_invalid_key: AtomicU64::new(0),
+            failure_internal_error: AtomicU64::new(0),
+        }
+    }
+}
+
+impl AuthMetrics {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(AuthMetricsInner::default()),
+        }
+    }
+
+    pub fn record_success(&self) {
+        self.inner.success.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_failure_missing_key(&self) {
+        self.inner.failure_missing_key.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_failure_invalid_key(&self) {
+        self.inner.failure_invalid_key.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_failure_internal_error(&self) {
+        self.inner
+            .failure_internal_error
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Snapshot accessors ────────────────────────────────────────────────
+
+    pub fn success(&self) -> u64 {
+        self.inner.success.load(Ordering::Relaxed)
+    }
+    pub fn failure_missing_key(&self) -> u64 {
+        self.inner.failure_missing_key.load(Ordering::Relaxed)
+    }
+    pub fn failure_invalid_key(&self) -> u64 {
+        self.inner.failure_invalid_key.load(Ordering::Relaxed)
+    }
+    pub fn failure_internal_error(&self) -> u64 {
+        self.inner.failure_internal_error.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for AuthMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Prometheus text exposition ────────────────────────────────────────────────
 
-/// Render webhook delivery metrics as a Prometheus-compatible plain-text snapshot.
-/// Called by `GET /metrics`.
-pub fn render(webhook: &WebhookMetrics) -> String {
+/// Render webhook delivery and auth outcome metrics as a Prometheus-compatible
+/// plain-text snapshot. Called by `GET /metrics`.
+pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics) -> String {
     let mut out = String::with_capacity(1024);
 
     // stellargate_webhook_deliveries_total — counter vec by outcome
@@ -179,6 +253,28 @@ pub fn render(webhook: &WebhookMetrics) -> String {
     out.push_str(&format!(
         "stellargate_webhook_delivery_latency_ms_count {}\n",
         webhook.latency_count()
+    ));
+
+    // stellargate_auth_attempts_total — counter vec by outcome/reason
+    out.push_str(
+        "# HELP stellargate_auth_attempts_total Total auth middleware decisions by outcome and reason.\n",
+    );
+    out.push_str("# TYPE stellargate_auth_attempts_total counter\n");
+    out.push_str(&format!(
+        "stellargate_auth_attempts_total{{outcome=\"success\"}} {}\n",
+        auth.success()
+    ));
+    out.push_str(&format!(
+        "stellargate_auth_attempts_total{{outcome=\"failure\",reason=\"missing_key\"}} {}\n",
+        auth.failure_missing_key()
+    ));
+    out.push_str(&format!(
+        "stellargate_auth_attempts_total{{outcome=\"failure\",reason=\"invalid_key\"}} {}\n",
+        auth.failure_invalid_key()
+    ));
+    out.push_str(&format!(
+        "stellargate_auth_attempts_total{{outcome=\"failure\",reason=\"internal_error\"}} {}\n",
+        auth.failure_internal_error()
     ));
 
     out
