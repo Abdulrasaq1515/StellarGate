@@ -46,6 +46,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -80,6 +81,10 @@ pub struct HorizonPayment {
     /// processed token so polling resumes from it instead of re-scanning.
     #[serde(default)]
     pub paging_token: Option<String>,
+    /// RFC 3339 timestamp of the operation (ledger close time), used to
+    /// measure how far behind the poller/stream cursor is running.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -420,6 +425,14 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
             }
         }
 
+        if let Some(cursor_age_secs) = page
+            .last()
+            .and_then(|hp| hp.created_at.as_deref())
+            .and_then(elapsed_secs)
+        {
+            info!(cursor_age_secs, "poller cursor advanced");
+        }
+
         /* Checkpoint after the whole page is processed. If we crash mid-page the
         cursor still points at the last fully-processed page, and re-reading
         the unfinished page is harmless (settled intents are skipped). */
@@ -563,7 +576,14 @@ async fn settle(
         }
         Ok(true) => {}
     }
-    info!(payment_id = %payment.id, status, %tx_hash, "payment settled");
+    let settlement_latency_secs = elapsed_secs(&payment.created_at);
+    info!(
+        payment_id = %payment.id,
+        status,
+        %tx_hash,
+        ?settlement_latency_secs,
+        "payment settled"
+    );
 
     // Reflect the new state in the copy we hand to the webhook.
     let mut settled = payment.clone();
@@ -775,6 +795,9 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
 
     match serde_json::from_str::<HorizonPayment>(&ev.data) {
         Ok(hp) => {
+            if let Some(cursor_age_secs) = hp.created_at.as_deref().and_then(elapsed_secs) {
+                info!(cursor_age_secs, "stream cursor advanced");
+            }
             if let Err(e) = reconcile_payment(state, &hp).await {
                 warn!(error = %e, "failed to reconcile streamed payment");
             }
@@ -821,6 +844,7 @@ mod tests {
                 successful: Some(true),
             }),
             paging_token: Some("1".into()),
+            created_at: None,
         }
     }
 
@@ -972,6 +996,7 @@ mod tests {
                 successful: Some(true),
             }),
             paging_token: Some("1".into()),
+            created_at: None,
         };
         assert!(matches!(
             verify(&p, &hp, &test_assets(), 0),
@@ -996,6 +1021,7 @@ mod tests {
                 successful: Some(true),
             }),
             paging_token: Some("1".into()),
+            created_at: None,
         };
         assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
         // Sanity: with the right issuer it would have matched.
