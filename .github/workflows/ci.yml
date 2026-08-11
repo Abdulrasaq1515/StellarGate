@@ -19,7 +19,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -55,7 +55,7 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
