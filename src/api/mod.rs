@@ -7,8 +7,8 @@ use axum::{
     routing::{get, post},
     Json,
 };
-use serde_json::json;
 use moka::sync::Cache;
+use serde_json::json;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -73,7 +73,10 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
     axum::Router::new()
-        .route("/", get(|| async { concat!("StellarGate API v", env!("CARGO_PKG_VERSION")) }))
+        .route(
+            "/",
+            get(|| async { concat!("StellarGate API v", env!("CARGO_PKG_VERSION")) }),
+        )
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics_handler))
@@ -254,16 +257,18 @@ async fn rate_limit_middleware(
 ) -> axum::response::Response {
     if let Some(bucket) = rate_limited_bucket(&req) {
         let key = rate_limit_key(bucket, &req);
-        let limited = {
-            let mut map = rate_limit.limiters.lock().unwrap();
-            let base_rps = rate_limit.requests_per_sec;
-            let effective_rps =
-                base_rps.saturating_mul(bucket_rate_multiplier(bucket)).max(1);
-            let limiter = map.entry(key).or_insert_with(|| {
-                governor::RateLimiter::direct(governor::Quota::per_second(
-                    NonZeroU32::new(effective_rps).unwrap(),
-                ))
-            });
+        let base_rps = rate_limit.requests_per_sec;
+        let effective_rps = base_rps
+            .saturating_mul(bucket_rate_multiplier(bucket))
+            .max(1);
+        /* `get_with` clones the `Arc` out of the cache rather than handing back a
+        guard, so nothing borrowed from the cache is held across the `.await`
+        below. */
+        let limiter = rate_limit.limiters.get_with(key, || {
+            Arc::new(governor::RateLimiter::direct(governor::Quota::per_second(
+                NonZeroU32::new(effective_rps).unwrap(),
+            )))
+        });
 
         if limiter.check().is_err() {
             return (
@@ -431,14 +436,18 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
     let url = state.config.horizon_url.trim_end_matches('/').to_string();
     let result = tokio::time::timeout(
         Duration::from_millis(3_000),
-        state.http.get(&url).header("Accept", "application/json").send(),
+        state
+            .http
+            .get(&url)
+            .header("Accept", "application/json")
+            .send(),
     )
     .await;
     match result {
         Ok(Ok(resp)) if resp.status().as_u16() < 500 => Ok(()),
         Ok(Ok(resp)) => Err(format!("Horizon returned {}", resp.status())),
-        Ok(Err(e))   => Err(format!("Horizon unreachable: {e}")),
-        Err(_)       => Err("Horizon health check timed out".to_string()),
+        Ok(Err(e)) => Err(format!("Horizon unreachable: {e}")),
+        Err(_) => Err("Horizon health check timed out".to_string()),
     }
 }
 

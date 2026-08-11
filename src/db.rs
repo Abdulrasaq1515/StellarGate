@@ -274,8 +274,8 @@ pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
     canonical string representation. This ensures "10.00", "10.0", and "10"
     all serialize identically, eliminating spurious string-based comparisons
     across create/get/webhook responses. */
-    let stroops = crate::money::parse_stroops(new.amount)
-        .ok_or_else(|| anyhow::anyhow!("Invalid amount"))?;
+    let stroops =
+        crate::money::parse_stroops(new.amount).ok_or_else(|| anyhow::anyhow!("Invalid amount"))?;
     let canonical_amount = crate::money::stroops_to_string(stroops);
 
     /* Compute the expiry as `now + ttl_secs` in SQLite so it shares the exact

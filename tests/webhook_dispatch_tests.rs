@@ -29,6 +29,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         webhook_secret: webhook_secret.into(),
         webhook_retry_attempts: retry_attempts,
         webhook_retry_delay_ms: 0,
+        allowed_webhook_schemes: vec!["https".into(), "http".into()],
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,
@@ -294,6 +295,7 @@ fn make_horizon_payment(tx_hash: &str) -> HorizonPayment {
             successful: Some(true),
         }),
         paging_token: Some("1".into()),
+        created_at: None,
     }
 }
 

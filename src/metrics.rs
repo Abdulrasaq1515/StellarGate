@@ -170,10 +170,14 @@ impl AuthMetrics {
         self.inner.success.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_failure_missing_key(&self) {
-        self.inner.failure_missing_key.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .failure_missing_key
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_failure_invalid_key(&self) {
-        self.inner.failure_invalid_key.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .failure_invalid_key
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_failure_internal_error(&self) {
         self.inner

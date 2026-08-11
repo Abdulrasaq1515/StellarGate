@@ -77,14 +77,14 @@ pub fn build_payload(payment: &db::Payment, event: &str, delta: Option<&str>) ->
         .unwrap_or_else(|| payment.amount.clone());
 
     // Canonicalize the received amount
-    let canonical_paid_amount = payment.paid_amount.as_ref().and_then(|pa| {
-        crate::money::parse_stroops(pa).map(crate::money::stroops_to_string)
-    });
+    let canonical_paid_amount = payment
+        .paid_amount
+        .as_ref()
+        .and_then(|pa| crate::money::parse_stroops(pa).map(crate::money::stroops_to_string));
 
     // Canonicalize delta if present (it's a price difference)
-    let canonical_delta = delta.and_then(|d| {
-        crate::money::parse_stroops(d).map(|s| crate::money::stroops_to_string(s))
-    });
+    let canonical_delta =
+        delta.and_then(|d| crate::money::parse_stroops(d).map(crate::money::stroops_to_string));
 
     let mut payload = json!({
         "event": event,

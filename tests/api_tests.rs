@@ -22,6 +22,10 @@ fn make_config() -> Config {
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
+        /* Both schemes are allowed here so the scheme allow-list isn't what
+        rejects http:// — these tests cover the network-based rule (http is fine
+        on testnet, HTTPS-only on public), which runs after this gate. */
+        allowed_webhook_schemes: vec!["https".into(), "http".into()],
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,
@@ -1270,7 +1274,7 @@ async fn test_amount_canonicalization_on_create_get_list() {
             .await;
         res.assert_status(StatusCode::CREATED);
         let body: Value = res.json();
-        
+
         // Verify that the created payment has the canonical form
         assert_eq!(
             body["amount"].as_str().unwrap(),
@@ -1279,7 +1283,7 @@ async fn test_amount_canonicalization_on_create_get_list() {
             input,
             expected_canonical
         );
-        
+
         let payment_id = body["id"].as_str().unwrap().to_string();
         payment_ids.push((input, expected_canonical, payment_id));
     }
@@ -1292,7 +1296,7 @@ async fn test_amount_canonicalization_on_create_get_list() {
             .await;
         res.assert_status_ok();
         let body: Value = res.json();
-        
+
         assert_eq!(
             body["amount"].as_str().unwrap(),
             *expected_canonical,
@@ -1308,7 +1312,7 @@ async fn test_amount_canonicalization_on_create_get_list() {
         .await;
     res.assert_status_ok();
     let list: Value = res.json();
-    
+
     for payment in list["payments"].as_array().unwrap() {
         let amount_str = payment["amount"].as_str().unwrap();
         // All amounts should be in canonical form (no trailing zeros)
@@ -1326,7 +1330,7 @@ async fn test_whole_amount_canonicalization() {
     // Test that whole amounts are serialized without decimal point
     let server = test_server().await;
     let key = provision_merchant(&server).await;
-    
+
     let test_cases = vec![
         ("1", "1"),
         ("1.0", "1"),
@@ -1343,7 +1347,7 @@ async fn test_whole_amount_canonicalization() {
             .await;
         res.assert_status(StatusCode::CREATED);
         let body: Value = res.json();
-        
+
         assert_eq!(
             body["amount"].as_str().unwrap(),
             expected,

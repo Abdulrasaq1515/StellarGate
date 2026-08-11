@@ -164,7 +164,9 @@ async fn main() -> Result<()> {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("failed to install Ctrl-C handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
     };
     #[cfg(unix)]
     let terminate = async {

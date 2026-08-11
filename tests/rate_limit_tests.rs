@@ -26,6 +26,7 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
+        allowed_webhook_schemes: vec!["https".into(), "http".into()],
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,

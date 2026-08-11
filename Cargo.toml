@@ -2,7 +2,7 @@
 name = "stellargate"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 
 description = "A Rust toolkit for building on the Stellar blockchain"
 repository = "https://github.com/StellarGateLabs/StellarGate"
@@ -38,6 +38,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 url = "2.5"
+time = { version = "0.3", features = ["parsing"] }
 
 
 [dev-dependencies]

@@ -189,6 +189,14 @@ impl HorizonPayment {
     }
 }
 
+/// Seconds elapsed between an RFC 3339 timestamp and now. Used to observe
+/// cursor age (how stale the poller/stream cursor is) and settlement latency
+/// (how long an intent took to settle). Returns `None` if `ts` doesn't parse.
+fn elapsed_secs(ts: &str) -> Option<i64> {
+    let then = OffsetDateTime::parse(ts, &Rfc3339).ok()?;
+    Some((OffsetDateTime::now_utc() - then).whole_seconds())
+}
+
 /// Decide whether a Horizon payment satisfies a pending intent.
 ///
 /// `already_paid_stroops` is the cumulative amount already received for this

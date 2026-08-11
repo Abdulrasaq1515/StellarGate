@@ -76,6 +76,7 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,
             webhook_retry_delay_ms: 0,
+            allowed_webhook_schemes: vec!["https".into(), "http".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -141,6 +142,7 @@ fn make_horizon_payment() -> HorizonPayment {
             successful: Some(true),
         }),
         paging_token: Some("1".into()),
+        created_at: None,
     }
 }
 
@@ -309,6 +311,7 @@ fn payment_with(tx_hash: &str, amount: &str) -> HorizonPayment {
             successful: Some(true),
         }),
         paging_token: Some("1".into()),
+        created_at: None,
     }
 }
 

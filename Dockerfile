@@ -1,5 +1,5 @@
 # ── Stage 1: dependency cache via cargo-chef ─────────────────────────────────
-FROM rust:1.75-bookworm AS chef
+FROM rust:1.88-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
@@ -17,8 +17,10 @@ RUN cargo build --release --locked
 # ── Stage 2: slim runtime image ───────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
+# `curl` is required by the healthcheck in docker-compose.yml; without it the
+# container reports unhealthy even while serving traffic normally.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -u 1001 -U stellargate \

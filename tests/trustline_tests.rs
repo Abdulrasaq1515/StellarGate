@@ -53,6 +53,7 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,
             webhook_retry_delay_ms: 0,
+            allowed_webhook_schemes: vec!["https".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,

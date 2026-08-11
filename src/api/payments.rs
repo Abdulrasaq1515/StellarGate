@@ -138,24 +138,39 @@ pub async fn create(
         ));
     }
     if let Some(url) = &body.webhook_url {
-        if url.len() > 2048{
+        if url.len() > 2048 {
             return Err(AppError::bad_request(
                 "invalid_webhook_url",
-                "webhook_url exceeds max length of 2048 characters"
+                "webhook_url exceeds max length of 2048 characters",
             ));
         };
         let parsed_url = reqwest::Url::parse(url).map_err(|_| {
             AppError::bad_request("invalid_webhook_url", "webhook_url is not a valid URL")
         })?;
 
-        if !state.config.allowed_webhook_schemes.contains(&parsed_url.scheme().to_string()){
+        if !state
+            .config
+            .allowed_webhook_schemes
+            .contains(&parsed_url.scheme().to_string())
+        {
             return Err(AppError::bad_request(
                 "invalid_webhook_url",
-                &format!(
+                format!(
                     "webhook_url scheme '{}' not allowed. Allowed schemes: {:?}",
                     parsed_url.scheme(),
                     state.config.allowed_webhook_schemes
-                )
+                ),
+            ));
+        }
+
+        /* Independent of the configurable allow-list: on the public network a
+        webhook must be HTTPS. Delivery carries payment data and the HMAC
+        signature, so a permissive ALLOWED_WEBHOOK_SCHEMES must not be able to
+        downgrade mainnet traffic to plaintext. */
+        if state.config.network == "public" && parsed_url.scheme() != "https" {
+            return Err(AppError::bad_request(
+                "invalid_webhook_url",
+                "webhook_url must be an HTTPS URL on public network",
             ));
         }
 
@@ -407,9 +422,10 @@ fn to_json(p: &db::Payment) -> Value {
     // Canonicalize paid_amount the same way (defensive; it should already be
     // canonical from horizon.rs, but this ensures consistency across all
     // serialization paths).
-    let canonical_paid_amount = p.paid_amount.as_ref().and_then(|pa| {
-        crate::money::parse_stroops(pa).map(crate::money::stroops_to_string)
-    });
+    let canonical_paid_amount = p
+        .paid_amount
+        .as_ref()
+        .and_then(|pa| crate::money::parse_stroops(pa).map(crate::money::stroops_to_string));
 
     json!({
         "id": p.id,

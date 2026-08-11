@@ -162,7 +162,6 @@ pub struct Config {
     /// `408 Request Timeout`, so a slow client or a stuck handler can't tie up
     /// a connection indefinitely. Defaults to 30 seconds.
     pub request_timeout_secs: u64,
-    pub allowed_webhook_schemes: Vec<String>
 }
 
 impl Config {
@@ -176,10 +175,10 @@ impl Config {
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
         let allowed_webhook_schemes: Vec<String> = {
-            let raw_schemes = std::env::var("ALLOWED_WEBHOOK_SCHEMES")
-                .unwrap_or_else(|_| "https".to_string());
+            let raw_schemes =
+                std::env::var("ALLOWED_WEBHOOK_SCHEMES").unwrap_or_else(|_| "https".to_string());
             raw_schemes
-                .split(',)
+                .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect()
@@ -511,6 +510,7 @@ mod tests {
             webhook_secret: "webhook-hmac-secret".into(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
+            allowed_webhook_schemes: vec!["https".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -582,6 +582,7 @@ mod tests {
             webhook_secret: String::new(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
+            allowed_webhook_schemes: vec!["https".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -766,10 +767,7 @@ mod tests {
                     "STELLAR_GATEWAY_SECRET",
                     Some("SCZANGBA5RLKJHTBF4RJNRJMZWI4VKTHCRKOVAH7LRZZPZHHZWATAWBN"),
                 ),
-                (
-                    "CORS_ALLOWED_ORIGINS",
-                    Some("https://example.com"),
-                ),
+                ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
             ],
             || {
                 let cfg = Config::from_env().unwrap();
@@ -805,8 +803,10 @@ mod tests {
             || {
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(
-                    err.contains("CORS_ALLOWED_ORIGINS must be set") ||
-                    err.contains("CORS_ALLOWED_ORIGINS must be set when STELLAR_NETWORK=public"),
+                    err.contains("CORS_ALLOWED_ORIGINS must be set")
+                        || err.contains(
+                            "CORS_ALLOWED_ORIGINS must be set when STELLAR_NETWORK=public"
+                        ),
                     "got: {err}"
                 );
             },
