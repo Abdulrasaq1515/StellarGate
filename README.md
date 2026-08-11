@@ -19,6 +19,7 @@ A payment gateway API built on [Stellar](https://stellar.org) for accepting, ver
 - [Getting Started](#getting-started)
 - [Dashboard](#dashboard)
 - [Configuration](#configuration)
+  - [Trustlines](#trustlines)
 - [API Reference](#api-reference)
 - [Payment Resolution Policy](#payment-resolution-policy)
 - [Webhooks](#webhooks)
@@ -231,8 +232,65 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet Horizon |
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
-| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only. Each issuer is strkey-validated at boot. | `XLM,USDC:<testnet issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. | `XLM,USDC:<testnet issuer>` |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
+
+### Trustlines
+
+**Every non-native asset in `ACCEPTED_ASSETS` needs a trustline on the gateway
+account.** This is a Stellar rule, not a StellarGate one: an account cannot hold
+an asset it does not trust, so a payment in an untrusted asset **fails on-chain**
+before the gateway ever sees it. Nothing in the API can rescue it — the intent
+sits `pending` until it expires while the payer's transaction is rejected.
+
+XLM is native and never needs one. `ACCEPTED_ASSETS` defaults to including USDC,
+so a fresh account will be missing that trustline.
+
+StellarGate checks at startup and names anything missing:
+
+```
+WARN gateway account has no trustline for an accepted asset;
+     intents in this asset will be unpayable  asset=USDC issuer=GBBD47IF…
+INFO accepted assets with no trustline on the gateway account  missing=["USDC"]
+```
+
+It is a warning, not a boot failure — accepting XLM only is perfectly valid, so
+refusing to start would be wrong. **Read the first lines of the log after your
+first deploy.**
+
+To check what the account currently trusts:
+
+```bash
+curl -s "https://horizon-testnet.stellar.org/accounts/$STELLAR_GATEWAY_PUBLIC" \
+  | jq '.balances[] | {asset: (.asset_code // "XLM"), issuer: .asset_issuer}'
+```
+
+Adding one is a `changeTrust` operation signed by the gateway account's **secret
+key** — done once, from a wallet or script you control, never by StellarGate,
+which holds no secret key and cannot do it for you. Any Stellar wallet
+(Lobstr, Freighter) can add a trustline, or use the SDK:
+
+```python
+from stellar_sdk import Keypair, Server, TransactionBuilder, Network, Asset
+
+kp = Keypair.from_secret("S...")            # gateway account secret
+server = Server("https://horizon-testnet.stellar.org")
+tx = (TransactionBuilder(
+        source_account=server.load_account(kp.public_key),
+        network_passphrase=Network.TESTNET_NETWORK_PASSPHRASE,
+        base_fee=100)
+      .append_change_trust_op(asset=Asset("USDC", "GBBD47IF…"))
+      .set_timeout(90).build())
+tx.sign(kp)
+server.submit_transaction(tx)
+```
+
+Each trustline locks **0.5 XLM** of the account's base reserve, so keep enough
+XLM free to cover one per asset.
+
+> The issuer must match `ACCEPTED_ASSETS` exactly. `USDC` from the wrong issuer
+> is a different asset entirely, and a trustline to it will not make payments in
+> the configured one succeed.
 
 ### Settlement
 

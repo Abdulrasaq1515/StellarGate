@@ -36,6 +36,9 @@ in an asset with no trustline **fails on-chain** — the gateway cannot rescue i
 It logs a warning at startup naming any accepted asset that is missing one, so
 read the first few lines of the log after your first deploy.
 
+See [Trustlines](README.md#trustlines) for how to check what an account trusts
+and how to add one.
+
 ### 2. A domain
 
 Caddy issues a Let's Encrypt certificate automatically, which requires a domain
