@@ -33,6 +33,9 @@ fn make_config() -> Config {
         webhook_redrive_grace_secs: 60,
         webhook_redrive_backoff_initial_secs: 0,
         webhook_redrive_backoff_max_secs: 0,
+        retention_interval_secs: 3600,
+        webhook_delivery_retention_days: 30,
+        idempotency_retention_days: 7,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
         /* High enough that these tests never trip the limiter; dedicated

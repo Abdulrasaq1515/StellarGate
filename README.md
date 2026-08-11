@@ -82,6 +82,7 @@ A payment is matched on three independent attributes — **memo**, **destination
 | SSRF protection | ✅ | Webhook targets resolved and filtered, re-checked on every send |
 | Rate limiting | ✅ | Per-IP, per-route-bucket |
 | API key lifecycle | ✅ | CSPRNG keys, rotation with overlap, instant revocation |
+| Data retention | ✅ | Background pruning of aged delivery rows and idempotency keys |
 | Prometheus metrics | ✅ | `GET /metrics` |
 | Dashboard UI | ✅ | Served at `/dashboard`; no build step or separate deploy |
 
@@ -98,6 +99,7 @@ src/
 ├── ssrf.rs        Webhook target resolution and private-range filtering
 ├── horizon.rs     Horizon SSE listener, interval poller, payment verification
 ├── expiry.rs      Background sweeper for overdue pending intents
+├── retention.rs   Background pruning of aged rows (bounds table growth)
 ├── metrics.rs     Prometheus counters and histograms
 ├── webhook.rs     Signed dispatch and the background redrive worker
 └── api/
@@ -326,6 +328,29 @@ Recovers deliveries left `pending`/`failed` by a process that exited mid-send or
 | `WEBHOOK_REDRIVE_GRACE_SECS` | Idle time required before the worker touches a row, so it never races an in-flight inline delivery. Also the floor under the backoff. | `60` |
 | `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Exponential backoff base: `initial × 2^(attempts−1)`. A row never attempted is exempt and gated only by the grace window. `0` disables growth. | `30` |
 | `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Backoff ceiling. Must be `≥` the initial value. | `900` |
+
+### Retention
+
+Two tables grow with traffic and have no natural bound — `idempotency_keys`
+gains a row per guarded create, `webhook_deliveries` one per delivery attempt.
+A background worker prunes both. On the single-volume deployments this service
+targets, an unbounded table eventually fills the disk and takes the gateway
+down.
+
+| Variable | Description | Default |
+|---|---|---|
+| `RETENTION_INTERVAL_SECS` | How often the worker prunes | `3600` |
+| `WEBHOOK_DELIVERY_RETENTION_DAYS` | Days to keep **terminal** (`delivered`/`failed`) delivery rows. `0` keeps them forever. | `30` |
+| `IDEMPOTENCY_RETENTION_DAYS` | Days to keep idempotency keys — they only need to outlive the window in which a client might retry. `0` keeps them forever. | `7` |
+
+> A `pending` delivery is **never** pruned regardless of age: the redrive worker
+> still owns it, and deleting it would silently drop a webhook the merchant is
+> owed. The worker marks rows `failed` once attempts are exhausted, so nothing
+> stays exempt forever.
+
+Deletes run in batches of 500 with a per-cycle cap. SQLite has a single writer,
+so one unbounded `DELETE` over a large table would stall every payment write
+until it finished; a backlog drains over several cycles instead.
 
 ### Security and Limits
 

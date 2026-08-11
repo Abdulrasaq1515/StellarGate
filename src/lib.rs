@@ -5,6 +5,7 @@ pub mod expiry;
 pub mod horizon;
 pub mod metrics;
 pub mod money;
+pub mod retention;
 pub mod ssrf;
 pub mod strkey;
 pub mod webhook;

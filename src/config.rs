@@ -130,6 +130,17 @@ pub struct Config {
     /// that has failed many times still gets retried at a bounded cadence
     /// rather than being pushed further and further out.
     pub webhook_redrive_backoff_max_secs: i64,
+    /// How often the retention worker prunes rows that have outlived their
+    /// usefulness. Both tables below grow monotonically without it, so on a
+    /// long-running deployment the disk is the only thing that stops them.
+    pub retention_interval_secs: u64,
+    /// Days to keep terminal (`delivered`/`failed`) webhook delivery rows.
+    /// `0` disables pruning and keeps them forever.
+    pub webhook_delivery_retention_days: i64,
+    /// Days to keep idempotency keys. They only need to outlive the window in
+    /// which a client might retry a create, so this can be short. `0` disables
+    /// pruning.
+    pub idempotency_retention_days: i64,
     pub poll_interval_secs: u64,
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
@@ -242,6 +253,9 @@ impl Config {
                 30,
             )?,
             webhook_redrive_backoff_max_secs: parse_env("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS", 900)?,
+            retention_interval_secs: parse_env("RETENTION_INTERVAL_SECS", 3600)?,
+            webhook_delivery_retention_days: parse_env("WEBHOOK_DELIVERY_RETENTION_DAYS", 30)?,
+            idempotency_retention_days: parse_env("IDEMPOTENCY_RETENTION_DAYS", 7)?,
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
@@ -518,6 +532,9 @@ mod tests {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 30,
             webhook_redrive_backoff_max_secs: 900,
+            retention_interval_secs: 3600,
+            webhook_delivery_retention_days: 30,
+            idempotency_retention_days: 7,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
@@ -590,6 +607,9 @@ mod tests {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 30,
             webhook_redrive_backoff_max_secs: 900,
+            retention_interval_secs: 3600,
+            webhook_delivery_retention_days: 30,
+            idempotency_retention_days: 7,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,

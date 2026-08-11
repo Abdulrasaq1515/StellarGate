@@ -14,7 +14,7 @@ use stellargate::{
     config::{Config, ListenerMode},
     db, expiry, horizon,
     metrics::{AuthMetrics, WebhookMetrics},
-    webhook, AppState, TaskHealth,
+    retention, webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -72,6 +72,10 @@ async fn main() -> Result<()> {
         &health,
         expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
     );
+    let retention = spawn_task(
+        &health,
+        retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
+    );
     let redrive = spawn_task(
         &health,
         webhook::run_redrive_worker(state.clone(), shutdown_rx),
@@ -93,6 +97,7 @@ async fn main() -> Result<()> {
         join_task(poller, &health).await;
         join_task(sweeper, &health).await;
         join_task(redrive, &health).await;
+        join_task(retention, &health).await;
         if let Some(handle) = stream {
             join_task(handle, &health).await;
         }

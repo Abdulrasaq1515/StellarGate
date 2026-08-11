@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a tombstone so the audit trail survives it, and revoking a merchant's last
   active key is refused. Keys issued before this change keep working — the
   migration carries them into the new table (issues #74, #81).
+- **Data retention worker.** `idempotency_keys` and `webhook_deliveries` grew
+  monotonically with no bound, so on a long-running deployment the disk was the
+  only thing that stopped them — and these deployments run on a single volume,
+  where a full disk takes the gateway down. A background worker now prunes both
+  on an interval, configurable via `RETENTION_INTERVAL_SECS`,
+  `WEBHOOK_DELIVERY_RETENTION_DAYS` and `IDEMPOTENCY_RETENTION_DAYS` (`0`
+  disables either). A `pending` delivery is never pruned regardless of age —
+  the redrive worker still owns it. Deletes are batched so no single statement
+  holds SQLite's write lock long enough to stall payment traffic
+  (issues #110, #111).
 - Index on `webhook_deliveries(payment_id)`; delivery listings and the redrive
   worker were doing a full scan (issue #112).
 - Operator dashboard at `/dashboard` — payments list with status filtering and

@@ -938,6 +938,66 @@ pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str, prefix: &str) -
     Ok(key_id)
 }
 
+/* ---------------------------------------------------------------------------
+Retention
+--------------------------------------------------------------------------- */
+
+/// Rows removed per statement. Deleting in batches keeps each write lock short:
+/// SQLite has a single writer, so one unbounded `DELETE` over a large table
+/// would stall every payment write until it finished.
+pub const PRUNE_BATCH: i64 = 500;
+
+/// Delete one batch of idempotency keys older than `retention_days`.
+///
+/// A key only has to outlive the window in which a client might retry the
+/// create it guarded. Past that it is dead weight, and the table has no other
+/// bound (issue #110).
+///
+/// Returns how many rows went; the caller loops until a batch comes back
+/// short.
+pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u64> {
+    let cutoff = format!("-{retention_days} days");
+    let n = sqlx::query(
+        "DELETE FROM idempotency_keys
+          WHERE rowid IN (
+              SELECT rowid FROM idempotency_keys
+               WHERE created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               LIMIT ?
+          )",
+    )
+    .bind(&cutoff)
+    .bind(PRUNE_BATCH)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n)
+}
+
+/// Delete one batch of webhook deliveries that have finished and aged out.
+///
+/// Only `delivered` and `failed` rows are eligible. A `pending` row is still
+/// owned by the redrive worker — pruning it would silently drop a delivery
+/// that was going to be retried. The worker marks rows `failed` once attempts
+/// are exhausted, so nothing stays exempt forever (issue #111).
+pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
+    let cutoff = format!("-{retention_days} days");
+    let n = sqlx::query(
+        "DELETE FROM webhook_deliveries
+          WHERE rowid IN (
+              SELECT rowid FROM webhook_deliveries
+               WHERE status IN ('delivered','failed')
+                 AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               LIMIT ?
+          )",
+    )
+    .bind(&cutoff)
+    .bind(PRUNE_BATCH)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n)
+}
+
 /// A key as exposed to an operator. Never carries the secret — only a
 /// prefix, so two keys can be told apart in a list.
 #[derive(Debug, Clone)]
