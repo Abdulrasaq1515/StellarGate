@@ -58,6 +58,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   work around the same repetition. Behaviour unchanged.
 - README rewritten against the actual API surface.
 
+### Security
+
+- **`GET /payments/:id` no longer discloses cross-tenant detail.** The endpoint
+  was fully public and returned `merchant_id`, amounts, the destination address
+  and `tx_hash` for any id — and payment ids travel through logs, referrers and
+  browser history, so anyone who came across one could identify the merchant
+  and the sum involved. It now returns a minimal projection (`id`, `status`,
+  `expires_at`) to unauthenticated callers and the full record only to the
+  owning merchant. Another merchant's key gets `404`, identical to an unknown
+  id, so the response cannot be used to confirm a payment exists
+  (issues #67, #85).
+
+  **Breaking:** clients that read amounts or `merchant_id` from this endpoint
+  without authenticating must now send the merchant's API key.
+
 ### Fixed
 
 - **The build.** `main` did not compile. An unclosed block in

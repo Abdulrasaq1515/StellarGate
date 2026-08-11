@@ -457,7 +457,11 @@ async fn test_get_by_id() {
         .unwrap()
         .to_string();
 
-    let res = server.get(&format!("/payments/{id}")).await;
+    // Full detail now requires the owning merchant's key (issues #67, #85).
+    let res = server
+        .get(&format!("/payments/{id}"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
     res.assert_status_ok();
     let body = res.json::<Value>();
     assert_eq!(body["id"], id);
@@ -1817,4 +1821,194 @@ async fn test_key_endpoints_404_for_unknown_merchant() {
         .await;
     res.assert_status(StatusCode::NOT_FOUND);
     assert_eq!(res.json::<Value>()["code"], "merchant_not_found");
+}
+
+// ── Scoped reads on GET /payments/:id (issues #67, #85) ──────────────────
+
+/// Unauthenticated callers keep a way to poll for completion, but the response
+/// must not identify the merchant or the sum involved. Payment ids travel
+/// through logs, referrers and browser history, so this response is
+/// effectively public.
+#[tokio::test]
+async fn test_public_payment_view_hides_merchant_and_amounts() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let created: Value = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "1234.5678", "asset": "XLM" }))
+        .await
+        .json();
+    let id = created["id"].as_str().unwrap();
+    let merchant_id = created["merchant_id"].as_str().unwrap();
+
+    let res = server.get(&format!("/payments/{id}")).await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    // Still useful: you can tell whether it has been paid.
+    assert_eq!(body["id"], json!(id));
+    assert_eq!(body["status"], json!("pending"));
+    assert!(body["expires_at"].is_string());
+
+    // ...and nothing that enables cross-tenant reconnaissance.
+    for leaked in [
+        "merchant_id",
+        "amount",
+        "paid_amount",
+        "tx_hash",
+        "destination_address",
+    ] {
+        assert!(
+            body.get(leaked).is_none(),
+            "public view must not expose {leaked}: {body}"
+        );
+    }
+
+    // Belt and braces: the merchant id must not appear anywhere in the bytes.
+    assert!(
+        !res.text().contains(merchant_id),
+        "merchant id leaked into the public view"
+    );
+    assert!(
+        !res.text().contains("1234.5678"),
+        "amount leaked into the public view"
+    );
+}
+
+/// The owning merchant still gets everything.
+#[tokio::test]
+async fn test_owner_sees_full_payment_detail() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .get(&format!("/payments/{id}"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    for field in [
+        "merchant_id",
+        "amount",
+        "asset",
+        "destination_address",
+        "memo",
+    ] {
+        assert!(
+            body.get(field).is_some(),
+            "owner should see {field}: {body}"
+        );
+    }
+}
+
+/// Another merchant's key must get a 404, not a 403. A 403 would confirm the
+/// payment exists and belongs to someone else, which is the cross-tenant
+/// signal these issues are about.
+#[tokio::test]
+async fn test_other_merchants_key_cannot_read_a_payment() {
+    let server = test_server().await;
+    let owner_key = provision_merchant(&server).await;
+    let stranger_key = provision_merchant(&server).await;
+
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {owner_key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .get(&format!("/payments/{id}"))
+        .add_header("Authorization", format!("Bearer {stranger_key}"))
+        .await;
+    res.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(res.json::<Value>()["code"], "payment_not_found");
+
+    // Identical to the response for an id that does not exist at all, so the
+    // two cases are indistinguishable to a prober.
+    let unknown = server
+        .get("/payments/00000000-0000-4000-8000-000000000000")
+        .add_header("Authorization", format!("Bearer {stranger_key}"))
+        .await;
+    assert_eq!(unknown.status_code(), res.status_code());
+    assert_eq!(unknown.json::<Value>()["code"], res.json::<Value>()["code"]);
+}
+
+/// A supplied-but-invalid key is an error, not a silent downgrade to the
+/// public view — otherwise a typo'd or revoked key looks like missing fields.
+#[tokio::test]
+async fn test_invalid_key_on_public_route_is_rejected() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .get(&format!("/payments/{id}"))
+        .add_header("Authorization", "Bearer sg_deadbeef")
+        .await;
+    res.assert_status(StatusCode::UNAUTHORIZED);
+    assert_eq!(res.json::<Value>()["code"], "unauthorized");
+}
+
+/// A revoked key must lose access to detail it previously had.
+#[tokio::test]
+async fn test_revoked_key_loses_access_to_payment_detail() {
+    let server = test_server().await;
+    let provisioned: Value = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .json();
+    let merchant_id = provisioned["merchant_id"].as_str().unwrap();
+    let old_key = provisioned["api_key"].as_str().unwrap().to_string();
+    let old_key_id = provisioned["key_id"].as_str().unwrap();
+
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {old_key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Issue a replacement so the last-key guard doesn't block revocation.
+    server
+        .post(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .assert_status(StatusCode::CREATED);
+    server
+        .delete(&format!("/merchants/{merchant_id}/keys/{old_key_id}"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .assert_status_ok();
+
+    let res = server
+        .get(&format!("/payments/{id}"))
+        .add_header("Authorization", format!("Bearer {old_key}"))
+        .await;
+    res.assert_status(StatusCode::UNAUTHORIZED);
 }

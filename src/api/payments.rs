@@ -269,18 +269,72 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(to_json(&payment))))
 }
 
+/// `GET /payments/:id` — status for one payment.
+///
+/// This route stays reachable without a merchant key so a checkout page can
+/// poll it directly, but what it returns depends on who is asking
+/// (issues #67, #85):
+///
+/// - **No credential** → a minimal projection: the id, its status, and when it
+///   expires. Enough to answer "has this been paid yet", and nothing else.
+/// - **The owning merchant's key** → the full record.
+/// - **Another merchant's key** → `404`, the same answer an unknown id gets.
+///   A `403` would confirm the payment exists and belongs to someone else,
+///   which is exactly the cross-tenant signal these issues are about.
+///
+/// The public projection deliberately omits `merchant_id`, every amount, and
+/// `tx_hash`. Payment ids travel through logs, referrers and browser history,
+/// so anything on this response should be treated as effectively public: it
+/// previously leaked which merchant an id belonged to and how much it was for.
 pub async fn get_by_id(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    match db::get_payment(&state.pool, &id).await? {
-        Some(p) => Ok(Json(to_json(&p))),
-        None => Err(AppError::new(
-            StatusCode::NOT_FOUND,
+    let payment = db::get_payment(&state.pool, &id)
+        .await?
+        .ok_or_else(|| AppError::not_found("payment_not_found", "payment not found"))?;
+
+    let Some(key) = bearer_token(&headers) else {
+        return Ok(Json(public_view(&payment)));
+    };
+
+    /* A credential was offered, so honour it rather than silently falling back
+    to the public view — a typo'd or revoked key should say so, not quietly
+    return less data and leave the caller wondering why fields are missing. */
+    match db::find_merchant_by_key(&state.pool, &key).await? {
+        Some(merchant_id) if merchant_id == payment.merchant_id => Ok(Json(to_json(&payment))),
+        Some(_) => Err(AppError::not_found(
             "payment_not_found",
             "payment not found",
         )),
+        None => Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid Authorization header",
+        )),
     }
+}
+
+/// Extract a bearer token, if one was supplied at all.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+}
+
+/// What an unauthenticated caller sees: enough to poll for completion, with
+/// nothing that identifies the merchant or the sum involved.
+fn public_view(p: &db::Payment) -> Value {
+    json!({
+        "id": p.id,
+        "status": p.status,
+        "expires_at": p.expires_at,
+    })
 }
 
 #[derive(Deserialize)]

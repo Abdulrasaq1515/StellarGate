@@ -373,7 +373,7 @@ until it finished; a backlog drains over several cycles instead.
 | Merchant API key | `Authorization: Bearer <api_key>` | `POST /payments`, `GET /payments`, webhook delivery routes |
 | Admin secret | `X-Admin-Secret: <secret>` | `POST /merchants` |
 
-`GET /payments/:id` is intentionally public — anyone holding the payment ID can poll its status, which lets a checkout page poll without embedding a merchant key.
+`GET /payments/:id` is reachable without a key so a checkout page can poll it directly, but **what it returns depends on who is asking** — an unauthenticated caller gets a minimal projection with no merchant or financial detail. See the endpoint below.
 
 ### Error Envelope
 
@@ -557,9 +557,24 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
 
 ### `GET /payments/:id`
 
-Fetch a payment's current state. Public — no authentication required.
+Fetch a payment's current state. Reachable with or without a key, but the
+response differs.
 
-**`200 OK`**
+**Without a credential** — a minimal projection, enough to poll for completion:
+
+```json
+{
+  "id": "a1b2c3d4-...",
+  "status": "pending",
+  "expires_at": "2026-04-29T16:00:00Z"
+}
+```
+
+**With the owning merchant's key** — the full record:
+
+```bash
+curl http://localhost:3000/payments/$ID -H "Authorization: Bearer $API_KEY"
+```
 
 ```json
 {
@@ -577,6 +592,25 @@ Fetch a payment's current state. Public — no authentication required.
   "expires_at": "2026-04-29T16:00:00Z"
 }
 ```
+
+| Caller | Response |
+|---|---|
+| No `Authorization` header | `200` — minimal projection above |
+| Owning merchant's key | `200` — full record |
+| **Another merchant's key** | `404 payment_not_found` |
+| Invalid or revoked key | `401 unauthorized` |
+
+> Another merchant's key gets a `404`, identical to an id that does not exist.
+> A `403` would confirm the payment is real and belongs to someone else, which
+> is precisely the cross-tenant signal this is meant to withhold.
+>
+> An invalid key is an error rather than a silent fall back to the public view,
+> so a typo'd or revoked credential says so instead of looking like missing
+> fields.
+
+The public projection omits `merchant_id`, every amount, `tx_hash` and the
+destination address by design. Payment ids travel through logs, referrers and
+browser history, so treat anything on that response as effectively public.
 
 **Status values**
 
@@ -809,6 +843,8 @@ For the full canonical reference, see **[WEBHOOK_REFERENCE.md](WEBHOOK_REFERENCE
 ## Security Model
 
 **No custody.** The gateway never holds a secret key, never signs, and never submits a transaction. Compromising it does not move funds — it only watches an address.
+
+**Reads are scoped to the owning merchant.** `GET /payments/:id` returns full detail only to the merchant that owns it; unauthenticated callers get a status-only projection with no merchant id or amounts, and another merchant's key gets a 404 rather than a 403 so the response cannot confirm a payment exists.
 
 **API keys are hashed at rest.** They are 256-bit tokens from the OS CSPRNG, shown once at issue and never stored in plaintext. Each merchant can hold several, so a key can be rotated without downtime, and any key can be revoked instantly — revocation takes effect on the next request. Revoking a merchant's last active key is refused, since this API has no self-service recovery.
 
