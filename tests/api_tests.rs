@@ -1464,3 +1464,39 @@ async fn test_dashboard_css_forces_hidden_to_win() {
          {{ display: grid }}`, got: {rule}"
     );
 }
+
+/// A browser opening the service root should land on the dashboard. Hosting
+/// platforms and port-forwarding UIs hand you the root URL, so a bare version
+/// string there reads as "nothing is running" and hides the UI entirely.
+#[tokio::test]
+async fn test_root_redirects_browsers_to_the_dashboard() {
+    let server = test_server().await;
+    let res = server
+        .get("/")
+        .add_header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+        .await;
+    res.assert_status(StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.header("location"), "/dashboard");
+}
+
+/// ...but API clients must keep the plaintext version string. `fetch()` and
+/// `curl` send `*/*`, and the dashboard's own version lookup depends on this.
+#[tokio::test]
+async fn test_root_serves_version_to_api_clients() {
+    let server = test_server().await;
+
+    for accept in ["*/*", "application/json"] {
+        let res = server.get("/").add_header("Accept", accept).await;
+        res.assert_status_ok();
+        assert!(
+            res.text().starts_with("StellarGate API v"),
+            "Accept: {accept} should get the version string, got: {}",
+            res.text()
+        );
+    }
+
+    // No Accept header at all (plain curl) must not redirect either.
+    let res = server.get("/").await;
+    res.assert_status_ok();
+    assert!(res.text().starts_with("StellarGate API v"));
+}

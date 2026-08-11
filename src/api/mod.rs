@@ -73,10 +73,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
     axum::Router::new()
-        .route(
-            "/",
-            get(|| async { concat!("StellarGate API v", env!("CARGO_PKG_VERSION")) }),
-        )
+        .route("/", get(root))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics_handler))
@@ -399,6 +396,37 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
             HeaderName::from_static("content-type"),
             HeaderName::from_static("authorization"),
         ])
+}
+
+/// Service root.
+///
+/// A browser gets sent to the dashboard; anything else gets the version string.
+/// Hosting platforms hand you the root URL ("open in browser"), so a bare line
+/// of text there reads as "nothing is running" and gives no hint that a UI
+/// exists one path away.
+///
+/// The split is on `Accept`, not User-Agent: `fetch()` and `curl` send `*/*`
+/// and keep the plaintext response, so the dashboard's own version lookup and
+/// any uptime check are unaffected.
+async fn root(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    let wants_html = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"));
+
+    if wants_html {
+        axum::response::Redirect::temporary("/dashboard").into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            concat!("StellarGate API v", env!("CARGO_PKG_VERSION")),
+        )
+            .into_response()
+    }
 }
 
 async fn health() -> impl IntoResponse {
