@@ -151,13 +151,24 @@
     }
   }
 
-  function signOut(message) {
+  /** Return to the sign-in form, keeping any stored key so a reload retries. */
+  function showGate(message) {
     state.key = null;
-    forgetKey();
     closeDetail();
     show($("app"), false);
     show($("gate"), true);
     setError($("gate-error"), message || null);
+  }
+
+  /** Return to the sign-in form AND discard the stored key.
+   *
+   * Only for cases where the key itself is the problem (a 401, or an explicit
+   * sign-out). A transient failure must use showGate() instead: discarding a
+   * perfectly good key because the network blinked forces the user to dig it
+   * out again. */
+  function signOut(message) {
+    forgetKey();
+    showGate(message);
   }
 
   function signIn(key, persist) {
@@ -437,13 +448,20 @@
     }, 30000);
 
     // Resume an existing session when a key is already stored.
+    /* Resume an existing session when a key is already stored. The gate is
+       visible until this succeeds, so any failure here simply leaves the user
+       looking at the sign-in form rather than at nothing. */
     var existing = storedKey();
     if (existing) {
-      signIn(existing, null).catch(function () {
-        /* signOut already surfaced the reason */
+      signIn(existing, null).catch(function (err) {
+        /* A 401 already returned to the gate via signOut() inside api(). Every
+           other failure — server down, network dropped, a proxy returning a
+           login page — must land there too. Swallowing it would leave both
+           panels hidden and render a blank page with no way forward. */
+        if (err.message !== "unauthorized") {
+          showGate("Could not restore your session: " + err.message);
+        }
       });
-    } else {
-      show($("gate"), true);
     }
   }
 

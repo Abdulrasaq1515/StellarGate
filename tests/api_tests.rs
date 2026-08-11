@@ -1500,3 +1500,56 @@ async fn test_root_serves_version_to_api_clients() {
     res.assert_status_ok();
     assert!(res.text().starts_with("StellarGate API v"));
 }
+
+/// Regression guard: the sign-in form must be visible in the markup as shipped.
+///
+/// Both panels used to start hidden, with the script revealing one once it had
+/// decided which to show. Any failure before that decision — script blocked,
+/// an exception, a session resume failing for a reason other than 401 — left
+/// both hidden and rendered a blank page with no way forward.
+///
+/// Defaulting to the gate means the worst case degrades to "sign in" instead.
+#[tokio::test]
+async fn test_dashboard_gate_is_visible_without_javascript() {
+    let server = test_server().await;
+    let html = server.get("/dashboard").await.text();
+
+    let gate = html
+        .find(r#"id="gate""#)
+        .map(|i| &html[i..html[i..].find('>').map(|j| i + j).unwrap_or(html.len())])
+        .expect("dashboard must contain the sign-in gate");
+
+    assert!(
+        !gate.contains("hidden"),
+        "the sign-in gate must not be hidden in the markup, or a script failure \
+         leaves a blank page; got: <section {gate}>"
+    );
+
+    // The app panel is the one that starts hidden.
+    let app = html
+        .find(r#"id="app""#)
+        .map(|i| &html[i..html[i..].find('>').map(|j| i + j).unwrap_or(html.len())])
+        .expect("dashboard must contain the app panel");
+    assert!(app.contains("hidden"), "the app panel should start hidden");
+}
+
+/// The sign-in form must not submit via GET. The script calls preventDefault,
+/// but if it never ran, a default GET submit would put the merchant's API key
+/// in the URL and the browser history. POST keeps it in a request body that
+/// this route answers with 405.
+#[tokio::test]
+async fn test_dashboard_form_does_not_leak_key_via_get() {
+    let server = test_server().await;
+    let html = server.get("/dashboard").await.text();
+
+    let form = html
+        .find(r#"id="gate-form""#)
+        .map(|i| &html[i..html[i..].find('>').map(|j| i + j).unwrap_or(html.len())])
+        .expect("dashboard must contain the sign-in form");
+
+    assert!(
+        form.contains(r#"method="post""#),
+        "sign-in form must be method=post so a no-script submit cannot place \
+         the API key in the URL; got: <form {form}>"
+    );
+}

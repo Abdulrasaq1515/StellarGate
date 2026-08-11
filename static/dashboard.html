@@ -13,8 +13,15 @@
   <body>
     <!-- Sign-in gate. The dashboard holds no session of its own: it calls the
          same public REST API with the merchant's API key. -->
-    <section id="gate" class="gate" hidden>
-      <form id="gate-form" class="card gate-card" autocomplete="off">
+    <!-- Visible by default, and hidden by the script only once a session is
+         actually established. If the script fails to load or throws, the worst
+         case is this sign-in form rather than a blank page. -->
+    <section id="gate" class="gate">
+      <!-- method="post" is a safety net for the no-JS case: the script calls
+           preventDefault, but if it never ran, a default GET submit would put
+           the API key in the URL and the browser history. A POST lands the key
+           in a request body that this route answers with 405. -->
+      <form id="gate-form" class="card gate-card" method="post" autocomplete="off">
         <h1>StellarGate</h1>
         <p class="muted">Sign in with a merchant API key to view payments.</p>
         <label for="api-key">API key</label>
