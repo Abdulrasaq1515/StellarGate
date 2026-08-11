@@ -24,6 +24,7 @@ A payment gateway API built on [Stellar](https://stellar.org) for accepting, ver
 - [Webhooks](#webhooks)
 - [Security Model](#security-model)
 - [Observability](#observability)
+- [Deployment](#deployment)
 - [Database Migrations](#database-migrations)
 - [Development](#development)
 - [Contributing](#contributing)
@@ -677,6 +678,37 @@ Control verbosity with `RUST_LOG`, e.g. `RUST_LOG=stellargate=debug,tower_http=d
 
 ---
 
+## Deployment
+
+**[DEPLOYMENT.md](DEPLOYMENT.md) is the production runbook** — pre-flight
+checklist, first deploy, secrets, backups, upgrades and rollback, alerting
+signals, and scaling limits.
+
+A `fly.toml` is committed for [Fly.io](https://fly.io), which suits this
+service well: it runs the single binary directly and provides the persistent
+volume SQLite needs.
+
+```bash
+fly launch --no-deploy --copy-config
+fly volumes create stellargate_data --size 1 --region lhr
+fly secrets set WEBHOOK_SECRET="$(openssl rand -hex 32)" \
+                ADMIN_PROVISIONING_SECRET="$(openssl rand -hex 32)" \
+                STELLAR_GATEWAY_PUBLIC="G..." \
+                CORS_ALLOWED_ORIGINS="https://yourapp.example.com"
+fly deploy
+```
+
+The image is a plain non-root container with no platform coupling, so any
+Docker host, Render, Kubernetes or ECS works equally well.
+
+> ⚠️ **Run exactly one instance.** SQLite permits a single writer, and the
+> background listeners assume they are the only ones running — two instances
+> would each keep their own database and could settle a payment twice. This is
+> the sharpest operational constraint in the system; see
+> [Scaling limits](DEPLOYMENT.md#scaling-limits).
+
+---
+
 ## Database Migrations
 
 Schema is managed with [`sqlx::migrate!`](https://docs.rs/sqlx/latest/sqlx/macro.migrate.html). Numbered SQL files in `migrations/` are applied automatically at startup, so a fresh database and an existing one converge on the same schema. sqlx records applied migrations in `_sqlx_migrations`, running each exactly once.
@@ -725,6 +757,8 @@ Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, co
 5. Open a pull request describing the change and its rationale
 
 Found a security vulnerability? Please report it privately — see [SECURITY.md](SECURITY.md).
+
+Release history is kept in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

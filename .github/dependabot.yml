@@ -1,0 +1,41 @@
+version: 2
+
+updates:
+  # Rust dependencies. Grouped so a routine week is one PR to review rather
+  # than a dozen — ungrouped bumps get rubber-stamped, which is how a bad
+  # dependency slips into a payments service.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # Pinned action SHAs and versions go stale silently and are a real supply
+  # chain path into CI.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "chore(ci)"
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+    labels: ["dependencies", "docker"]
+    commit-message:
+      prefix: "chore(docker)"

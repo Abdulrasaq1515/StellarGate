@@ -1,0 +1,15 @@
+# Normalise line endings so a Windows checkout doesn't produce a whole-file
+# diff, and so rustfmt --check doesn't fail on CRLF.
+* text=auto eol=lf
+
+# Scripts must keep LF or they will not execute on Linux.
+*.sh text eol=lf
+
+# Generated / vendored files: collapse in diffs and exclude from language stats.
+Cargo.lock linguist-generated=true -diff
+
+# Binary files git should never try to merge or diff as text.
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary

@@ -1,0 +1,10 @@
+# Pins the toolchain so every contributor, CI job, and Docker build compiles
+# with the same compiler. This is the project's MSRV — keep it in sync with
+# `rust-version` in Cargo.toml, the CI matrix, and the Dockerfile base image.
+#
+# 1.88 is a floor imposed by the dependency graph, not a preference: `time`
+# requires 1.88 and `url`'s icu_* chain requires 1.86.
+[toolchain]
+channel = "1.88"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

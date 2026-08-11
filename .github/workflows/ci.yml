@@ -29,11 +29,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # RUSTUP_TOOLCHAIN takes precedence over rust-toolchain.toml, which would
+      # otherwise pin this job to the MSRV and quietly ignore the toolchain
+      # selected above.
       - name: Check formatting
         run: cargo fmt --check
+        env:
+          RUSTUP_TOOLCHAIN: stable
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+        env:
+          RUSTUP_TOOLCHAIN: stable
 
   test:
     name: test (${{ matrix.rust }})
@@ -58,5 +65,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.rust }}-
 
+      # Without this the repo's rust-toolchain.toml would pin every matrix leg
+      # to the MSRV, so the `stable` leg would silently retest 1.88 and report
+      # a green check for a toolchain it never ran.
       - name: Test with locked dependencies
         run: cargo test --locked
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.rust }}

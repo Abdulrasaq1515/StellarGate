@@ -1,0 +1,67 @@
+name: Bug report
+description: Something behaves differently from how it is documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste secrets.** API keys, `WEBHOOK_SECRET`,
+        `ADMIN_PROVISIONING_SECRET` and Stellar secret keys must never appear
+        in an issue. Redact them before pasting logs.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Ideally the exact request. Redact keys.
+      placeholder: |
+        1. curl -X POST http://localhost:3000/payments \
+             -H "Authorization: Bearer <redacted>" \
+             -H "Content-Type: application/json" \
+             -d '{"amount":"10","asset":"XLM"}'
+        2. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `GET /` or the commit SHA you built from.
+      placeholder: StellarGate API v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: network
+    attributes:
+      label: Stellar network
+      options: ["testnet", "public"]
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Run with `RUST_LOG=stellargate=debug` if you can. Redact secrets.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: I checked this is not a configuration issue documented in the README
+          required: true
+        - label: I have removed all secrets from the text above
+          required: true

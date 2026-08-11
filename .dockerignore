@@ -1,0 +1,41 @@
+# Keep the build context small. Without this, `COPY . .` ships the whole
+# target/ directory (multiple GB) into the daemon on every build, and `fly
+# deploy` uploads it over the network before anything is compiled.
+#
+# The image builds from source, so it needs Cargo.toml/Cargo.lock, src/,
+# static/, migrations/ and nothing else.
+
+# Build artifacts — by far the largest offender.
+target/
+**/*.rs.bk
+
+# Local state that must never be baked into an image.
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+
+# VCS and CI metadata.
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# Editor and OS noise.
+.vscode/
+.idea/
+.editorconfig
+*.swp
+.DS_Store
+
+# Docs and repo furniture: irrelevant to the binary, and changing a README
+# should not invalidate the Docker layer cache.
+*.md
+!README.md
+LICENSE
+docker-compose.yml
+deny.toml
+openapi.yaml
+fly.toml

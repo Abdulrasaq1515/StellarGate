@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/StellarGateLabs/StellarGate/security/advisories/new
+    about: >
+      Do NOT open a public issue for a security problem. Report it privately
+      here — see SECURITY.md for what to include and expected response times.
+  - name: Question or integration help
+    url: https://github.com/StellarGateLabs/StellarGate/discussions
+    about: For usage questions, start a discussion rather than filing a bug.

@@ -1,0 +1,64 @@
+# Fly.io deployment for StellarGate.
+#
+# First-time setup and the full runbook live in DEPLOYMENT.md. In short:
+#
+#   fly launch --no-deploy --copy-config    # claims the app name
+#   fly volumes create stellargate_data --size 1 --region lhr
+#   fly secrets set WEBHOOK_SECRET=... ADMIN_PROVISIONING_SECRET=... \
+#                   STELLAR_GATEWAY_PUBLIC=G...
+#   fly deploy
+#
+# Rename `app` before the first deploy — app names are global to Fly.
+
+app = "stellargate"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# SQLite needs real, durable storage. A Fly volume is a local NVMe disk pinned
+# to one machine, which is exactly SQLite's deployment model — see the scaling
+# note in DEPLOYMENT.md before adding a second machine.
+[mounts]
+  source = "stellargate_data"
+  destination = "/data"
+
+[env]
+  PORT = "3000"
+  DATABASE_URL = "sqlite:///data/stellargate.db"
+  STELLAR_NETWORK = "public"
+  STELLAR_HORIZON_URL = "https://horizon.stellar.org"
+  STELLAR_LISTENER_MODE = "stream"
+  RUST_LOG = "stellargate=info,tower_http=warn"
+  # Everything else keeps its documented default. Secrets are set with
+  # `fly secrets set`, never here — this file is committed.
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  # SQLite plus the background listeners assume a single writer, so the app
+  # must not be auto-scaled horizontally. See DEPLOYMENT.md.
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+# Liveness: is the process up at all.
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/health"
+
+# Readiness: database reachable AND Horizon reachable. A machine that cannot
+# see Horizon cannot detect payments, so it should stop taking traffic.
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "10s"
+  grace_period = "20s"
+  method = "GET"
+  path = "/ready"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
