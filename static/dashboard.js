@@ -168,6 +168,7 @@
       show($("gate"), false);
       show($("app"), true);
       setError($("gate-error"), null);
+      loadVersion();
       pollHealth();
       reload();
     });
@@ -348,6 +349,23 @@
   function closeDetail() {
     show($("detail"), false);
     show($("scrim"), false);
+  }
+
+  // ── Version ───────────────────────────────────────────────────────────
+
+  /** The root route answers with "StellarGate API vX.Y.Z". */
+  function loadVersion() {
+    fetch("/")
+      .then(function (res) {
+        return res.text();
+      })
+      .then(function (text) {
+        var match = /v\d+\.\d+\.\d+/.exec(text);
+        if (match) $("version").textContent = match[0];
+      })
+      .catch(function () {
+        /* cosmetic only */
+      });
   }
 
   // ── Health ────────────────────────────────────────────────────────────
