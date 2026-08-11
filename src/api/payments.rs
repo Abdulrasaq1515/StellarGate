@@ -34,6 +34,10 @@ impl AppError {
     pub fn unsupported_media_type(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, code, message)
     }
+
+    pub fn not_found(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, code, message)
+    }
 }
 
 impl IntoResponse for AppError {

@@ -1553,3 +1553,265 @@ async fn test_dashboard_form_does_not_leak_key_via_get() {
          the API key in the URL; got: <form {form}>"
     );
 }
+
+// ── API key lifecycle (issues #74, #81) ──────────────────────────────────
+
+/// Keys must be CSPRNG bearer tokens, not UUIDs. A v4 UUID carries 122 random
+/// bits and spends 6 encoding version/variant — fine as an identifier, wrong
+/// as a credential.
+#[tokio::test]
+async fn test_api_keys_are_high_entropy_prefixed_tokens() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+
+    assert!(key.starts_with("sg_"), "key should be recognisable: {key}");
+    // sg_ + 32 bytes hex = 67 chars, i.e. 256 bits of entropy.
+    assert_eq!(key.len(), 67, "expected 256 bits of entropy, got: {key}");
+    assert!(
+        key[3..].chars().all(|c| c.is_ascii_hexdigit()),
+        "body should be hex: {key}"
+    );
+    assert!(
+        !key.contains('-'),
+        "should not be a UUID (issue #81): {key}"
+    );
+
+    // Two keys must never collide.
+    let second = provision_merchant(&server).await;
+    assert_ne!(key, second);
+}
+
+/// Rotation is issue-then-revoke: both keys work in the overlap window, so a
+/// merchant can deploy the new credential before retiring the old one.
+#[tokio::test]
+async fn test_key_rotation_keeps_both_keys_live_during_handover() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    let body: Value = res.json();
+    let merchant_id = body["merchant_id"].as_str().unwrap().to_string();
+    let old_key = body["api_key"].as_str().unwrap().to_string();
+
+    // Issue a replacement.
+    let res = server
+        .post(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "label": "rotation-2026-08" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    let issued: Value = res.json();
+    let new_key = issued["api_key"].as_str().unwrap().to_string();
+    let new_key_id = issued["key_id"].as_str().unwrap().to_string();
+    assert_ne!(old_key, new_key);
+
+    // Both authenticate during the handover.
+    for k in [&old_key, &new_key] {
+        server
+            .get("/payments")
+            .add_header("Authorization", format!("Bearer {k}"))
+            .await
+            .assert_status_ok();
+    }
+
+    // Retire the old one.
+    let old_id = server
+        .get(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .json::<Value>()["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key_id"] != json!(new_key_id))
+        .unwrap()["key_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .delete(&format!("/merchants/{merchant_id}/keys/{old_id}"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .assert_status_ok();
+
+    // The revoked key stops working immediately; the new one keeps working.
+    server
+        .get("/payments")
+        .add_header("Authorization", format!("Bearer {old_key}"))
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+    server
+        .get("/payments")
+        .add_header("Authorization", format!("Bearer {new_key}"))
+        .await
+        .assert_status_ok();
+}
+
+/// Revoking a merchant's only key would lock them out of an API with no
+/// self-service recovery, turning a routine revocation into an incident.
+#[tokio::test]
+async fn test_cannot_revoke_the_last_active_key() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let body: Value = res.json();
+    let merchant_id = body["merchant_id"].as_str().unwrap();
+    let key = body["api_key"].as_str().unwrap().to_string();
+    let key_id = body["key_id"].as_str().unwrap();
+
+    let res = server
+        .delete(&format!("/merchants/{merchant_id}/keys/{key_id}"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "last_active_key");
+
+    // And it really is still usable.
+    server
+        .get("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await
+        .assert_status_ok();
+}
+
+/// Listing keys must never expose a usable credential.
+#[tokio::test]
+async fn test_listing_keys_never_returns_the_secret() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let body: Value = res.json();
+    let merchant_id = body["merchant_id"].as_str().unwrap();
+    let raw_key = body["api_key"].as_str().unwrap().to_string();
+
+    let listed = server
+        .get(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    listed.assert_status_ok();
+    let text = listed.text();
+
+    assert!(
+        !text.contains(&raw_key),
+        "key listing must not contain the secret"
+    );
+    let body: Value = listed.json();
+    let entry = &body["keys"][0];
+    assert_eq!(entry["active"], json!(true));
+    assert!(entry["prefix"].as_str().unwrap().starts_with("sg_"));
+    // The prefix identifies a key without being enough to use it.
+    assert!(entry["prefix"].as_str().unwrap().len() < raw_key.len());
+}
+
+/// Key management is an operator action — it must not be reachable with a
+/// merchant's own key, only the admin secret.
+#[tokio::test]
+async fn test_key_endpoints_require_the_admin_secret() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let body: Value = res.json();
+    let merchant_id = body["merchant_id"].as_str().unwrap();
+    let merchant_key = body["api_key"].as_str().unwrap();
+
+    for (method, path) in [
+        ("POST", format!("/merchants/{merchant_id}/keys")),
+        ("GET", format!("/merchants/{merchant_id}/keys")),
+        ("DELETE", format!("/merchants/{merchant_id}/keys/whatever")),
+    ] {
+        // No credential at all.
+        let res = match method {
+            "POST" => server.post(&path).await,
+            "GET" => server.get(&path).await,
+            _ => server.delete(&path).await,
+        };
+        res.assert_status(StatusCode::UNAUTHORIZED);
+
+        // A valid merchant key is not sufficient either.
+        let res = match method {
+            "POST" => {
+                server
+                    .post(&path)
+                    .add_header("Authorization", format!("Bearer {merchant_key}"))
+                    .await
+            }
+            "GET" => {
+                server
+                    .get(&path)
+                    .add_header("Authorization", format!("Bearer {merchant_key}"))
+                    .await
+            }
+            _ => {
+                server
+                    .delete(&path)
+                    .add_header("Authorization", format!("Bearer {merchant_key}"))
+                    .await
+            }
+        };
+        res.assert_status(StatusCode::UNAUTHORIZED);
+    }
+}
+
+/// One merchant must not be able to revoke another's key.
+#[tokio::test]
+async fn test_revocation_is_scoped_to_the_owning_merchant() {
+    let server = test_server().await;
+
+    let a: Value = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .json();
+    let b: Value = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .json();
+
+    let b_id = b["merchant_id"].as_str().unwrap();
+    let a_key_id = a["key_id"].as_str().unwrap();
+    let a_key = a["api_key"].as_str().unwrap().to_string();
+
+    // Give B a second key so the last-key guard is not what stops this.
+    server
+        .post(&format!("/merchants/{b_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    // Try to revoke A's key through B.
+    let res = server
+        .delete(&format!("/merchants/{b_id}/keys/{a_key_id}"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res.assert_status(StatusCode::NOT_FOUND);
+
+    // A's key is untouched.
+    server
+        .get("/payments")
+        .add_header("Authorization", format!("Bearer {a_key}"))
+        .await
+        .assert_status_ok();
+}
+
+/// Key endpoints for a merchant that does not exist must 404, not silently
+/// succeed against nothing.
+#[tokio::test]
+async fn test_key_endpoints_404_for_unknown_merchant() {
+    let server = test_server().await;
+    let res = server
+        .get("/merchants/does-not-exist/keys")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(res.json::<Value>()["code"], "merchant_not_found");
+}

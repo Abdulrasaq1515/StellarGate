@@ -1,6 +1,7 @@
+use crate::api::payments::{AppError, JsonBody};
 use crate::{db, AppState};
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -8,7 +9,7 @@ use axum::{
     Json,
 };
 use moka::sync::Cache;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -84,15 +85,19 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/dashboard", get(dashboard_html))
         .route("/dashboard/app.css", get(dashboard_css))
         .route("/dashboard/app.js", get(dashboard_js))
-        /* Merchant provisioning — returns a one-time plaintext API key. Gated
-        behind ADMIN_PROVISIONING_SECRET so it can't be used to mint
-        unlimited credentials anonymously. */
-        .route(
+        /* Merchant provisioning and API key lifecycle. All admin-gated behind
+        ADMIN_PROVISIONING_SECRET: this service has no self-service signup, and
+        minting or revoking a credential is an operator action. */
+        .nest(
             "/merchants",
-            post(provision_merchant).route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_admin_secret,
-            )),
+            axum::Router::new()
+                .route("/", post(provision_merchant))
+                .route("/:id/keys", post(issue_api_key).get(list_api_keys))
+                .route("/:id/keys/:key_id", axum::routing::delete(revoke_api_key))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_admin_secret,
+                )),
         )
         .nest("/payments", {
             /* Auth middleware on the write + list routes, the webhook listing,
@@ -234,11 +239,14 @@ async fn provision_merchant(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let merchant_id = uuid::Uuid::new_v4().to_string();
-    let raw_key = uuid::Uuid::new_v4().to_string();
+    let (raw_key, prefix) = db::generate_api_key();
 
-    db::create_merchant(&state.pool, &merchant_id, &raw_key)
+    let key_id = db::create_merchant(&state.pool, &merchant_id, &raw_key, &prefix)
         .await
-        .map_err(|_| {
+        .map_err(|e| {
+            // Issue #125: swallowing this left an operator with a 500 and no
+            // way to tell a disk error from a UNIQUE collision.
+            tracing::error!(error = %e, "failed to provision merchant");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "internal server error", "code": "internal_error" })),
@@ -250,8 +258,133 @@ async fn provision_merchant(
         Json(json!({
             "merchant_id": merchant_id,
             "api_key": raw_key,
+            "key_id": key_id,
         })),
     ))
+}
+
+/// `POST /merchants/:id/keys` — issue an additional API key.
+///
+/// Rotation is issue-then-revoke rather than replace-in-place: the new key is
+/// live immediately while the old one keeps working, so a merchant can deploy
+/// the new credential before retiring the old one and never has a window with
+/// no valid key. Admin-gated, like provisioning.
+async fn issue_api_key(
+    State(state): State<Arc<AppState>>,
+    Path(merchant_id): Path<String>,
+    body: Option<JsonBody<IssueKeyRequest>>,
+) -> Result<impl IntoResponse, AppError> {
+    if !db::merchant_exists(&state.pool, &merchant_id).await? {
+        return Err(AppError::not_found(
+            "merchant_not_found",
+            "merchant not found",
+        ));
+    }
+
+    let label = body.and_then(|JsonBody(b)| b.label);
+    if let Some(l) = &label {
+        if l.len() > 100 {
+            return Err(AppError::bad_request(
+                "invalid_label",
+                "label exceeds max length of 100 characters",
+            ));
+        }
+    }
+
+    let (raw_key, prefix) = db::generate_api_key();
+    let key_id = db::create_api_key(
+        &state.pool,
+        &merchant_id,
+        &raw_key,
+        &prefix,
+        label.as_deref(),
+    )
+    .await?;
+
+    tracing::info!(%merchant_id, %key_id, "api key issued");
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "key_id": key_id,
+            "api_key": raw_key,
+            "prefix": prefix,
+            "label": label,
+        })),
+    ))
+}
+
+/// `GET /merchants/:id/keys` — list a merchant's keys.
+///
+/// Returns metadata only. The secret is unrecoverable by design, so this can
+/// never leak a usable credential; `prefix` exists so an operator can identify
+/// which key to revoke.
+async fn list_api_keys(
+    State(state): State<Arc<AppState>>,
+    Path(merchant_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    if !db::merchant_exists(&state.pool, &merchant_id).await? {
+        return Err(AppError::not_found(
+            "merchant_not_found",
+            "merchant not found",
+        ));
+    }
+
+    let keys = db::list_api_keys(&state.pool, &merchant_id).await?;
+    Ok(Json(json!({
+        "merchant_id": merchant_id,
+        "keys": keys.iter().map(|k| json!({
+            "key_id": k.id,
+            "prefix": k.prefix,
+            "label": k.label,
+            "created_at": k.created_at,
+            "last_used_at": k.last_used_at,
+            "revoked_at": k.revoked_at,
+            "active": k.revoked_at.is_none(),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+/// `DELETE /merchants/:id/keys/:key_id` — revoke a key immediately.
+///
+/// Refuses to revoke a merchant's last active key. Doing so would lock them
+/// out of an API that has no self-service recovery, turning a routine
+/// revocation into an incident; issue a replacement first.
+async fn revoke_api_key(
+    State(state): State<Arc<AppState>>,
+    Path((merchant_id, key_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    if !db::merchant_exists(&state.pool, &merchant_id).await? {
+        return Err(AppError::not_found(
+            "merchant_not_found",
+            "merchant not found",
+        ));
+    }
+
+    if db::count_active_api_keys(&state.pool, &merchant_id).await? <= 1 {
+        return Err(AppError::bad_request(
+            "last_active_key",
+            "cannot revoke a merchant's only active key — issue a replacement first",
+        ));
+    }
+
+    if !db::revoke_api_key(&state.pool, &merchant_id, &key_id).await? {
+        return Err(AppError::not_found(
+            "key_not_found",
+            "no active key with that id for this merchant",
+        ));
+    }
+
+    tracing::warn!(%merchant_id, %key_id, "api key revoked");
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "key_id": key_id, "revoked": true })),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct IssueKeyRequest {
+    label: Option<String>,
 }
 
 async fn rate_limit_middleware(

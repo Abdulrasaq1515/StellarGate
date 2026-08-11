@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **API key lifecycle management.** Keys are now 256-bit tokens from the OS
+  CSPRNG prefixed `sg_`, replacing UUIDv4 — a v4 UUID carries 122 random bits
+  and spends 6 encoding version/variant, which is fine for an identifier and
+  wrong for a bearer credential. A merchant can hold several keys, so rotation
+  is issue-then-revoke with an overlap window rather than a replace-in-place
+  that would leave no valid key. `POST/GET /merchants/:id/keys` and
+  `DELETE /merchants/:id/keys/:key_id` cover issue, list and revoke; revocation
+  is a tombstone so the audit trail survives it, and revoking a merchant's last
+  active key is refused. Keys issued before this change keep working — the
+  migration carries them into the new table (issues #74, #81).
+- Index on `webhook_deliveries(payment_id)`; delivery listings and the redrive
+  worker were doing a full scan (issue #112).
 - Operator dashboard at `/dashboard` — payments list with status filtering and
   cursor pagination, payment detail, webhook delivery history with one-click
   redelivery, and a live health indicator. Built as dependency-free HTML/CSS/JS

@@ -138,6 +138,60 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
+    /* API keys, one row per credential rather than one per merchant, so a key
+    can be rotated (issue a second, revoke the first) and revoked individually
+    without disturbing the merchant record.
+
+    Only the SHA-256 digest is stored; `prefix` keeps the first few characters
+    of the raw key so an operator can tell two keys apart in a list without the
+    secret being recoverable. `revoked_at` is a tombstone rather than a delete
+    so an audit trail survives revocation. */
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS api_keys (
+            id TEXT PRIMARY KEY,
+            merchant_id TEXT NOT NULL,
+            key_hash TEXT NOT NULL UNIQUE,
+            prefix TEXT NOT NULL,
+            label TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            last_used_at TEXT,
+            revoked_at TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    /* Authentication looks a key up by hash on every request, so this index is
+    load-bearing rather than an optimisation. */
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_merchant ON api_keys(merchant_id)")
+        .execute(pool)
+        .await?;
+
+    /* Carry pre-existing single-key merchants across. Their raw key is not
+    recoverable, but the hash is all authentication needs, so keys issued
+    before this table existed keep working. The prefix is unknown for those
+    rows — mark them rather than inventing one. */
+    sqlx::query(
+        "INSERT OR IGNORE INTO api_keys (id, merchant_id, key_hash, prefix, label, created_at)
+         SELECT lower(hex(randomblob(16))), id, api_key_hash, 'legacy', 'migrated', created_at
+           FROM merchants
+          WHERE api_key_hash IS NOT NULL AND api_key_hash <> ''",
+    )
+    .execute(pool)
+    .await?;
+
+    /* `webhook_deliveries` is queried by payment_id on every delivery listing
+    and by the redrive worker; without this it is a full scan (issue #112). */
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment
+         ON webhook_deliveries(payment_id)",
+    )
+    .execute(pool)
+    .await?;
+
     /* Idempotency keys for payment creation. A key is unique per merchant and
     maps to the payment id minted for the first request that used it, so a
     client retrying after a network blip gets the original payment back
@@ -849,27 +903,207 @@ fn hash_api_key(raw: &str) -> String {
     hex::encode(Sha256::digest(raw.as_bytes()))
 }
 
-/// Create a merchant row. Returns the merchant `id` — the raw key must be
-/// shown to the user by the caller and is not recoverable afterward.
-pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str) -> Result<()> {
-    let hash = hash_api_key(raw_key);
+/// Create a merchant and its first API key, atomically — a merchant that
+/// exists with no way to authenticate would be unusable and un-fixable through
+/// the API.
+///
+/// The raw key must be shown to the caller once; it is not recoverable.
+///
+/// `merchants.api_key_hash` is written only to satisfy the column's NOT NULL
+/// constraint on databases created before `api_keys` existed. Nothing reads it
+/// any more — authentication goes through `api_keys` so that rotation and
+/// revocation work — and it is not maintained as keys change.
+pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str, prefix: &str) -> Result<String> {
+    let mut tx = pool.begin().await?;
+
     sqlx::query("INSERT INTO merchants (id, api_key_hash) VALUES (?, ?)")
         .bind(id)
-        .bind(hash)
-        .execute(pool)
+        .bind(hash_api_key(raw_key))
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+
+    let key_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO api_keys (id, merchant_id, key_hash, prefix, label)
+         VALUES (?, ?, ?, ?, 'initial')",
+    )
+    .bind(&key_id)
+    .bind(id)
+    .bind(hash_api_key(raw_key))
+    .bind(prefix)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(key_id)
 }
 
-/// Look up a merchant by their raw API key. Returns `None` if the key does
-/// not match any registered merchant.
+/// A key as exposed to an operator. Never carries the secret — only a
+/// prefix, so two keys can be told apart in a list.
+#[derive(Debug, Clone)]
+pub struct ApiKeyInfo {
+    pub id: String,
+    pub prefix: String,
+    pub label: Option<String>,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+/// Characters of the raw key kept in `prefix` for display.
+const KEY_PREFIX_LEN: usize = 12;
+
+/// Mint a new API key: 256 bits from the OS CSPRNG, hex-encoded behind an
+/// `sg_` marker.
+///
+/// Deliberately not a UUID. A v4 UUID carries only 122 random bits and spends
+/// 6 of them encoding its version and variant, which is fine for an identifier
+/// and wrong for a bearer credential. The `sg_` marker makes a leaked key
+/// recognisable in logs and lets secret scanners match on it.
+///
+/// Returns `(raw_key, prefix)`. The raw key is shown once and never stored.
+pub fn generate_api_key() -> (String, String) {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    let raw = format!("sg_{}", hex::encode(bytes));
+    let prefix = raw.chars().take(KEY_PREFIX_LEN).collect();
+    (raw, prefix)
+}
+
+/// Store a new API key for a merchant. Only the digest is persisted.
+pub async fn create_api_key(
+    pool: &Db,
+    merchant_id: &str,
+    raw_key: &str,
+    prefix: &str,
+    label: Option<&str>,
+) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO api_keys (id, merchant_id, key_hash, prefix, label)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(merchant_id)
+    .bind(hash_api_key(raw_key))
+    .bind(prefix)
+    .bind(label)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Resolve a raw API key to its merchant, rejecting revoked keys.
+///
+/// Also refreshes `last_used_at`, but at most once a minute per key: this runs
+/// on every authenticated request, and SQLite takes a write lock for each
+/// update, so touching it unconditionally would put a write in the path of
+/// every read. Minute granularity is plenty to spot a key that has gone quiet
+/// or one that is being used when it should not be.
 pub async fn find_merchant_by_key(pool: &Db, raw_key: &str) -> Result<Option<String>> {
     let hash = hash_api_key(raw_key);
-    let id: Option<String> = sqlx::query_scalar("SELECT id FROM merchants WHERE api_key_hash = ?")
-        .bind(hash)
-        .fetch_optional(pool)
+
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, merchant_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
+    )
+    .bind(&hash)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((key_id, merchant_id)) = row else {
+        return Ok(None);
+    };
+
+    sqlx::query(
+        "UPDATE api_keys
+            SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE id = ?
+            AND (last_used_at IS NULL
+                 OR last_used_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-60 seconds'))",
+    )
+    .bind(&key_id)
+    .execute(pool)
+    .await?;
+
+    Ok(Some(merchant_id))
+}
+
+/// Every key issued to a merchant, newest first, including revoked ones so the
+/// history stays visible.
+pub async fn list_api_keys(pool: &Db, merchant_id: &str) -> Result<Vec<ApiKeyInfo>> {
+    /// (id, prefix, label, created_at, last_used_at, revoked_at) as selected below.
+    type KeyRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    );
+
+    let rows: Vec<KeyRow> = sqlx::query_as(
+        "SELECT id, prefix, label, created_at, last_used_at, revoked_at
+               FROM api_keys WHERE merchant_id = ? ORDER BY created_at DESC, id DESC",
+    )
+    .bind(merchant_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, prefix, label, created_at, last_used_at, revoked_at)| ApiKeyInfo {
+                id,
+                prefix,
+                label,
+                created_at,
+                last_used_at,
+                revoked_at,
+            },
+        )
+        .collect())
+}
+
+/// Revoke a key. Scoped by merchant so one merchant cannot revoke another's.
+///
+/// Returns `Ok(false)` when no such live key exists — either it was never
+/// there, belongs to someone else, or is already revoked. Revoking twice is
+/// not an error worth surfacing, but "no key was revoked" is.
+pub async fn revoke_api_key(pool: &Db, merchant_id: &str, key_id: &str) -> Result<bool> {
+    let affected = sqlx::query(
+        "UPDATE api_keys
+            SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE id = ? AND merchant_id = ? AND revoked_at IS NULL",
+    )
+    .bind(key_id)
+    .bind(merchant_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
+/// Number of usable keys a merchant has, so the API can refuse to revoke the
+/// last one and lock them out.
+pub async fn count_active_api_keys(pool: &Db, merchant_id: &str) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM api_keys WHERE merchant_id = ? AND revoked_at IS NULL",
+    )
+    .bind(merchant_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Whether a merchant exists, so key endpoints can 404 rather than silently
+/// operating on nothing.
+pub async fn merchant_exists(pool: &Db, merchant_id: &str) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merchants WHERE id = ?")
+        .bind(merchant_id)
+        .fetch_one(pool)
         .await?;
-    Ok(id)
+    Ok(n > 0)
 }
 
 #[cfg(test)]
@@ -884,6 +1118,87 @@ mod tests {
             .unwrap();
         migrate(&pool).await.unwrap();
         pool
+    }
+
+    /// An upgrade must not lock out merchants whose keys predate the
+    /// `api_keys` table. This simulates a pre-upgrade database — the old
+    /// `merchants.api_key_hash` schema with no `api_keys` table — runs the
+    /// migration over it, and checks the original key still authenticates.
+    ///
+    /// Getting this wrong would revoke every live credential on deploy, with
+    /// no way to recover them: the raw keys are unrecoverable by design.
+    #[tokio::test]
+    async fn legacy_single_key_merchants_survive_the_api_keys_migration() {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // The schema as it existed before api_keys.
+        sqlx::query(
+            "CREATE TABLE merchants (
+                id TEXT PRIMARY KEY,
+                api_key_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let legacy_key = "3f1c9a7e-0b2d-4e5f-8a6b-7c8d9e0f1a2b"; // an old UUID key
+        sqlx::query("INSERT INTO merchants (id, api_key_hash) VALUES (?, ?)")
+            .bind("legacy-merchant")
+            .bind(hash_api_key(legacy_key))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        migrate(&pool).await.unwrap();
+
+        assert_eq!(
+            find_merchant_by_key(&pool, legacy_key).await.unwrap(),
+            Some("legacy-merchant".to_string()),
+            "a key issued before the api_keys table must keep working"
+        );
+
+        // It is now a first-class key: listable, and revocable once replaced.
+        let keys = list_api_keys(&pool, "legacy-merchant").await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].prefix, "legacy");
+        assert!(keys[0].revoked_at.is_none());
+    }
+
+    /// Revoking a key must take effect immediately for authentication.
+    #[tokio::test]
+    async fn revoked_keys_stop_authenticating() {
+        let pool = memory_db().await;
+        let (raw, prefix) = generate_api_key();
+        let key_id = create_merchant(&pool, "m1", &raw, &prefix).await.unwrap();
+
+        assert_eq!(
+            find_merchant_by_key(&pool, &raw).await.unwrap(),
+            Some("m1".to_string())
+        );
+
+        assert!(revoke_api_key(&pool, "m1", &key_id).await.unwrap());
+        assert_eq!(find_merchant_by_key(&pool, &raw).await.unwrap(), None);
+
+        // Revoking again reports that nothing was revoked.
+        assert!(!revoke_api_key(&pool, "m1", &key_id).await.unwrap());
+    }
+
+    /// Generated keys must be unique and carry full entropy.
+    #[tokio::test]
+    async fn generated_keys_are_unique_and_prefixed() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let (raw, prefix) = generate_api_key();
+            assert!(raw.starts_with("sg_"));
+            assert_eq!(raw.len(), 67);
+            assert!(raw.starts_with(&prefix));
+            assert!(seen.insert(raw), "generated a duplicate key");
+        }
     }
 
     fn new_payment<'a>(id: &'a str, memo: &'a str, ttl_secs: i64) -> NewPayment<'a> {

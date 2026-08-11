@@ -1,3 +1,4 @@
+
 # StellarGate
 
 [![CI](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml)
@@ -21,6 +22,7 @@ A payment gateway API built on [Stellar](https://stellar.org) for accepting, ver
 - [Configuration](#configuration)
   - [Trustlines](#trustlines)
 - [API Reference](#api-reference)
+  - [API Key Lifecycle](#post-merchantsidkeys)
 - [Payment Resolution Policy](#payment-resolution-policy)
 - [Webhooks](#webhooks)
 - [Security Model](#security-model)
@@ -79,6 +81,7 @@ A payment is matched on three independent attributes — **memo**, **destination
 | Cursor pagination | ✅ | Keyset pagination, stable at any depth |
 | SSRF protection | ✅ | Webhook targets resolved and filtered, re-checked on every send |
 | Rate limiting | ✅ | Per-IP, per-route-bucket |
+| API key lifecycle | ✅ | CSPRNG keys, rotation with overlap, instant revocation |
 | Prometheus metrics | ✅ | `GET /metrics` |
 | Dashboard UI | ✅ | Served at `/dashboard`; no build step or separate deploy |
 
@@ -371,6 +374,10 @@ The `code` field is stable across releases and is what you should branch on.
 | `invalid_status` | `400` | `status` filter is not a recognized value |
 | `invalid_cursor` | `400` | `cursor` could not be decoded |
 | `payment_not_found` | `404` | No such payment, or it belongs to another merchant |
+| `merchant_not_found` | `404` | No merchant with that id |
+| `key_not_found` | `404` | No active key with that id for this merchant |
+| `last_active_key` | `400` | Refused: would revoke a merchant's only usable key |
+| `invalid_label` | `400` | Key label exceeds 100 characters |
 | `delivery_not_found` | `404` | No such delivery for that payment |
 | `webhook_target_blocked` | `400` | Redelivery target rejected by the SSRF guard |
 | `webhook_delivery_failed` | `502` | Receiver returned a non-success response |
@@ -395,11 +402,86 @@ curl -X POST http://localhost:3000/merchants \
 ```json
 {
   "merchant_id": "a1b2c3d4-...",
-  "api_key": "e5f6..."
+  "api_key": "sg_ec5759103e27f...",
+  "key_id": "d15f5a1a-..."
 }
 ```
 
 > ⚠️ `api_key` is returned **once**, in plaintext, and is never recoverable. Only a hash is stored. Save it immediately.
+
+Keys are 256-bit tokens from the OS CSPRNG, prefixed `sg_` so they are
+recognisable in logs and matchable by secret scanners. Use `key_id` to revoke
+this key later.
+
+---
+
+### `POST /merchants/:id/keys`
+
+Issue an **additional** key for a merchant — this is how rotation works. Admin only.
+
+```bash
+curl -X POST http://localhost:3000/merchants/$MERCHANT_ID/keys \
+  -H "X-Admin-Secret: $ADMIN_PROVISIONING_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "rotation-2026-08"}'
+```
+
+**`201 Created`** — `{ "key_id": "…", "api_key": "sg_…", "prefix": "sg_6c85bd46e", "label": "rotation-2026-08" }`
+
+> Rotation is **issue-then-revoke**, not replace-in-place. The new key is live
+> immediately while the old one keeps working, so a merchant can deploy the new
+> credential and only then retire the old one — there is never a window with no
+> valid key. `label` is optional, purely for your own bookkeeping.
+
+---
+
+### `GET /merchants/:id/keys`
+
+List a merchant's keys, including revoked ones so the history stays visible.
+Admin only.
+
+**`200 OK`**
+
+```json
+{
+  "merchant_id": "abee3b99-…",
+  "keys": [
+    {
+      "key_id": "e150ccc8-…",
+      "prefix": "sg_6c85bd46e",
+      "label": "rotation-2026-08",
+      "created_at": "2026-08-11T15:45:29Z",
+      "last_used_at": "2026-08-11T15:45:29Z",
+      "revoked_at": null,
+      "active": true
+    }
+  ]
+}
+```
+
+Metadata only — the secret is unrecoverable by design, so this endpoint cannot
+leak a usable credential. `prefix` exists so you can tell keys apart when
+deciding which to revoke. `last_used_at` is refreshed at most once a minute per
+key: it runs on every authenticated request, and SQLite takes a write lock per
+update, so touching it unconditionally would put a write in the path of every
+read.
+
+---
+
+### `DELETE /merchants/:id/keys/:key_id`
+
+Revoke a key. Effective immediately — the next request using it gets `401`.
+Admin only.
+
+**`200 OK`** — `{ "key_id": "…", "revoked": true }`
+
+> Refuses with `last_active_key` if it would revoke a merchant's **only** active
+> key. This API has no self-service recovery, so that would turn a routine
+> revocation into an incident. Issue a replacement first.
+
+Revocation is a tombstone, not a delete, so the audit trail survives it. Keys
+are scoped to their merchant: one merchant's key id cannot be revoked through
+another's path.
 
 ---
 
@@ -703,7 +785,7 @@ For the full canonical reference, see **[WEBHOOK_REFERENCE.md](WEBHOOK_REFERENCE
 
 **No custody.** The gateway never holds a secret key, never signs, and never submits a transaction. Compromising it does not move funds — it only watches an address.
 
-**API keys are hashed at rest.** The plaintext key is shown once at provisioning and never stored.
+**API keys are hashed at rest.** They are 256-bit tokens from the OS CSPRNG, shown once at issue and never stored in plaintext. Each merchant can hold several, so a key can be rotated without downtime, and any key can be revoked instantly — revocation takes effect on the next request. Revoking a merchant's last active key is refused, since this API has no self-service recovery.
 
 **SSRF protection on webhook targets.** A `webhook_url` has its host resolved and rejected if it lands on loopback, link-local (including the cloud metadata address `169.254.169.254`), private, or otherwise reserved ranges. The check runs again on every dispatch and redelivery **against the exact resolved address** rather than a fresh DNS lookup, closing the DNS-rebinding window.
 
