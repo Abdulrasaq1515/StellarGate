@@ -22,6 +22,7 @@ A payment gateway API built on [Stellar](https://stellar.org) for accepting, ver
 - [Configuration](#configuration)
   - [Trustlines](#trustlines)
 - [API Reference](#api-reference)
+  - [Versioning](#versioning)
   - [API Key Lifecycle](#post-merchantsidkeys)
 - [Payment Resolution Policy](#payment-resolution-policy)
 - [Webhooks](#webhooks)
@@ -83,6 +84,7 @@ A payment is matched on three independent attributes — **memo**, **destination
 | Rate limiting | ✅ | Per-IP, per-route-bucket |
 | API key lifecycle | ✅ | CSPRNG keys, rotation with overlap, instant revocation |
 | Data retention | ✅ | Background pruning of aged delivery rows and idempotency keys |
+| API versioning | ✅ | `/v1` prefix with a documented deprecation policy |
 | Prometheus metrics | ✅ | `GET /metrics` |
 | Dashboard UI | ✅ | Served at `/dashboard`; no build step or separate deploy |
 
@@ -365,6 +367,50 @@ until it finished; a backlog drains over several cycles instead.
 ---
 
 ## API Reference
+
+### Versioning
+
+The API is versioned by path prefix. **`/v1` is canonical** — use it for new
+integrations:
+
+```
+POST /v1/payments
+GET  /v1/payments/:id
+POST /v1/merchants
+```
+
+Unversioned paths (`/payments`, `/merchants`) still work and serve the same
+data, so nothing breaks today. They respond with headers pointing at their
+replacement:
+
+```
+Deprecation: true
+Link: </v1/payments>; rel="successor-version"
+```
+
+Operational endpoints — `/health`, `/ready`, `/metrics`, `/dashboard` and `/` —
+are **not** versioned. They are infrastructure rather than contract; moving a
+liveness probe with every API revision would break probes and scrape configs
+for no benefit.
+
+#### Deprecation policy
+
+| Change | How it ships |
+|---|---|
+| Adding a field, endpoint, or optional parameter | Within the current version. Treat unknown fields as ignorable. |
+| Changing or removing a field, changing a status code or error `code` | A new version prefix (`/v2`) |
+| Security fixes that must apply to existing callers | Within the current version, documented in [CHANGELOG.md](CHANGELOG.md) as breaking |
+
+That last row is a deliberate exception rather than an oversight: a data-exposure
+fix that only applied to callers who opted into a new version would leave the
+exposure in place for everyone who did not.
+
+When a version is retired it will carry a `Sunset` header (RFC 8594) with the
+removal date, announced in the changelog and release notes first. **No `Sunset`
+date is currently set** for the unversioned paths — they emit `Deprecation`
+only, because a sunset header is a commitment and none has been made.
+
+---
 
 ### Authentication
 

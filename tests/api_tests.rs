@@ -2012,3 +2012,152 @@ async fn test_revoked_key_loses_access_to_payment_detail() {
         .await;
     res.assert_status(StatusCode::UNAUTHORIZED);
 }
+
+// ── API versioning (issue #121) ──────────────────────────────────────────
+
+/// The versioned surface must be a complete, working mount — not a subset.
+#[tokio::test]
+async fn test_v1_routes_serve_the_full_api() {
+    let server = test_server().await;
+
+    // Provision through /v1.
+    let res = server
+        .post("/v1/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    let body: Value = res.json();
+    let key = body["api_key"].as_str().unwrap().to_string();
+    let merchant_id = body["merchant_id"].as_str().unwrap().to_string();
+
+    // Create, fetch and list through /v1.
+    let created = server
+        .post("/v1/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await;
+    created.assert_status(StatusCode::CREATED);
+    let id = created.json::<Value>()["id"].as_str().unwrap().to_string();
+
+    server
+        .get(&format!("/v1/payments/{id}"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await
+        .assert_status_ok();
+    server
+        .get("/v1/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await
+        .assert_status_ok();
+    server
+        .get(&format!("/v1/payments/{id}/webhooks"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await
+        .assert_status_ok();
+    server
+        .get(&format!("/v1/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .assert_status_ok();
+}
+
+/// Introducing versioning must not break existing integrators — that would be
+/// the exact failure versioning exists to prevent. Unversioned paths keep
+/// working, and say so via RFC 8594 / RFC 8288 headers rather than requiring
+/// anyone to read release notes.
+#[tokio::test]
+async fn test_legacy_paths_still_work_and_advertise_their_successor() {
+    let server = test_server().await;
+
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res.assert_status(StatusCode::CREATED);
+
+    assert_eq!(res.header("deprecation"), "true");
+    let link = res.header("link");
+    assert_eq!(
+        link.to_str().unwrap(),
+        "</v1/merchants>; rel=\"successor-version\"",
+        "legacy responses must point at their /v1 equivalent"
+    );
+}
+
+/// The canonical surface must not mark itself deprecated.
+#[tokio::test]
+async fn test_v1_responses_are_not_marked_deprecated() {
+    let server = test_server().await;
+    let res = server
+        .post("/v1/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    assert!(
+        !res.headers().contains_key("deprecation"),
+        "/v1 is canonical and must not advertise itself as deprecated"
+    );
+}
+
+/// Operational endpoints are infrastructure, not contract. Versioning them
+/// would break liveness probes and scrape configs on every API revision for
+/// no benefit, so they stay where they are.
+#[tokio::test]
+async fn test_operational_endpoints_are_not_versioned() {
+    let server = test_server().await;
+
+    for path in ["/health", "/ready", "/metrics", "/dashboard"] {
+        server.get(path).await.assert_status_ok();
+    }
+    for path in ["/v1/health", "/v1/ready", "/v1/metrics", "/v1/dashboard"] {
+        server.get(path).await.assert_status(StatusCode::NOT_FOUND);
+    }
+}
+
+/// Versioning must not open a hole around the auth layers.
+#[tokio::test]
+async fn test_v1_enforces_the_same_authorization() {
+    let server = test_server().await;
+
+    // Admin gate on merchant provisioning.
+    server
+        .post("/v1/merchants")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+
+    // Merchant auth on payments.
+    server
+        .get("/v1/payments")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+    server
+        .post("/v1/payments")
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+}
+
+/// A payment created on one mount must be readable from the other — they are
+/// the same API, not two parallel deployments.
+#[tokio::test]
+async fn test_both_mounts_share_the_same_data() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "7", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let via_v1 = server
+        .get(&format!("/v1/payments/{id}"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    via_v1.assert_status_ok();
+    assert_eq!(via_v1.json::<Value>()["id"], json!(id));
+}

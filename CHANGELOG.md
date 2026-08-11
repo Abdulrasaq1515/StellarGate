@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **API versioning.** Public routes are now served under `/v1` alongside a
+  documented deprecation policy. Unversioned paths keep working and return
+  `Deprecation` and `Link: rel="successor-version"` headers pointing at their
+  `/v1` equivalent — shipping versioning by breaking every existing caller at
+  once would be exactly the failure versioning exists to prevent. Operational
+  endpoints (`/health`, `/ready`, `/metrics`, `/dashboard`) are deliberately
+  unversioned: they are infrastructure, not contract (issue #121).
 - **API key lifecycle management.** Keys are now 256-bit tokens from the OS
   CSPRNG prefixed `sg_`, replacing UUIDv4 — a v4 UUID carries 122 random bits
   and spends 6 encoding version/variant, which is fine for an identifier and

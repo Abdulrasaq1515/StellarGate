@@ -85,41 +85,15 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/dashboard", get(dashboard_html))
         .route("/dashboard/app.css", get(dashboard_css))
         .route("/dashboard/app.js", get(dashboard_js))
-        /* Merchant provisioning and API key lifecycle. All admin-gated behind
-        ADMIN_PROVISIONING_SECRET: this service has no self-service signup, and
-        minting or revoking a credential is an operator action. */
-        .nest(
-            "/merchants",
-            axum::Router::new()
-                .route("/", post(provision_merchant))
-                .route("/:id/keys", post(issue_api_key).get(list_api_keys))
-                .route("/:id/keys/:key_id", axum::routing::delete(revoke_api_key))
-                .route_layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    require_admin_secret,
-                )),
-        )
-        .nest("/payments", {
-            /* Auth middleware on the write + list routes, the webhook listing,
-            and redelivery (it triggers a merchant-scoped outbound request);
-            only the per-payment status endpoint stays public (anyone with the
-            id can poll it). */
-            let authed = axum::Router::new()
-                .route("/", post(payments::create).get(payments::list))
-                .route("/:id/webhooks", get(payments::list_webhooks))
-                .route(
-                    "/:id/webhooks/:delivery_id/redeliver",
-                    post(payments::redeliver_webhook),
-                )
-                .route_layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    auth_middleware,
-                ));
-
-            axum::Router::new()
-                .merge(authed)
-                .route("/:id", get(payments::get_by_id))
-        })
+        /* The versioned API surface, mounted twice.
+        `/v1` is canonical. The same routes stay mounted unprefixed so every
+        existing integrator keeps working — shipping versioning by breaking all
+        current callers at once would be precisely the failure versioning
+        exists to prevent (issue #121). Legacy responses carry `Deprecation`
+        and `Link` headers pointing at their `/v1` equivalent, so a client can
+        discover the move from a response it already parses. */
+        .nest("/v1", api_v1(&state))
+        .merge(api_v1(&state).layer(middleware::from_fn(mark_deprecated)))
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
@@ -135,6 +109,73 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             request_timeout,
         ))
         .with_state(state)
+}
+
+/// The versioned API surface: everything that forms the public contract.
+///
+/// Operational endpoints (`/health`, `/ready`, `/metrics`, `/dashboard`, `/`)
+/// are deliberately excluded. They are infrastructure rather than contract —
+/// a probe URL that moved with every API revision would break liveness checks
+/// and scrape configs for no benefit.
+fn api_v1(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
+    /* Merchant provisioning and API key lifecycle. All admin-gated behind
+    ADMIN_PROVISIONING_SECRET: this service has no self-service signup, and
+    minting or revoking a credential is an operator action. */
+    let merchants = axum::Router::new()
+        .route("/", post(provision_merchant))
+        .route("/:id/keys", post(issue_api_key).get(list_api_keys))
+        .route("/:id/keys/:key_id", axum::routing::delete(revoke_api_key))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_secret,
+        ));
+
+    /* Auth middleware on the write + list routes, the webhook listing, and
+    redelivery (it triggers a merchant-scoped outbound request). The
+    per-payment status endpoint handles credentials itself, because it serves
+    both authenticated and anonymous callers — see `payments::get_by_id`. */
+    let payments_authed = axum::Router::new()
+        .route("/", post(payments::create).get(payments::list))
+        .route("/:id/webhooks", get(payments::list_webhooks))
+        .route(
+            "/:id/webhooks/:delivery_id/redeliver",
+            post(payments::redeliver_webhook),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    axum::Router::new().nest("/merchants", merchants).nest(
+        "/payments",
+        axum::Router::new()
+            .merge(payments_authed)
+            .route("/:id", get(payments::get_by_id)),
+    )
+}
+
+/// Tag a response served from an unversioned path as deprecated.
+///
+/// `Deprecation` and `Link: rel="successor-version"` are the RFC 8594 /
+/// RFC 8288 way of saying this, so a client can find the replacement in a
+/// response it is already parsing rather than by reading release notes.
+///
+/// No `Sunset` header is emitted. That header is a commitment to a removal
+/// date, and inventing one here would announce a promise nobody has made —
+/// see the deprecation policy in the README.
+async fn mark_deprecated(req: Request, next: Next) -> axum::response::Response {
+    let successor = format!("/v1{}", req.uri().path());
+    let mut res = next.run(req).await;
+
+    let headers = res.headers_mut();
+    headers.insert(
+        axum::http::HeaderName::from_static("deprecation"),
+        HeaderValue::from_static("true"),
+    );
+    if let Ok(link) = HeaderValue::from_str(&format!("<{successor}>; rel=\"successor-version\"")) {
+        headers.insert(header::LINK, link);
+    }
+    res
 }
 
 /// Authenticates via the `Authorization: Bearer <key>` header, injecting
