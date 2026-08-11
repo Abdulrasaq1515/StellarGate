@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>StellarGate Dashboard</title>
+    <link rel="stylesheet" href="/dashboard/app.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>&#9733;</text></svg>"
+    />
+  </head>
+  <body>
+    <!-- Sign-in gate. The dashboard holds no session of its own: it calls the
+         same public REST API with the merchant's API key. -->
+    <section id="gate" class="gate" hidden>
+      <form id="gate-form" class="card gate-card" autocomplete="off">
+        <h1>StellarGate</h1>
+        <p class="muted">Sign in with a merchant API key to view payments.</p>
+        <label for="api-key">API key</label>
+        <input
+          id="api-key"
+          name="api-key"
+          type="password"
+          placeholder="merchant API key"
+          spellcheck="false"
+          required
+        />
+        <label class="checkbox">
+          <input id="remember" type="checkbox" />
+          <span>Keep me signed in on this device</span>
+        </label>
+        <button type="submit" class="primary">Sign in</button>
+        <p id="gate-error" class="error" hidden></p>
+        <p class="muted small">
+          The key is held in your browser only and sent as a bearer token
+          directly to this gateway. It is never stored on the server.
+        </p>
+      </form>
+    </section>
+
+    <!-- Main application. -->
+    <div id="app" hidden>
+      <header class="topbar">
+        <div class="brand">
+          <span class="star">&#9733;</span>
+          <strong>StellarGate</strong>
+          <span class="muted small" id="version"></span>
+        </div>
+        <div class="topbar-right">
+          <span id="health" class="pill pill-idle" title="Gateway health">
+            checking&hellip;
+          </span>
+          <button id="sign-out" class="ghost">Sign out</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="toolbar">
+          <div class="filters" role="group" aria-label="Filter by status">
+            <button class="chip chip-on" data-status="">All</button>
+            <button class="chip" data-status="pending">Pending</button>
+            <button class="chip" data-status="completed">Completed</button>
+            <button class="chip" data-status="underpaid">Underpaid</button>
+            <button class="chip" data-status="expired">Expired</button>
+          </div>
+          <button id="refresh" class="ghost">Refresh</button>
+        </section>
+
+        <section class="card">
+          <table class="payments">
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Amount</th>
+                <th>Memo</th>
+                <th>Created</th>
+                <th>Payment ID</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+          <p id="empty" class="empty" hidden>No payments match this filter.</p>
+          <p id="list-error" class="error" hidden></p>
+          <div class="table-foot">
+            <button id="load-more" class="ghost" hidden>Load more</button>
+          </div>
+        </section>
+      </main>
+
+      <!-- Detail panel, opened by clicking a row. -->
+      <aside id="detail" class="detail" hidden aria-label="Payment detail">
+        <div class="detail-head">
+          <h2>Payment</h2>
+          <button id="detail-close" class="ghost" aria-label="Close">&times;</button>
+        </div>
+        <dl id="detail-fields" class="fields"></dl>
+
+        <h3>Webhook deliveries</h3>
+        <p id="deliveries-empty" class="muted small" hidden>
+          No delivery attempts recorded for this payment.
+        </p>
+        <p id="deliveries-error" class="error" hidden></p>
+        <ul id="deliveries" class="deliveries"></ul>
+      </aside>
+      <div id="scrim" class="scrim" hidden></div>
+    </div>
+
+    <script src="/dashboard/app.js"></script>
+  </body>
+</html>

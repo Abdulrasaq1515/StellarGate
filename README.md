@@ -17,6 +17,7 @@ A payment gateway API built on [Stellar](https://stellar.org) for accepting, ver
 - [Features](#features)
 - [Architecture](#architecture)
 - [Getting Started](#getting-started)
+- [Dashboard](#dashboard)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
 - [Payment Resolution Policy](#payment-resolution-policy)
@@ -77,7 +78,7 @@ A payment is matched on three independent attributes — **memo**, **destination
 | SSRF protection | ✅ | Webhook targets resolved and filtered, re-checked on every send |
 | Rate limiting | ✅ | Per-IP, per-route-bucket |
 | Prometheus metrics | ✅ | `GET /metrics` |
-| Dashboard UI | ⬜ | Not started |
+| Dashboard UI | ✅ | Served at `/dashboard`; no build step or separate deploy |
 
 ## Architecture
 
@@ -95,9 +96,10 @@ src/
 ├── metrics.rs     Prometheus counters and histograms
 ├── webhook.rs     Signed dispatch and the background redrive worker
 └── api/
-    ├── mod.rs     Router, auth, rate limiting, CORS, timeouts, 404 fallback
+    ├── mod.rs     Router, auth, rate limiting, CORS, timeouts, dashboard, 404 fallback
     └── payments.rs  Payment and webhook-delivery handlers
 
+static/            Dashboard assets, compiled into the binary via include_str!
 migrations/        Versioned SQL, applied automatically on startup
 tests/             Integration tests (API, concurrency, rate limits, webhooks, trustlines)
 ```
@@ -170,6 +172,48 @@ curl -X POST http://localhost:3000/payments \
   -H "Content-Type: application/json" \
   -d '{"amount":"10","asset":"XLM"}'
 ```
+
+---
+
+## Dashboard
+
+A read-and-operate dashboard is served directly by the gateway at
+**`http://localhost:3000/dashboard`** — no separate process, build step, or
+deploy. Sign in with any merchant API key.
+
+| View | What it does |
+|---|---|
+| Payments | Table of the merchant's payments, filterable by status, paged with the keyset cursor |
+| Payment detail | Full record — amounts, memo, destination, transaction hash, timestamps |
+| Webhook deliveries | Every attempt for a payment, with a one-click **Redeliver** |
+| Health | Live `/ready` indicator, polled every 30s |
+
+**How it's built.** The page is plain HTML, CSS, and dependency-free
+JavaScript, compiled into the binary with `include_str!`. There is no npm, no
+bundler, and no `node_modules`: the deployable artifact stays a single Rust
+binary, and the dashboard cannot drift out of sync with the API it ships
+alongside. It is also a plain client of the documented REST API — it uses no
+private endpoints, so anything it displays you can fetch yourself.
+
+**Security.**
+
+- The static shell is unauthenticated because it contains no data. Every figure
+  on the page is fetched by your browser from the same authenticated endpoints
+  documented below, using the key you supply.
+- The key is held in your browser (`sessionStorage`, or `localStorage` if you
+  tick *keep me signed in*) and sent as a bearer token. It is never stored
+  server-side and never logged.
+- Responses carry a strict `Content-Security-Policy` (`default-src 'none'`,
+  no `unsafe-inline`) plus `X-Content-Type-Options: nosniff`, so the page an
+  operator pastes a key into cannot load third-party script or be framed.
+- All API-supplied values are inserted via `textContent`, never as markup —
+  `webhook_url` and `memo` are merchant-controlled and would otherwise be a
+  stored-XSS vector.
+
+> The dashboard shows only what the signed-in merchant's key can already reach.
+> It exposes no admin capability — merchant provisioning stays on
+> `POST /merchants` behind `ADMIN_PROVISIONING_SECRET`. If you expose the
+> gateway publicly, put `/dashboard` behind your own network controls as well.
 
 ---
 
@@ -455,6 +499,11 @@ Readiness probe. Runs `SELECT 1` against the database.
 ### `GET /metrics`
 
 Prometheus exposition format. See [Observability](#observability).
+
+### `GET /dashboard`
+
+The operator dashboard. Also serves `/dashboard/app.css` and
+`/dashboard/app.js`. See [Dashboard](#dashboard).
 
 ---
 

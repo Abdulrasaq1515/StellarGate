@@ -1357,3 +1357,60 @@ async fn test_whole_amount_canonicalization() {
         );
     }
 }
+
+/// The dashboard shell is static and carries no merchant data, so it is served
+/// without authentication — the browser then authenticates every data call
+/// with the API key the operator types in.
+#[tokio::test]
+async fn test_dashboard_assets_served_unauthenticated() {
+    let server = test_server().await;
+
+    for (path, content_type) in [
+        ("/dashboard", "text/html; charset=utf-8"),
+        ("/dashboard/app.css", "text/css; charset=utf-8"),
+        ("/dashboard/app.js", "text/javascript; charset=utf-8"),
+    ] {
+        let res = server.get(path).await;
+        res.assert_status_ok();
+        assert_eq!(
+            res.header("content-type"),
+            content_type,
+            "{path} served with the wrong content type"
+        );
+        assert!(
+            !res.text().is_empty(),
+            "{path} served an empty body — asset missing from the binary?"
+        );
+    }
+}
+
+/// The dashboard must stay locked to its own origin. Without a CSP a single
+/// injected third-party script would sit on the page an operator pastes an
+/// API key into.
+#[tokio::test]
+async fn test_dashboard_sets_security_headers() {
+    let server = test_server().await;
+    let res = server.get("/dashboard").await;
+    res.assert_status_ok();
+
+    let csp = res.header("content-security-policy");
+    let csp = csp.to_str().unwrap();
+    assert!(csp.contains("default-src 'none'"), "got: {csp}");
+    assert!(csp.contains("script-src 'self'"), "got: {csp}");
+    assert!(csp.contains("frame-ancestors 'none'"), "got: {csp}");
+    // An inline-script allowance would defeat the point of the policy.
+    assert!(!csp.contains("unsafe-inline"), "got: {csp}");
+
+    assert_eq!(res.header("x-content-type-options"), "nosniff");
+}
+
+/// The dashboard is a client of the documented API, so the endpoints it
+/// depends on must keep working unauthenticated/authenticated as it expects.
+#[tokio::test]
+async fn test_dashboard_data_endpoints_reject_missing_key() {
+    let server = test_server().await;
+    // The list the dashboard loads on sign-in is the key-validation call.
+    let res = server.get("/payments?limit=1").await;
+    res.assert_status(StatusCode::UNAUTHORIZED);
+    assert_eq!(res.json::<Value>()["code"], "unauthorized");
+}

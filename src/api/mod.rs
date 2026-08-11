@@ -80,6 +80,13 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics_handler))
+        /* Operator dashboard. The assets are static and carry no data, so they
+        are served unauthenticated — every figure they display is fetched by
+        the browser from the same authenticated endpoints a merchant would
+        call directly, using an API key the operator supplies. */
+        .route("/dashboard", get(dashboard_html))
+        .route("/dashboard/app.css", get(dashboard_css))
+        .route("/dashboard/app.js", get(dashboard_js))
         /* Merchant provisioning — returns a one-time plaintext API key. Gated
         behind ADMIN_PROVISIONING_SECRET so it can't be used to mint
         unlimited credentials anonymously. */
@@ -462,6 +469,55 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         )],
         body,
     )
+}
+
+/* The dashboard is compiled into the binary rather than read from disk, so a
+deployment stays a single artifact with no asset path to configure and no way
+for the two to drift apart. */
+const DASHBOARD_HTML: &str = include_str!("../../static/dashboard.html");
+const DASHBOARD_CSS: &str = include_str!("../../static/dashboard.css");
+const DASHBOARD_JS: &str = include_str!("../../static/dashboard.js");
+
+/// Locks the dashboard to its own origin: no third-party script, style, frame
+/// or connection. The page ships no inline script or style, so this needs no
+/// `unsafe-inline` escape hatch.
+const DASHBOARD_CSP: &str = "default-src 'none'; \
+     script-src 'self'; \
+     style-src 'self'; \
+     img-src 'self' data:; \
+     connect-src 'self'; \
+     form-action 'none'; \
+     frame-ancestors 'none'; \
+     base-uri 'none'";
+
+fn dashboard_asset(body: &'static str, content_type: &'static str) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(DASHBOARD_CSP),
+            ),
+            (
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            ),
+        ],
+        body,
+    )
+}
+
+async fn dashboard_html() -> impl IntoResponse {
+    dashboard_asset(DASHBOARD_HTML, "text/html; charset=utf-8")
+}
+
+async fn dashboard_css() -> impl IntoResponse {
+    dashboard_asset(DASHBOARD_CSS, "text/css; charset=utf-8")
+}
+
+async fn dashboard_js() -> impl IntoResponse {
+    dashboard_asset(DASHBOARD_JS, "text/javascript; charset=utf-8")
 }
 
 async fn not_found() -> impl IntoResponse {
