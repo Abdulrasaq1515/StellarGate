@@ -54,11 +54,18 @@ allow = [
     "Apache-2.0 WITH LLVM-exception", # compiler-builtins and related LLVM crates
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "ISC",                             # ring and rustls-webpki, via the rustls TLS stack
+    # webpki-roots — the Mozilla CA root store. A permissive *data* licence
+    # (no copyleft, redistribution unrestricted) covering the certificate set
+    # rather than code. Arrives with the rustls stack.
+    "CDLA-Permissive-2.0",
     "Unicode-DFS-2016",                # unicode-ident, icu_* and related crates
     "Unicode-3.0",                     # newer unicode-ident / icu_* releases
     "Zlib",                            # miniz_oxide and compression crates
-    "OpenSSL",                         # openssl-sys transitive dep via native-tls
 ]
+# Note: "OpenSSL" was removed with the move to rustls (sqlx uses
+# runtime-tokio-rustls, reqwest uses rustls-tls). openssl-sys is no longer in
+# the tree, and keeping the allowance would let it return unnoticed.
 
 # Crates that either bundle their own license text or use a non-SPDX
 # expression that cargo-deny cannot auto-classify. Add with justification.
