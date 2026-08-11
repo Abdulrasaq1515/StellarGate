@@ -39,3 +39,16 @@ updates:
     labels: ["dependencies", "docker"]
     commit-message:
       prefix: "chore(docker)"
+    ignore:
+      # The builder image is deliberately pinned to the MSRV, so that what CI
+      # compiles on its oldest supported toolchain is what the image ships.
+      # Bumping it here achieves nothing anyway: rust-toolchain.toml pins 1.88
+      # and outranks the image's own default, so a newer base would simply
+      # download 1.88 during the build.
+      #
+      # Raising the MSRV is a deliberate, coordinated change across
+      # Cargo.toml, rust-toolchain.toml, the CI matrix and this Dockerfile —
+      # not a dependency bump. Do that by hand.
+      - dependency-name: "rust"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]

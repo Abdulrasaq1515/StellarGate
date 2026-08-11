@@ -21,7 +21,8 @@
 //! verification recipe and recommended window.
 
 use crate::{db, AppState};
-use hmac::{Hmac, Mac};
+// `KeyInit` provides `new_from_slice`; it moved off `Mac` in hmac 0.13.
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::json;
 use sha2::Sha256;
 use std::sync::Arc;
