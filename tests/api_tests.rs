@@ -1414,3 +1414,53 @@ async fn test_dashboard_data_endpoints_reject_missing_key() {
     res.assert_status(StatusCode::UNAUTHORIZED);
     assert_eq!(res.json::<Value>()["code"], "unauthorized");
 }
+
+/// Regression guard for a bug that shipped: the sign-in panel stayed on screen
+/// after signing in, with the payments list pushed below it.
+///
+/// The script hides elements by setting the `hidden` attribute, but the browser
+/// applies `[hidden] { display: none }` from its own stylesheet, which any
+/// author `display` rule outranks — and `.gate` sets `display: grid`. The
+/// stylesheet must therefore assert the rule itself.
+///
+/// There is no browser in CI to catch this visually, so pin it here: every
+/// element the dashboard toggles depends on it.
+#[tokio::test]
+async fn test_dashboard_css_forces_hidden_to_win() {
+    let server = test_server().await;
+    let raw = server.get("/dashboard/app.css").await.text();
+
+    // Strip comments first — the rule is *explained* in a comment that also
+    // contains the text `[hidden] { display: none }`, and matching that instead
+    // of the real declaration would make this test pass on a broken stylesheet.
+    let mut css = String::with_capacity(raw.len());
+    let mut rest = raw.as_str();
+    while let Some(open) = rest.find("/*") {
+        css.push_str(&rest[..open]);
+        rest = match rest[open..].find("*/") {
+            Some(close) => &rest[open + close + 2..],
+            None => "",
+        };
+    }
+    css.push_str(rest);
+
+    let rule_start = css.find("[hidden]").expect(
+        "stylesheet must define a [hidden] rule; without it any author \
+         `display` declaration keeps `hidden` elements visible",
+    );
+    let rule = &css[rule_start
+        ..css[rule_start..]
+            .find('}')
+            .map(|i| rule_start + i)
+            .unwrap_or(css.len() - rule_start)];
+
+    assert!(
+        rule.contains("display") && rule.contains("none"),
+        "[hidden] must set display:none, got: {rule}"
+    );
+    assert!(
+        rule.contains("!important"),
+        "[hidden] must be !important to outrank author rules like `.gate \
+         {{ display: grid }}`, got: {rule}"
+    );
+}

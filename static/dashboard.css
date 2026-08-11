@@ -45,6 +45,15 @@
   box-sizing: border-box;
 }
 
+/* The browser applies `[hidden] { display: none }` from its own stylesheet,
+   which ANY author `display` rule outranks. `.gate` sets `display: grid`, so
+   setting `hidden` on it had no visual effect and the sign-in panel stayed on
+   screen after signing in. Every element the script toggles needs this to be
+   authoritative, so declare it once here rather than per-component. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   background: var(--bg);
