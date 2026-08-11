@@ -684,22 +684,30 @@ Control verbosity with `RUST_LOG`, e.g. `RUST_LOG=stellargate=debug,tower_http=d
 checklist, first deploy, secrets, backups, upgrades and rollback, alerting
 signals, and scaling limits.
 
-A `fly.toml` is committed for [Fly.io](https://fly.io), which suits this
-service well: it runs the single binary directly and provides the persistent
-volume SQLite needs.
+The target is an **Oracle Cloud "Always Free" VM** — free with no expiry, and
+one of the few free tiers offering the persistent disk SQLite requires. The
+stack is plain Docker Compose (app + Caddy for automatic TLS), so it runs
+unchanged on any VPS, home server, or Raspberry Pi.
 
 ```bash
-fly launch --no-deploy --copy-config
-fly volumes create stellargate_data --size 1 --region lhr
-fly secrets set WEBHOOK_SECRET="$(openssl rand -hex 32)" \
-                ADMIN_PROVISIONING_SECRET="$(openssl rand -hex 32)" \
-                STELLAR_GATEWAY_PUBLIC="G..." \
-                CORS_ALLOWED_ORIGINS="https://yourapp.example.com"
-fly deploy
+# On the VM — installs Docker, opens the host firewall, adds a systemd unit
+curl -fsSL https://raw.githubusercontent.com/StellarGateLabs/StellarGate/main/deploy/setup-oracle.sh | bash
+
+cd ~/StellarGate
+cp deploy/stellargate.env.example deploy/stellargate.env
+chmod 600 deploy/stellargate.env
+nano deploy/stellargate.env          # domain, Stellar account, secrets
+
+sudo systemctl start stellargate
+curl https://your-domain.com/health
 ```
 
-The image is a plain non-root container with no platform coupling, so any
-Docker host, Render, Kubernetes or ECS works equally well.
+Only Caddy binds to the host; the gateway is reachable solely over the internal
+Compose network, so the API cannot be hit over plaintext via the VM's IP.
+
+> Most free tiers elsewhere (Render, Cloud Run, Railway) provide **no
+> persistent disk** and idle the container out. For a payment gateway that
+> means losing the ledger — hence a VM.
 
 > ⚠️ **Run exactly one instance.** SQLite permits a single writer, and the
 > background listeners assume they are the only ones running — two instances

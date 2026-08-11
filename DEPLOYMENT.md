@@ -1,10 +1,15 @@
 # Deployment
 
-Production runbook for StellarGate on [Fly.io](https://fly.io). The same image
-runs anywhere Docker does; only the platform commands differ.
+Production runbook for StellarGate on an **Oracle Cloud "Always Free" VM** —
+genuinely free with no expiry, and the only common free tier that gives you a
+real persistent disk, which SQLite requires.
+
+The stack is a plain Docker Compose deployment, so the same files run on any
+VPS, home server, or Raspberry Pi.
 
 - [Before you deploy](#before-you-deploy)
-- [First deploy](#first-deploy)
+- [Provision the VM](#provision-the-vm)
+- [Deploy](#deploy)
 - [Provisioning a merchant](#provisioning-a-merchant)
 - [Operating](#operating)
 - [Upgrades and rollback](#upgrades-and-rollback)
@@ -16,168 +21,233 @@ runs anywhere Docker does; only the platform commands differ.
 
 ## Before you deploy
 
-### 1. A funded Stellar account
+### 1. A Stellar account to watch
 
 The gateway watches one account for incoming payments. It **never holds the
-secret key** — set only the public key.
+secret key** — you configure only the public key, and it never signs or submits
+a transaction.
 
-```bash
-# Testnet: create and fund an account at https://laboratory.stellar.org
-# Mainnet: use an account you control. Fund it with the 1 XLM base reserve
-# plus 0.5 XLM per trustline.
-```
+- **Testnet:** create and fund one free at [Stellar Laboratory](https://laboratory.stellar.org).
+- **Mainnet:** an account you control, funded with the 1 XLM base reserve plus
+  0.5 XLM per trustline.
 
-Add a trustline for every non-native asset you intend to accept (USDC and so
-on). A payment in an asset with no trustline **will fail on-chain**, so the
-gateway logs a warning at startup listing any accepted asset that is missing
-one. Check the logs after your first deploy.
+Add a trustline for **every non-native asset** you intend to accept. A payment
+in an asset with no trustline **fails on-chain** — the gateway cannot rescue it.
+It logs a warning at startup naming any accepted asset that is missing one, so
+read the first few lines of the log after your first deploy.
 
-### 2. Generate real secrets
+### 2. A domain
 
-Never reuse the values from `.env.example` — startup rejects known
-placeholders, and `WEBHOOK_SECRET` must be at least 32 characters.
+Caddy issues a Let's Encrypt certificate automatically, which requires a domain
+resolving to the VM. A free subdomain from [DuckDNS](https://duckdns.org) or
+[Afraid](https://freedns.afraid.org) works.
+
+TLS is not optional here: merchants send API keys as bearer tokens on every
+request, and operators paste one into the dashboard.
+
+### 3. Real secrets
 
 ```bash
 openssl rand -hex 32   # WEBHOOK_SECRET
 openssl rand -hex 32   # ADMIN_PROVISIONING_SECRET
 ```
 
-### 3. Pre-flight checklist
+Never reuse the placeholders — startup rejects known placeholder values, and
+`WEBHOOK_SECRET` must be at least 32 characters.
+
+### 4. Pre-flight checklist
 
 | Check | Why |
 |---|---|
-| `STELLAR_NETWORK=public` | Otherwise you are watching testnet and will never see real payments |
-| `STELLAR_HORIZON_URL` points at mainnet Horizon | Must match the network |
+| `STELLAR_NETWORK` and `STELLAR_HORIZON_URL` agree | Mismatched, they silently watch the wrong chain |
 | `WEBHOOK_SECRET` ≥ 32 random chars | Signs every webhook; merchants verify against it |
 | `ADMIN_PROVISIONING_SECRET` set | Unset disables merchant provisioning entirely |
-| `CORS_ALLOWED_ORIGINS` set | **Required** on `public`; a missing value is a startup error |
+| `CORS_ALLOWED_ORIGINS` set | **Required** on `public` — boot fails without it |
 | Trustlines added for every accepted asset | Payments in an untrusted asset bounce |
-| `WEBHOOK_ALLOW_PRIVATE_TARGETS` unset/false | Enabling it in production reopens the SSRF hole |
+| `WEBHOOK_ALLOW_PRIVATE_TARGETS` false | Enabling it in production reopens the SSRF hole |
+| `deploy/stellargate.env` is `chmod 600` | It holds every secret the service has |
 
 ---
 
-## First deploy
+## Provision the VM
+
+In the [Oracle Cloud console](https://cloud.oracle.com): **Compute → Instances
+→ Create instance**.
+
+| Setting | Value |
+|---|---|
+| Shape | `VM.Standard.A1.Flex` — Ampere ARM, **Always Free** |
+| OCPUs / memory | 1 OCPU / 6 GB is ample (up to 4/24 is free) |
+| Image | Canonical Ubuntu 22.04 or 24.04 |
+| Boot volume | 50 GB (200 GB total is free) |
+| SSH key | Upload your public key |
+
+> **On capacity errors.** `Out of host capacity` for the ARM shape is common
+> and not a mistake on your part — free ARM capacity is heavily contested. Try
+> a different availability domain or region, or retry later. The x86
+> `VM.Standard.E2.1.Micro` shape is also Always Free and works fine for this
+> service if ARM stays unavailable.
+
+### Open the ports — both firewalls
+
+This is the step that traps nearly everyone on Oracle Cloud. There are **two
+independent firewalls**, and traffic must pass both.
+
+**1. The cloud security list** — Networking → Virtual Cloud Networks → your VCN
+→ Security Lists → Default → **Add Ingress Rules**:
+
+| Source | Protocol | Destination port |
+|---|---|---|
+| `0.0.0.0/0` | TCP | 80 |
+| `0.0.0.0/0` | TCP | 443 |
+
+**2. The host firewall** — Oracle's stock images also ship a restrictive local
+`iptables`/`firewalld` ruleset. `setup-oracle.sh` handles this for you.
+
+> Symptom of missing either: connections **hang** rather than being refused,
+> and Caddy never issues a certificate because the ACME challenge cannot reach
+> the host.
+
+---
+
+## Deploy
+
+SSH in, then:
 
 ```bash
-# 0. Install flyctl and sign in
-curl -L https://fly.io/install.sh | sh
-fly auth login
+# 1. Bootstrap: installs Docker, opens the host firewall, clones the repo,
+#    and installs a systemd unit so the stack survives reboots.
+curl -fsSL https://raw.githubusercontent.com/StellarGateLabs/StellarGate/main/deploy/setup-oracle.sh | bash
 
-# 1. Claim the app name. Edit `app` in fly.toml first — names are global.
-fly launch --no-deploy --copy-config
+# Docker group membership needs a new session
+newgrp docker   # or log out and back in
 
-# 2. Create the volume SQLite writes to. Must be in the same region as the app.
-fly volumes create stellargate_data --size 1 --region lhr
+# 2. Configure
+cd ~/StellarGate
+cp deploy/stellargate.env.example deploy/stellargate.env
+chmod 600 deploy/stellargate.env
+nano deploy/stellargate.env        # domain, email, Stellar account, secrets
 
-# 3. Set secrets (never commit these; fly.toml is in git)
-fly secrets set \
-  WEBHOOK_SECRET="$(openssl rand -hex 32)" \
-  ADMIN_PROVISIONING_SECRET="$(openssl rand -hex 32)" \
-  STELLAR_GATEWAY_PUBLIC="GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" \
-  CORS_ALLOWED_ORIGINS="https://yourapp.example.com"
+# 3. Point your domain's A record at the VM's public IP, and confirm:
+dig +short your-domain.com         # must return the VM IP before starting
 
-# 4. Ship it
-fly deploy
+# 4. Start
+sudo systemctl start stellargate
 
-# 5. Confirm it came up healthy
-fly status
-curl https://<your-app>.fly.dev/health   # {"status":"ok"}
-curl https://<your-app>.fly.dev/ready    # {"status":"ok"} once Horizon is reachable
+# 5. Verify
+curl https://your-domain.com/health   # {"status":"ok"}
+curl https://your-domain.com/ready    # {"status":"ok"} once Horizon is reachable
 ```
 
-`/ready` returning `503` with `"reason":"..."` is the fastest way to tell
-whether the database or Horizon is the problem.
+`/ready` returning `503` with a `"reason"` field tells you immediately whether
+the database or Horizon is the problem.
 
-### Custom domain
+The first build compiles the whole dependency tree and takes several minutes on
+a 1-OCPU shape. Subsequent deploys reuse the Docker layer cache.
 
-```bash
-fly certs add pay.example.com   # then add the DNS records it prints
-```
+### What is exposed
 
-Once the domain is live, add it to `CORS_ALLOWED_ORIGINS`.
+Only Caddy binds to the host, on 80/443. The gateway itself is reachable solely
+over the internal Compose network, so there is no way to reach the API over
+plaintext by hitting the VM's IP directly.
 
 ---
 
 ## Provisioning a merchant
 
-There is no self-service signup. Mint keys yourself:
+There is no self-service signup — you mint keys:
 
 ```bash
-curl -X POST https://<your-app>.fly.dev/merchants \
+curl -X POST https://your-domain.com/merchants \
   -H "X-Admin-Secret: $ADMIN_PROVISIONING_SECRET"
 # {"merchant_id":"...","api_key":"..."}
 ```
 
-The API key is shown **once** — only a hash is stored, so it cannot be
-recovered. Hand it to the merchant over a secure channel. They then use it as
-`Authorization: Bearer <key>`, and to sign in to the dashboard at
-`/dashboard`.
+The API key is shown **once**; only a hash is stored, so it cannot be
+recovered. Deliver it over a secure channel. Merchants use it as
+`Authorization: Bearer <key>`, and to sign in to the dashboard at `/dashboard`.
 
 ---
 
 ## Operating
 
 ```bash
-fly logs                      # stream structured logs
-fly status                    # machine + health check state
-fly ssh console               # shell into the running machine
-fly dashboard                 # metrics and machine management
+cd ~/StellarGate
+docker compose -f deploy/docker-compose.prod.yml logs -f app   # stream logs
+docker compose -f deploy/docker-compose.prod.yml ps            # container state
+systemctl status stellargate                                    # unit state
 ```
 
 **Metrics.** `GET /metrics` exposes Prometheus counters for webhook delivery
-outcomes, retries, delivery latency, and auth successes/failures. Point your
-scraper at it.
+outcomes, retries, delivery latency, and auth success/failure.
 
-**Alerts worth wiring up first:**
+**Alerts worth wiring first:**
 
 | Signal | Why it matters |
 |---|---|
 | `/ready` failing | Horizon or the database is unreachable — payments will not be detected |
-| `stellargate_webhook_deliveries_total{outcome="failed"}` rising | Merchants are not being notified of completed payments |
-| `cursor_age_secs` climbing in logs | The poller is falling behind the chain |
+| `stellargate_webhook_deliveries_total{outcome="failed"}` rising | Merchants are not learning about completed payments |
+| `cursor_age_secs` climbing in logs | The listener is falling behind the chain |
 | `stellargate_auth_attempts_total{outcome="failure"}` spiking | Credential stuffing, or a broken integration |
 
 **Exposure.** `/dashboard` leaks nothing without a valid API key, but there is
-no reason to serve the sign-in page to the open internet. Restrict it at your
-edge, or via `fly proxy` for operator-only access.
+no reason to serve the sign-in page to the whole internet. Restrict it in the
+`Caddyfile` by source IP, or put it behind basic auth, if only your team uses it.
+
+**Log growth.** Both containers cap their JSON logs (10 MB × 5 for the app).
+Uncapped container logs filling the boot volume is a slow and surprising way to
+take a service down.
 
 ---
 
 ## Upgrades and rollback
 
 Migrations in `migrations/` run automatically at startup and are recorded in
-`_sqlx_migrations`, so each runs exactly once. Deploying a build with a new
-migration applies it as the machine boots.
+`_sqlx_migrations`, so each runs exactly once.
 
 ```bash
-fly deploy                    # rolling deploy; health checks gate the cutover
-fly releases                  # list past releases
-fly deploy --image <previous> # roll back to a prior image
+cd ~/StellarGate
+git pull
+sudo systemctl restart stellargate     # rebuilds and restarts
 ```
 
-> **Rolling back across a migration does not undo it.** SQLite migrations here
-> are forward-only. If a release adds a migration, take a backup first (below)
-> and treat rollback as restore-from-backup rather than a redeploy.
+To roll back to a previous commit:
+
+```bash
+git checkout <previous-sha>
+sudo systemctl restart stellargate
+```
+
+> **Rolling back across a migration does not undo it.** Migrations here are
+> forward-only. If a release added one, take a backup first and treat rollback
+> as restore-from-backup rather than a redeploy.
 
 ---
 
 ## Backups
 
-The entire dataset is one SQLite file on the volume. Fly snapshots volumes
-daily by default, but take your own before anything risky:
+The entire dataset is one SQLite file in a Docker volume.
 
 ```bash
-# Consistent copy of a live SQLite database — do NOT just `cp` the file.
-fly ssh console -C "sqlite3 /data/stellargate.db \".backup '/data/backup.db'\""
-fly ssh sftp get /data/backup.db ./stellargate-$(date +%F).db
+# Consistent snapshot of a live database — do NOT just copy the file.
+docker compose -f deploy/docker-compose.prod.yml exec app \
+  sqlite3 /data/stellargate.db ".backup '/data/backup.db'"
+
+# Copy it off the VM
+docker compose -f deploy/docker-compose.prod.yml cp \
+  app:/data/backup.db ./stellargate-$(date +%F).db
+scp ubuntu@<vm-ip>:~/StellarGate/stellargate-*.db ./
 ```
 
-Restore by uploading the file back to `/data/stellargate.db` with the app
-stopped.
+> Copying `stellargate.db` directly while the app runs can capture a torn
+> write, because WAL mode keeps recent commits in a side file. `.backup` takes
+> a consistent snapshot.
 
-> Copying `stellargate.db` directly while the app is running can capture a torn
-> write, because WAL mode keeps recent commits in a side file. Use `.backup`,
-> which takes a consistent snapshot.
+Restore by stopping the stack, replacing the file in the volume, and starting
+again. **Test a restore before you need one** — an untested backup is a guess.
+
+Worth automating as a cron job, with the copy going somewhere other than this
+VM.
 
 ---
 
@@ -185,41 +255,34 @@ stopped.
 
 Read this before scaling out — it is the sharpest constraint in the system.
 
-**Run exactly one machine.** SQLite allows a single writer, and the volume is
-local to one machine. Two machines would each hold their own database file and
+**Run exactly one instance.** SQLite allows a single writer, and the volume is
+local to this host. Two instances would each keep their own database file and
 each run their own Horizon listener and expiry sweeper — a payment could settle
-twice and fire duplicate webhooks. `fly.toml` therefore pins
-`min_machines_running = 1` with autoscaling off.
+twice and fire duplicate webhooks.
 
-This is comfortable for a large volume of payments: the workload is a handful
-of small writes per payment. What it does not survive is a machine failure —
-you get the restart window as downtime.
+This handles a large volume of payments comfortably; the workload is a handful
+of small writes per payment. What it does not survive is host failure — you get
+the restart window as downtime.
 
-To go multi-node you would need to move off SQLite to a networked database and
-elect a single leader for the background listeners. That is a real project, not
-a config change; the sqlx queries and migrations are SQLite-specific today.
+Going multi-node means moving off SQLite to a networked database and electing a
+single leader for the background listeners. That is a real project, not a
+config change: the sqlx queries and migrations are SQLite-specific today.
 
-**Vertical scaling** is the supported lever:
-
-```bash
-fly scale vm shared-cpu-2x --memory 1024
-fly volumes extend <volume-id> --size 5
-```
+**Vertical scaling** is the supported lever — the free ARM shape goes to 4
+OCPUs and 24 GB, editable on a running instance.
 
 ---
 
 ## Other platforms
 
-The image is a plain, non-root Docker container with no platform coupling:
+The stack is plain Docker Compose with no Oracle coupling. On any VPS or home
+server, skip `setup-oracle.sh`, install Docker yourself, and run the same
+compose file.
 
-- **Any VPS / Docker host** — `docker compose up -d`, using the committed
-  `docker-compose.yml` and a named volume.
-- **Render** — Docker environment, health check path `/ready`, persistent disk
-  mounted at `/data`.
-- **Kubernetes / ECS** — one replica, `RollingUpdate` with `maxSurge: 0` so two
-  instances never share the volume, `/health` as liveness and `/ready` as
-  readiness.
+For managed container platforms (Render, Koyeb, Railway, Kubernetes), three
+things must hold: **one instance**, a **persistent volume at `/data`**, and
+secrets supplied as environment variables rather than baked into the image.
 
-Whatever the platform, three things must hold: **one instance**, a **persistent
-volume at `/data`**, and secrets supplied as environment variables rather than
-baked into the image.
+> Most free tiers on those platforms give you **no persistent disk** and stop
+> the container when idle. For a payment gateway that means losing the ledger,
+> which is why this runbook targets a VM instead.

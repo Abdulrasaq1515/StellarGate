@@ -1,0 +1,69 @@
+# Production stack for a single always-on host (Oracle Cloud Always Free VM).
+#
+#   docker compose -f deploy/docker-compose.prod.yml up -d --build
+#
+# Caddy terminates TLS and proxies to the gateway, which is NOT published on a
+# host port — it is reachable only over the internal compose network. That way
+# the only thing exposed to the internet is Caddy on 80/443, and there is no
+# way to reach the API over plaintext HTTP by hitting the VM's IP directly.
+
+name: stellargate
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Deliberately no `ports:` — see the note above. Caddy reaches this over
+    # the compose network as http://app:3000.
+    expose:
+      - "3000"
+    env_file:
+      - ./stellargate.env
+    environment:
+      DATABASE_URL: sqlite:///data/stellargate.db
+      PORT: "3000"
+    volumes:
+      - stellargate_data:/data
+    healthcheck:
+      # /ready, not /health: this reports unhealthy when the database or
+      # Horizon is unreachable, which is what actually matters.
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        # Without a cap, container logs will eventually fill the boot volume —
+        # a slow, surprising way to take the gateway down.
+        max-size: "10m"
+        max-file: "5"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    env_file:
+      - ./stellargate.env
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # ACME account + issued certificates — must persist
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  stellargate_data:
+  caddy_data:
+  caddy_config:

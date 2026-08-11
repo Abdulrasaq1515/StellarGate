@@ -1,0 +1,41 @@
+# Caddy obtains and renews a Let's Encrypt certificate automatically. It needs
+# DOMAIN to resolve to this VM's public IP before it can complete the ACME
+# challenge — point DNS first, then start the stack.
+#
+# DOMAIN and ACME_EMAIL come from deploy/stellargate.env.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# The gateway is not published on a host port; this is the only route in.
+	reverse_proxy app:3000 {
+		# Preserve the client IP. The rate limiter and the auth failure logs
+		# key on it, so without these every request would appear to come from
+		# the proxy and one noisy client would rate-limit everybody.
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	header {
+		# HSTS: this service handles API keys and payment data, so never allow
+		# a downgrade to plaintext once a browser has seen it over TLS.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# The dashboard sets its own CSP per-response; don't override it here.
+		-Server
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}

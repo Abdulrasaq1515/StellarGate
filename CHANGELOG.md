@@ -13,12 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cursor pagination, payment detail, webhook delivery history with one-click
   redelivery, and a live health indicator. Built as dependency-free HTML/CSS/JS
   compiled into the binary, so there is no build step and no separate deploy.
-- Fly.io deployment configuration (`fly.toml`) and a production runbook
-  (`DEPLOYMENT.md`) covering first deploy, secrets, backups, upgrades,
-  rollback, alerting signals, and scaling limits.
+- Deployment stack under `deploy/` — Docker Compose (app + Caddy for automatic
+  TLS), an Oracle Cloud bootstrap script, and a systemd unit — plus a
+  production runbook (`DEPLOYMENT.md`) covering first deploy, secrets, backups,
+  upgrades, rollback, alerting signals, and scaling limits. The gateway is not
+  published on a host port; Caddy is the only route in.
 - `.dockerignore`, cutting the Docker build context from ~7 GB to a few hundred
-  kilobytes. Without it every build and every `fly deploy` shipped the whole
-  `target/` directory.
+  kilobytes. Without it every image build shipped the whole `target/` directory.
 - Repository furniture: issue and pull request templates, Dependabot
   configuration, `.editorconfig`, `.gitattributes`, and a pinned
   `rust-toolchain.toml`.
