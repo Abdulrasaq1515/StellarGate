@@ -712,6 +712,7 @@ pub async fn list_merchant_webhooks(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedeliverBulkRequest {
     /// Specific deliveries to requeue. Omit (or send an empty list) to requeue
     /// every failed delivery this merchant has.
@@ -737,11 +738,9 @@ const MAX_BULK_DELIVERY_IDS: usize = 100;
 pub async fn redeliver_webhooks_bulk(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
-    body: Option<JsonBody<RedeliverBulkRequest>>,
+    OptionalJsonBody(body): OptionalJsonBody<RedeliverBulkRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let ids = body
-        .and_then(|JsonBody(b)| b.delivery_ids)
-        .unwrap_or_default();
+    let ids = body.and_then(|b| b.delivery_ids).unwrap_or_default();
     if ids.len() > MAX_BULK_DELIVERY_IDS {
         return Err(AppError::bad_request(
             "too_many_delivery_ids",
