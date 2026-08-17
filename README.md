@@ -362,6 +362,7 @@ until it finished; a backlog drains over several cycles instead.
 | `ADMIN_PROVISIONING_SECRET` | Required via `X-Admin-Secret` to call `POST /merchants`. Unset disables provisioning entirely (always `401`). | _(unset — disabled)_ |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated origins. **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Base per-IP limit. Write routes get this rate; read-only routes get 5×. | `10` |
+| `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite pool size. WAL allows one writer plus many readers. | `10` |
 | `DB_BUSY_TIMEOUT_MS` | Lock-acquisition wait before erroring. Must be `> 0` under concurrent load. | `5000` |
 
@@ -904,6 +905,8 @@ For the full canonical reference, see **[WEBHOOK_REFERENCE.md](WEBHOOK_REFERENCE
 **HTTPS enforced on mainnet.** On `STELLAR_NETWORK=public`, a `webhook_url` must be HTTPS regardless of `ALLOWED_WEBHOOK_SCHEMES` — a permissive scheme list cannot downgrade mainnet delivery to plaintext.
 
 **Rate limiting.** Every route falls into a per-IP bucket. Write and sensitive routes get the base quota; read-only routes get 5×. The limiter cache is capacity-bounded with idle eviction, so key cardinality cannot exhaust memory.
+
+**Client IP attribution is fail-closed.** `X-Forwarded-For`/`X-Real-IP` are client-supplied, so they are honored only when the socket peer is a configured trusted proxy (`TRUSTED_PROXY_CIDRS`) — an unset allow-list means the headers are always ignored and the peer address is used, so a caller can't rotate a header to evade the limiter or poison the auth logs. When no peer address is available at all, every request shares a single key rather than trusting a header.
 
 **Bounded requests.** Bodies are capped at 256 KiB and every request is subject to `REQUEST_TIMEOUT_SECS`.
 

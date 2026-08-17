@@ -48,6 +48,7 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
         request_timeout_secs: 30,
+        trusted_proxy_cidrs: vec![],
     }
 }
 
@@ -108,6 +109,38 @@ async fn test_rate_limit_exceeded_returns_429() {
         .await;
     second.assert_status(StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(second.json::<Value>()["code"], "rate_limit_exceeded");
+}
+
+/// A client cannot evade the per-IP limiter by rotating `X-Forwarded-For` on
+/// each request: forwarding headers are client-supplied and are honored only
+/// when the socket peer is a configured trusted proxy (issue #330). With no
+/// trusted proxies configured, every request keys on the peer address — or on
+/// the single fail-closed key when no peer is available — so the second
+/// request below exceeds the quota no matter which header value it sends.
+#[tokio::test]
+async fn spoofed_forwarded_for_cannot_evade_rate_limit() {
+    let (server, _pool) = server_with_config(make_config(1)).await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    // The first request consumes the single per-second token.
+    let first = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .add_header("X-Forwarded-For", "198.51.100.1")
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await;
+    first.assert_status(StatusCode::CREATED);
+
+    // A second immediate request with a *different* spoofed header still hits
+    // the same rate-limit key and is rejected.
+    let second = server
+        .post("/payments")
+        .add_header("Authorization", auth)
+        .add_header("X-Forwarded-For", "198.51.100.2")
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await;
+    second.assert_status(StatusCode::TOO_MANY_REQUESTS);
 }
 
 /// Redelivery is rate-limited independently of `POST /payments` — a merchant
