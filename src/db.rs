@@ -560,44 +560,42 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// Transition every watchable payment whose TTL has elapsed to `expired`,
-/// returning the rows that were swept so the caller can fire `payment.expired`
-/// webhooks. Each row is updated with a guard on a watchable status so a payment
-/// that settles concurrently is left untouched and not double-reported.
-pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
-    let overdue = sqlx::query(
-        "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
-                webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-         FROM payments
-         WHERE status IN ('pending', 'underpaid')
-           AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
-         ORDER BY created_at ASC",
+/// Transition up to `batch` watchable payments whose TTL has elapsed to
+/// `expired`, returning the rows that were swept so the caller can fire
+/// `payment.expired` webhooks.
+///
+/// The whole batch is transitioned in a single `UPDATE … RETURNING` — one
+/// round-trip instead of one guarded `UPDATE` per intent (issue #323). The
+/// `WHERE … status IN ('pending','underpaid')` guard remains what makes a
+/// concurrent settlement win the race: the subquery and update run under one
+/// write lock, so a payment that settles in between is never selected here
+/// (if the settlement committed first) and a payment this statement sweeps is
+/// rejected by the settlement's own guard (issue #155) — never double-reported.
+/// `RETURNING` yields exactly the rows this statement actually transitioned.
+///
+/// `batch` bounds each statement, so a large backlog drains over several
+/// sweeps instead of one long write lock.
+pub async fn expire_overdue(pool: &Db, batch: i64) -> Result<Vec<Payment>> {
+    let rows = sqlx::query(
+        "UPDATE payments
+            SET status = 'expired',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE id IN (
+              SELECT id FROM payments
+               WHERE status IN ('pending', 'underpaid')
+                 AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
+               ORDER BY created_at ASC
+               LIMIT ?
+          )
+          RETURNING id, merchant_id, destination_address, memo, amount, asset,
+                    status, webhook_url, tx_hash, paid_amount, created_at,
+                    updated_at, expires_at",
     )
+    .bind(batch)
     .fetch_all(pool)
     .await?;
 
-    let mut expired = Vec::new();
-    for row in &overdue {
-        let mut payment = row_to_payment(row);
-        let result = sqlx::query(
-            "UPDATE payments
-                SET status = 'expired',
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-              WHERE id = ? AND status IN ('pending', 'underpaid')",
-        )
-        .bind(&payment.id)
-        .execute(pool)
-        .await?;
-
-        /* Only report rows we actually transitioned; a concurrent settlement
-        may have flipped the status out from under us. */
-        if result.rows_affected() == 1 {
-            payment.status = "expired".to_string();
-            expired.push(payment);
-        }
-    }
-
-    Ok(expired)
+    Ok(rows.iter().map(row_to_payment).collect())
 }
 
 pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Payment>> {
@@ -1341,7 +1339,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let expired = expire_overdue(&pool).await.unwrap();
+        let expired = expire_overdue(&pool, 1).await.unwrap();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, "partial-dead");
         assert_eq!(expired[0].status, "expired");
@@ -1358,7 +1356,7 @@ mod tests {
             .unwrap();
 
         // First sweep expires exactly the overdue intent and returns it.
-        let expired = expire_overdue(&pool).await.unwrap();
+        let expired = expire_overdue(&pool, 10).await.unwrap();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, "dead");
         assert_eq!(expired[0].status, "expired");
@@ -1373,7 +1371,82 @@ mod tests {
         );
 
         // A second sweep is a no-op — nothing is double-reported.
-        assert_eq!(expire_overdue(&pool).await.unwrap().len(), 0);
+        assert_eq!(expire_overdue(&pool, 10).await.unwrap().len(), 0);
+    }
+
+    /// A backlog larger than a single batch must drain across repeated sweeps
+    /// rather than being cut off at the batch size, and each sweep must report
+    /// exactly the rows it transitioned (issue #323).
+    #[tokio::test]
+    async fn expire_overdue_drains_large_backlog_across_batches() {
+        let pool = memory_db().await;
+        let batch = 7;
+        let total = PRUNE_BATCH + 137;
+        for i in 0..total {
+            create_payment(
+                &pool,
+                new_payment(&format!("backlog{i}"), &format!("MEMOB{i}"), -10),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut swept = 0i64;
+        while swept < total {
+            let expired = expire_overdue(&pool, batch).await.unwrap();
+            assert!(
+                expired.len() <= batch as usize,
+                "a sweep may not exceed its batch"
+            );
+            for payment in &expired {
+                assert_eq!(payment.status, "expired");
+            }
+            swept += expired.len() as i64;
+        }
+
+        assert_eq!(swept, total, "the whole backlog must eventually drain");
+
+        // Nothing is left over for the next sweep; nothing was double-counted.
+        assert_eq!(expire_overdue(&pool, batch).await.unwrap().len(), 0);
+    }
+
+    /// A payment settled concurrently with the sweep must not be expired (and
+    /// thus cannot be reported as expired) — the settlement's status guard wins
+    /// the race even though the row was selected as overdue first (issue #323).
+    #[tokio::test]
+    async fn concurrent_settlement_beats_overdue_sweep() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("racer", "MEMOR", -10))
+            .await
+            .unwrap();
+        create_payment(&pool, new_payment("swept", "MEMOS", -10))
+            .await
+            .unwrap();
+
+        // "Concurrent" settlement: flip the racer out from under the sweep
+        // between selection and update. `update_payment_status` applies the
+        // same `status IN ('pending','underpaid')` guard as real settlement.
+        assert!(
+            update_payment_status(&pool, "racer", "completed", "TX1", "10")
+                .await
+                .unwrap()
+        );
+
+        let expired = expire_overdue(&pool, 10).await.unwrap();
+        assert_eq!(
+            expired.len(),
+            1,
+            "only the unsettled overdue intent may expire"
+        );
+        assert_eq!(expired[0].id, "swept");
+
+        let racer = get_payment(&pool, "racer").await.unwrap().unwrap();
+        assert_eq!(
+            racer.status, "completed",
+            "settlement must win over the sweep"
+        );
+        let swept = get_payment(&pool, "swept").await.unwrap().unwrap();
+        assert_eq!(swept.status, "expired");
     }
 
     #[tokio::test]

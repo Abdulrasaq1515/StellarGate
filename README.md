@@ -307,6 +307,11 @@ XLM free to cover one per asset.
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
 | `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
+| `EXPIRY_BATCH_SIZE` | Maximum overdue intents the expiry sweeper transitions per sweep | `500` |
+
+Intents are expired in bounded batches (`EXPIRY_BATCH_SIZE`) so a large
+backlog drains over several sweeps instead of one long write lock — SQLite has
+a single writer.
 
 ### Webhooks
 

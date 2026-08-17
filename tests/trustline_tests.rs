@@ -67,6 +67,7 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             poll_interval_secs: 10,
             cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
+            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 10000,
             db_pool_max_connections: 5,
             db_busy_timeout_ms: 5000,
