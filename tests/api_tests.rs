@@ -1406,6 +1406,175 @@ async fn test_list_webhooks_rejects_other_merchants_payment() {
     assert_eq!(res.json::<Value>()["code"], "payment_not_found");
 }
 
+/// Regression for #326: the webhook-delivery listing must be paginated like
+/// `GET /payments`. Create more deliveries than one page holds, then walk the
+/// keyset cursor until it runs dry, asserting every delivery is seen exactly
+/// once and the final page reports a null `next_cursor`.
+#[tokio::test]
+async fn test_list_webhooks_walks_cursor_across_pages() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for i in 1..=5 {
+        stellargate::db::save_webhook_delivery(
+            &pool,
+            &format!("delivery-{i}"),
+            &id,
+            "https://example.com/webhook",
+            r#"{"event":"payment.completed"}"#,
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+    }
+
+    // Page 1 — a full page of 2 must mint a cursor.
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?limit=2"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    assert_eq!(body["deliveries"].as_array().unwrap().len(), 2);
+    assert_eq!(body["limit"], 2);
+    let cursor = body["next_cursor"]
+        .as_str()
+        .expect("a full page must mint next_cursor");
+
+    // Pages 2 and 3 walk the cursor; only the last (short) page is null.
+    let res2 = server
+        .get(&format!("/payments/{id}/webhooks?cursor={cursor}&limit=2"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res2.assert_status_ok();
+    let body2: Value = res2.json();
+    assert_eq!(body2["deliveries"].as_array().unwrap().len(), 2);
+    let cursor2 = body2["next_cursor"]
+        .as_str()
+        .expect("second full page must mint next_cursor");
+
+    let res3 = server
+        .get(&format!("/payments/{id}/webhooks?cursor={cursor2}&limit=2"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res3.assert_status_ok();
+    let body3: Value = res3.json();
+    assert_eq!(body3["deliveries"].as_array().unwrap().len(), 1);
+    assert!(
+        body3["next_cursor"].is_null(),
+        "last page must have null next_cursor"
+    );
+
+    // All five deliveries walked exactly once.
+    let ids: Vec<String> = [&body, &body2, &body3]
+        .iter()
+        .flat_map(|b| b["deliveries"].as_array().unwrap().iter())
+        .map(|d| d["id"].as_str().unwrap().to_string())
+        .collect();
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 5, "pages must never repeat a delivery");
+}
+
+/// Regression for #326: the webhook-delivery listing accepts a `status`
+/// filter and rejects anything that isn't a real delivery status.
+#[tokio::test]
+async fn test_list_webhooks_status_filter() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for i in 1..=4 {
+        stellargate::db::save_webhook_delivery(
+            &pool,
+            &format!("delivery-{i}"),
+            &id,
+            "https://example.com/webhook",
+            r#"{"event":"payment.completed"}"#,
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+    }
+    // Mark delivery-1 failed and delivery-2 pending; the rest stay delivered.
+    stellargate::db::update_webhook_delivery(&pool, "delivery-1", "failed", 8)
+        .await
+        .unwrap();
+    stellargate::db::update_webhook_delivery(&pool, "delivery-3", "delivered", 1)
+        .await
+        .unwrap();
+
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?status=failed&limit=5"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    let deliveries = body["deliveries"].as_array().unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0]["id"], "delivery-1");
+    assert_eq!(deliveries[0]["status"], "failed");
+
+    // An invalid status is a 400, matching the payments listing.
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?status=nonsense"))
+        .add_header("Authorization", auth)
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_status");
+}
+
+/// Regression for #326: an undecodable `cursor` is rejected with a 400, and
+/// `limit` is clamped into the acknowledged range.
+#[tokio::test]
+async fn test_list_webhooks_invalid_cursor_and_limit_clamp() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?cursor=not-a-cursor"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_cursor");
+
+    // Above MAX_LIMIT is clamped down to 100, not an error.
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?limit=5000"))
+        .add_header("Authorization", auth)
+        .await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>()["limit"], 100);
+}
+
 #[tokio::test]
 async fn test_redeliver_unauthenticated_returns_401() {
     let res = test_server()

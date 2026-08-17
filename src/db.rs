@@ -904,6 +904,86 @@ pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<
     Ok(rows.iter().map(row_to_webhook_delivery).collect())
 }
 
+/// Get a page of webhook deliveries for a payment with keyset (cursor)
+/// pagination, sharing the contracts used by `GET /payments`.
+///
+/// Rows are ordered by `(created_at DESC, id DESC)` — the same ordering and
+/// tie-break as the payments listing — so a `next_cursor` encoded from any
+/// page resumes exactly after its last row and never re-reads or skips the
+/// whole-second `created_at` tie group that ends the page. An optional
+/// `status` filter narrows to deliveries in that state (`pending`,
+/// `delivered`, or `failed`).
+pub async fn list_webhook_deliveries_keyset(
+    pool: &Db,
+    payment_id: &str,
+    status: Option<&str>,
+    limit: i64,
+    cursor: Option<(&str, &str)>,
+) -> Result<Vec<WebhookDelivery>> {
+    let rows = match (status, cursor) {
+        (None, None) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries WHERE payment_id = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (None, Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries
+                 WHERE payment_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(s), None) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries WHERE payment_id = ? AND status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(s)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(s), Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries
+                 WHERE payment_id = ? AND status = ?
+                   AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(s)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    Ok(rows.iter().map(row_to_webhook_delivery).collect())
+}
+
 /// Get a specific webhook delivery by id.
 pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookDelivery>> {
     let row = sqlx::query(

@@ -225,6 +225,25 @@ paths:
           schema:
             type: string
             format: uuid
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, delivered, failed]
+          description: Filter deliveries by status
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Page size
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor for keyset pagination (returned as next_cursor)
       responses:
         "200":
           description: Webhook delivery history
@@ -232,6 +251,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListWebhookDeliveriesResponse"
+"400":
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -496,7 +521,7 @@ components:
 
     ListWebhookDeliveriesResponse:
       type: object
-      required: [payment_id, deliveries]
+      required: [payment_id, deliveries, limit]
       properties:
         payment_id:
           type: string
@@ -505,6 +530,13 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/WebhookDelivery"
+        limit:
+          type: integer
+          description: Page size applied to this response
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as cursor on the next request to get the following page
 
     ErrorResponse:
       type: object

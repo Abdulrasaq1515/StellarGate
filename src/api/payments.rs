@@ -442,6 +442,12 @@ const MAX_LIMIT: i64 = 100;
 /// a guaranteed-empty filter and is rejected as invalid.
 const VALID_STATUSES: [&str; 4] = ["pending", "completed", "underpaid", "expired"];
 
+/// Statuses a webhook delivery can hold: `pending` while attempts are still
+/// possible, `delivered` on success, `failed` when the attempt budget is
+/// exhausted. Nothing writes any other value, so a filter on anything else is
+/// a guaranteed-empty query and is rejected as invalid.
+const VALID_DELIVERY_STATUSES: [&str; 3] = ["pending", "delivered", "failed"];
+
 pub async fn list(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
@@ -600,11 +606,36 @@ fn to_json(p: &db::Payment) -> Value {
     })
 }
 
+/// Query parameters for the webhook-delivery listing. Matches the payments
+/// listing conventions: a `status` filter, a `limit` (default 20, max 100),
+/// and an opaque keyset `cursor` whose value comes from a previous response's
+/// `next_cursor`.
+#[derive(Deserialize)]
+pub struct ListDeliveryQuery {
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
 pub async fn list_webhooks(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Path(payment_id): Path<String>,
+    Query(q): Query<ListDeliveryQuery>,
 ) -> Result<Json<Value>, AppError> {
+    if let Some(s) = &q.status {
+        if !VALID_DELIVERY_STATUSES.contains(&s.as_str()) {
+            return Err(AppError::bad_request(
+                "invalid_status",
+                format!(
+                    "invalid status '{}'; valid: {}",
+                    s,
+                    VALID_DELIVERY_STATUSES.join(", ")
+                ),
+            ));
+        }
+    }
+
     // Verify payment exists and belongs to the caller. A payment owned by
     // another merchant reports the same 404 as a missing one, so this can't
     // be used to enumerate which payment ids exist for other tenants.
@@ -619,7 +650,35 @@ pub async fn list_webhooks(
             )
         })?;
 
-    let deliveries = db::list_webhook_deliveries(&state.pool, &payment_id).await?;
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+    let cursor = match q.cursor.as_deref() {
+        Some(raw_cursor) => {
+            let (ts, id) = decode_cursor(raw_cursor)
+                .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?;
+            Some((ts, id))
+        }
+        None => None,
+    };
+
+    let deliveries = db::list_webhook_deliveries_keyset(
+        &state.pool,
+        &payment_id,
+        q.status.as_deref(),
+        limit,
+        cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
+    )
+    .await?;
+
+    // A full page mints a cursor from its last row (created_at, id); a short
+    // page means we've reached the end and null signals "no more".
+    let next_cursor = if deliveries.len() == limit as usize {
+        deliveries
+            .last()
+            .map(|d| encode_cursor(&d.created_at, &d.id))
+    } else {
+        None
+    };
 
     Ok(Json(json!({
         "payment_id": payment.id,
@@ -632,6 +691,8 @@ pub async fn list_webhooks(
             "last_attempt": d.last_attempt,
             "created_at": d.created_at,
         })).collect::<Vec<_>>(),
+        "limit": limit,
+        "next_cursor": next_cursor,
     })))
 }
 
