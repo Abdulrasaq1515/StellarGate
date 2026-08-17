@@ -886,6 +886,110 @@ async fn test_list_cursor_pagination() {
     assert_eq!(unique.len(), 5);
 }
 
+/// Regression for #328: the offset branch mints a `next_cursor` from its last
+/// row, but its query ordered ties on `created_at` alone while the keyset
+/// query broke them on `id DESC`. `created_at` is whole-second, so a page
+/// whose last row sits inside a tie group handed that cursor to the keyset
+/// query, which resumed *after* the whole group — skipping the members that
+/// sorted above the boundary. Both branches must share one ordering, and a
+/// cursor taken from an offset page must walk the tie group without skipping
+/// or repeating rows.
+#[tokio::test]
+async fn test_offset_cursor_tie_group_agreement() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    let merchant_id = stellargate::db::find_merchant_by_key(&pool, &key)
+        .await
+        .unwrap()
+        .expect("merchant must exist");
+
+    // Six payments stamped in the *same* second. The ids sort inversely to
+    // insertion order, so id DESC (the keyset ordering) and rowid order (what
+    // a bare `ORDER BY created_at DESC` may fall back to) disagree at every
+    // position — page 1 of the offset path is exactly the tie group.
+    let ts = "2026-08-17T12:00:00Z";
+    for id in ["a", "b", "c", "d", "e", "f"] {
+        sqlx::query(
+            "INSERT INTO payments
+                (id, merchant_id, destination_address, memo, amount, asset, status,
+                 created_at, updated_at, expires_at)
+             VALUES (?, ?, 'GDEST', ?, '1', 'XLM', 'pending', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(&merchant_id)
+        .bind(format!("MEMO-{id}"))
+        .bind(ts)
+        .bind(ts)
+        .bind("2026-08-17T13:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Page 1 via the offset path. Its next_cursor must be a valid entry point
+    // into cursor mode.
+    let res = server
+        .get("/payments?limit=3")
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    let page1: Vec<String> = body["payments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        page1,
+        ["f", "e", "d"],
+        "offset page 1 must order whole-second ties by id DESC"
+    );
+    let cursor = body["next_cursor"]
+        .as_str()
+        .expect("full offset page must carry a migration cursor");
+
+    // Page 2 via the cursor. The tie group must continue, not resume after it.
+    let res2 = server
+        .get(&format!("/payments?cursor={cursor}&limit=3"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res2.assert_status_ok();
+    let body2: Value = res2.json();
+    let page2: Vec<String> = body2["payments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        page2,
+        ["c", "b", "a"],
+        "cursor minted on the offset branch must resume inside the tie group"
+    );
+
+    // No rows skipped or repeated across the two pages.
+    let all: std::collections::HashSet<_> = page1.iter().chain(&page2).collect();
+    assert_eq!(all.len(), 6);
+
+    // The offset path walks the same sequence the cursor path did.
+    let res3 = server
+        .get("/payments?limit=3&offset=3")
+        .add_header("Authorization", auth)
+        .await;
+    res3.assert_status_ok();
+    let body3: Value = res3.json();
+    let page2_offset: Vec<String> = body3["payments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(page2_offset, page2, "offset and cursor pages must agree");
+}
+
 #[tokio::test]
 async fn test_list_cursor_invalid() {
     let server = test_server().await;

@@ -82,6 +82,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`GET /payments` offset pages now order rows exactly like cursor pages.**
+  The offset query sorted by `created_at DESC` alone while the keyset query
+  broke whole-second `created_at` ties on `id DESC`, so a `next_cursor` minted
+  from an offset page silently skipped the rest of the tie group when handed
+  to the cursor branch. The offset query now orders by
+  `(created_at DESC, id DESC)` — the same ordering and the same index — and a
+  short offset page returns `null` instead of a dangling cursor. The migration
+  path from offset to cursor pagination is documented in the README; offset
+  mode is marked deprecated (issues #328, #269).
 - **The build.** `main` did not compile. An unclosed block in
   `rate_limit_middleware` plus a reversion to the pre-`moka` `Mutex` API, a
   duplicated struct field and an unterminated character literal in `config.rs`,

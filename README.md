@@ -671,7 +671,8 @@ browser history, so treat anything on that response as effectively public.
 
 ### `GET /payments`
 
-List the authenticated merchant's payments, newest first. Supports **cursor** (recommended) and **offset** (legacy) pagination.
+List the authenticated merchant's payments, newest first. Supports **cursor**
+(recommended) and **offset** (legacy) pagination.
 
 | Param | Description | Default |
 |---|---|---|
@@ -680,7 +681,7 @@ List the authenticated merchant's payments, newest first. Supports **cursor** (r
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
 | `offset` | Rows to skip (legacy; prefer `cursor`) | `0` |
 
-**`200 OK`** — cursor mode
+**`200 OK`** — cursor mode (no `cursor` parameter on the first request)
 
 ```json
 {
@@ -690,9 +691,32 @@ List the authenticated merchant's payments, newest first. Supports **cursor** (r
 }
 ```
 
-`next_cursor` is `null` on the final page. Offset mode additionally returns `total` and `offset`.
+**`200 OK`** — offset mode (no `cursor` parameter, `offset` set)
 
-> Cursor pagination is keyset-based and stays stable regardless of page depth or concurrent inserts. Offset mode is retained for backward compatibility and can skip or repeat rows if data changes mid-scan.
+```json
+{
+  "payments": [ { "id": "...", "status": "pending" } ],
+  "total": 42,
+  "limit": 20,
+  "offset": 0,
+  "next_cursor": "3230..."
+}
+```
+
+Both modes order rows identically (`created_at DESC`, then `id DESC` to break
+the whole-second `created_at` ties), so a `next_cursor` returned by an offset
+page resumes cleanly in cursor mode. `next_cursor` is `null` on the final page
+of either mode. Offset mode additionally returns `total` and `offset`.
+
+> **Migration path.** Switch to cursor pagination by sending `cursor` instead
+> of `offset`. Start with a first request that carries **no** `cursor` and
+> **no** `offset`, then continue with the previous response's `next_cursor` on
+> each subsequent request. The `next_cursor` an offset response returns is a
+> courtesy for this migration — you may use it as the *first* cursor, but once
+> you do you must stay in cursor mode; offset and cursor pagination cannot be
+> mixed within one scan. Offset mode is retained for backward compatibility
+> and is deprecated: like any offset paging, it can skip or repeat rows if
+> data changes mid-scan.
 
 ---
 
