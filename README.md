@@ -21,6 +21,7 @@ A payment gateway API built on [Stellar](https://stellar.org) for accepting, ver
 - [Dashboard](#dashboard)
 - [Configuration](#configuration)
   - [Trustlines](#trustlines)
+- [Rate Limiting](#rate-limiting)
 - [API Reference](#api-reference)
   - [Versioning](#versioning)
   - [API Key Lifecycle](#post-merchantsidkeys)
@@ -239,7 +240,7 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet Horizon |
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
-| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. | `XLM,USDC:<testnet issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. Duplicate codes are refused: Stellar codes are not unique across issuers, and two entries sharing a code used to settle each other's intents (issue #222). | `XLM,USDC:<testnet issuer>` |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
 
 ### Trustlines
@@ -307,6 +308,11 @@ XLM free to cover one per asset.
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
 | `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
+| `EXPIRY_BATCH_SIZE` | Maximum overdue intents the expiry sweeper transitions per sweep | `500` |
+
+Intents are expired in bounded batches (`EXPIRY_BATCH_SIZE`) so a large
+backlog drains over several sweeps instead of one long write lock — SQLite has
+a single writer.
 
 ### Webhooks
 
@@ -365,6 +371,60 @@ until it finished; a backlog drains over several cycles instead.
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite pool size. WAL allows one writer plus many readers. | `10` |
 | `DB_BUSY_TIMEOUT_MS` | Lock-acquisition wait before erroring. Must be `> 0` under concurrent load. | `5000` |
+
+---
+
+## Rate Limiting
+
+Every request is assigned to a **bucket**, and each bucket is limited
+independently per client IP — so provisioning a merchant can never eat into a
+client's payment quota, or vice versa. The client IP is resolved per
+`TRUSTED_PROXY_CIDRS` above.
+
+| Bucket | Routes | Quota |
+|---|---|---|
+| `payments` | `POST /payments` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
+| `merchants` | `POST /merchants` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
+| `redeliver` | `POST /payments/:id/webhooks/:delivery_id/redeliver` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
+| `default` | everything else, including all `GET` routes and the probes | `RATE_LIMIT_REQUESTS_PER_SEC` × 5 |
+
+Write and sensitive routes get the base rate; read-only traffic gets a more
+generous allowance so ordinary polling is not throttled. Redelivery is bucketed
+by *shape*, not by path — the URL carries payment and delivery ids, and keying
+on those would let every id mint its own limiter entry, which is both an
+unbounded map and a trivially bypassed limit.
+
+### Response headers
+
+**Every** response carries the current state of its bucket, so a client can pace
+itself before being throttled rather than discovering the limit by hitting it:
+
+| Header | Meaning |
+|---|---|
+| `X-RateLimit-Limit` | The bucket's effective quota, i.e. the multiplier is already applied |
+| `X-RateLimit-Remaining` | Requests still available in this bucket right now |
+| `X-RateLimit-Reset` | Delta-seconds until the bucket is back to **full** capacity |
+
+A `429` additionally carries `Retry-After`, in delta-seconds, derived from the
+limiter's own state — `governor` knows exactly when the next request would be
+permitted, and this is that value rounded up with a floor of `1`. `Retry-After`
+is time until a **single** request is permitted; `X-RateLimit-Reset` is time
+until the bucket is full, so `Reset` is never the smaller of the two.
+
+`Reset` is a delta rather than an epoch timestamp so that a client with a skewed
+clock still gets a usable answer.
+
+All four headers are listed in `Access-Control-Expose-Headers`. The CORS spec
+hides every response header outside its safelist unless it is named there, and
+`Retry-After` is not on that safelist — a self-pacing contract a browser cannot
+read would be the same as no contract at all.
+
+> **Note on precision.** Quotas are per-second, so a single cell replenishes in
+> `1 / RATE_LIMIT_REQUESTS_PER_SEC` seconds — always under a second. Since
+> `Retry-After` is an integer number of seconds (RFC 9110), it currently reports
+> `1` at every configured rate. It is derived rather than hard-coded so that it
+> stays correct if the quota shape changes; for pacing *now*, use
+> `X-RateLimit-Remaining`.
 
 ---
 
@@ -442,10 +502,37 @@ Every error response uses the same shape:
 
 The `code` field is stable across releases and is what you should branch on.
 
+**Request bodies are closed.** Every JSON body is validated against exactly the
+fields its endpoint accepts, and anything else is rejected with `400`
+`unknown_field` naming the offending field. A typo is not quietly dropped:
+
+```bash
+curl -X POST http://localhost:3000/v1/payments \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"amount": "100", "assset": "USDC"}'
+```
+
+```json
+{
+  "error": "invalid request body: Failed to deserialize the JSON body into the target type: unknown field `assset`, expected one of `amount`, `asset`, `webhook_url`",
+  "code": "unknown_field"
+}
+```
+
+This matters most where a field has a default. `asset` defaults to `XLM` when
+absent, so before this the request above created a **100 XLM** intent and
+returned `201` describing it — the single transposed character was recoverable
+only by reading the response back carefully. `merchant_id` was the other sharp
+edge: earlier revisions of `openapi.yaml` advertised it, but the handler has
+always taken the merchant from the API key, so a client that sent it believed
+it was choosing the tenant and was not.
+
 | Code | HTTP | Meaning |
 |---|---|---|
 | `unauthorized` | `401` | Missing/invalid API key or admin secret |
 | `invalid_request` | `400` | Malformed JSON or a deserialization failure |
+| `unknown_field` | `400` | Request body contained a field the endpoint does not accept |
 | `unsupported_media_type` | `415` | `Content-Type` is not `application/json` |
 | `unsupported_asset` | `400` | Asset is not in `ACCEPTED_ASSETS` |
 | `invalid_amount` | `400` | Not a positive decimal with ≤ 7 decimal places |
@@ -584,6 +671,10 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
 | `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. |
 | `webhook_url` | string | ❌ | ≤ 2048 chars; scheme must be allowed; HTTPS required on `public`; SSRF-checked |
 
+Any other field is rejected with `400` `unknown_field` — see [Error
+Envelope](#error-envelope). In particular there is no `merchant_id` field: the
+merchant comes from the API key and cannot be overridden by the body.
+
 | Header | Required | Description |
 |---|---|---|
 | `Content-Type: application/json` | ✅ | Anything else returns `415` |
@@ -599,6 +690,7 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
   "memo": "A1B2C3D4",
   "amount": "10",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "pending",
   "created_at": "2026-04-29T15:00:00Z",
   "expires_at": "2026-04-29T16:00:00Z"
@@ -638,6 +730,7 @@ curl http://localhost:3000/payments/$ID -H "Authorization: Bearer $API_KEY"
   "memo": "A1B2C3D4",
   "amount": "10",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "pending",
   "tx_hash": null,
   "paid_amount": null,
@@ -836,6 +929,7 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
   "amount": "10",
   "paid_amount": "12.5",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "completed",
   "delta": "2.5"
 }
@@ -1014,7 +1108,7 @@ Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), calle
 
 - Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
 - New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
-- A few one-time data backfills (populating `processed_transactions` from legacy rows, normalising pre-RFC 3339 timestamps) run alongside them.
+- A few one-time data backfills (populating `processed_transactions` from legacy rows, filling `asset_issuer` from `ACCEPTED_ASSETS`, normalising pre-RFC 3339 timestamps) run alongside them.
 
 Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
 

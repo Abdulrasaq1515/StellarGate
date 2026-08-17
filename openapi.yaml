@@ -40,6 +40,13 @@ paths:
       responses:
         "201":
           description: Payment intent created
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/XRateLimitLimit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/XRateLimitRemaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/XRateLimitReset"
           content:
             application/json:
               schema:
@@ -64,7 +71,19 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
-          description: Rate limit exceeded
+          description: >-
+            Rate limit exceeded. The request fell into the `payments` bucket,
+            whose quota is RATE_LIMIT_REQUESTS_PER_SEC × 1. See the Rate
+            Limiting section of the README for the full bucket/quota model.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/RetryAfter"
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/XRateLimitLimit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/XRateLimitRemaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/XRateLimitReset"
           content:
             application/json:
               schema:
@@ -401,6 +420,11 @@ components:
     CreatePaymentRequest:
       type: object
       required: [amount]
+      # The server rejects any field not listed here with 400 unknown_field.
+      # `merchant_id` used to be documented but was never read — the merchant is
+      # taken from the API key — so sending it now fails loudly instead of
+      # silently binding the intent to whichever merchant owns the key.
+      additionalProperties: false
       properties:
         amount:
           type: string
@@ -410,9 +434,10 @@ components:
           type: string
           enum: [XLM, USDC]
           default: XLM
-        merchant_id:
-          type: string
-          example: my-shop
+          description: >-
+            Defaults to XLM when omitted. Because the default applies silently,
+            a misspelled field name (e.g. `assset`) would otherwise create an
+            XLM intent; it is rejected as unknown_field instead.
         webhook_url:
           type: string
           format: uri
@@ -498,7 +523,7 @@ components:
           description: >-
             Stable machine-readable error code for programmatic handling. Public
             values currently include unauthorized, internal_error,
-            invalid_request, unsupported_asset, invalid_amount,
+            invalid_request, unknown_field, unsupported_asset, invalid_amount,
             invalid_webhook_url, invalid_status, invalid_cursor,
             payment_not_found, delivery_not_found, rate_limit_exceeded,
             not_found, webhook_target_blocked, webhook_delivery_failed, and

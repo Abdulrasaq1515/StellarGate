@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`X-RateLimit-*` response headers.** Every response now carries
+  `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` for the
+  bucket it fell into, so a client can pace itself before being throttled
+  instead of discovering the limit by hitting it. All four rate-limit headers
+  (including `Retry-After`) are listed in `Access-Control-Expose-Headers` — the
+  CORS spec hides everything outside its safelist, and `Retry-After` is not on
+  it, so a browser client could previously see the `429` but none of the
+  headers explaining it. The bucket/quota model is now documented per route in
+  the README and in `openapi.yaml` (issue #327).
+
 ### Fixed
 
 - **`openapi.yaml` declares its security schemes.** The spec had no
@@ -125,6 +137,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   short offset page returns `null` instead of a dangling cursor. The migration
   path from offset to cursor pagination is documented in the README; offset
   mode is marked deprecated (issues #328, #269).
+- **Expiry sweeping now batches transitions.** `expire_overdue` previously
+  issued one guarded `UPDATE` per overdue intent, costing N round-trips and N
+  write-lock acquisitions per sweep — a real burden on the single SQLite
+  writer after an outage leaves a large backlog overdue at once. It now
+  transitions a bounded batch in a single `UPDATE … RETURNING`, so each sweep
+  is one write sized by `EXPIRY_BATCH_SIZE` (default `500`) and the backlog
+  drains over several sweeps. The `status IN ('pending','underpaid')` guard and
+  the "only rows actually transitioned produce a webhook" property are
+  preserved (issue #323).
 - **The build.** `main` did not compile. An unclosed block in
   `rate_limit_middleware` plus a reversion to the pre-`moka` `Mutex` API, a
   duplicated struct field and an unterminated character literal in `config.rs`,

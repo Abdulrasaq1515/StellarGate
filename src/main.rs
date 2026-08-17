@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
 
     let pool = open_pool(&cfg).await?;
     db::migrate(&pool).await?;
+    db::backfill_asset_issuers(&pool, &cfg.accepted_assets).await?;
 
     let state = Arc::new(AppState {
         pool,
