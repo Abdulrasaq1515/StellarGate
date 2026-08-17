@@ -124,17 +124,30 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let asset = body.asset.to_uppercase();
     let accepted = &state.config.accepted_assets;
-    if !accepted.iter().any(|a| a.code == asset) {
-        let codes = accepted
-            .iter()
-            .map(|a| a.code.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(AppError::bad_request(
-            "unsupported_asset",
-            format!("unsupported asset '{}'; supported: {}", body.asset, codes),
-        ));
-    }
+    let matched: Vec<_> = accepted.iter().filter(|a| a.code == asset).collect();
+    let accepted_asset = match matched.as_slice() {
+        [] => {
+            let codes = accepted
+                .iter()
+                .map(|a| a.code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AppError::bad_request(
+                "unsupported_asset",
+                format!("unsupported asset '{}'; supported: {}", body.asset, codes),
+            ));
+        }
+        [one] => *one,
+        _ => {
+            return Err(AppError::bad_request(
+                "ambiguous_asset",
+                format!(
+                    "asset '{asset}' maps to more than one issuer; pin ACCEPTED_ASSETS to a single issuer per code"
+                ),
+            ));
+        }
+    };
+    let asset_issuer = accepted_asset.issuer.as_deref();
     if !money::is_valid_amount(&body.amount) {
         return Err(AppError::bad_request(
             "invalid_amount",
@@ -260,6 +273,7 @@ pub async fn create(
             memo: &memo,
             amount: &body.amount,
             asset: &asset,
+            asset_issuer,
             webhook_url: body.webhook_url.as_deref(),
             ttl_secs: state.config.payment_ttl_secs as i64,
         },
@@ -502,6 +516,7 @@ fn to_json(p: &db::Payment) -> Value {
         "memo": p.memo,
         "amount": canonical_amount,
         "asset": p.asset,
+        "asset_issuer": p.asset_issuer,
         "status": p.status,
         "tx_hash": p.tx_hash,
         "paid_amount": canonical_paid_amount,

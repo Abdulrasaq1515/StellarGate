@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ipnet::IpNet;
+use std::collections::HashSet;
 
 /// How the service detects incoming on-chain payments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,8 +87,9 @@ pub struct Config {
     pub network: String,
     pub horizon_url: String,
     pub gateway_public: String,
-    /// Assets the gateway will accept, validated on POST /payments and in verify().
-    /// Configure via ACCEPTED_ASSETS=XLM,USDC:GISSUER (comma-separated).
+    /// Assets the gateway will accept, validated on POST /payments.
+    /// Duplicate codes are rejected at boot (issue #222). Configure via
+    /// `ACCEPTED_ASSETS=XLM,USDC:GISSUER` (comma-separated).
     pub accepted_assets: Vec<AcceptedAsset>,
     pub webhook_secret: String,
     pub webhook_retry_attempts: u32,
@@ -323,6 +325,19 @@ impl Config {
                         issuer
                     )
                 })?;
+            }
+        }
+        /* Stellar asset codes are not unique — anyone can issue `USDC`. Two
+        allow-list entries sharing a code made `verify()` accept a payment from
+        either issuer against an intent that stored only the code (issue #222). */
+        let mut seen_codes = HashSet::new();
+        for asset in &self.accepted_assets {
+            let code = asset.code.to_ascii_uppercase();
+            if !seen_codes.insert(code.clone()) {
+                return Err(anyhow::anyhow!(
+                    "ACCEPTED_ASSETS has duplicate code {code}. Stellar asset codes are not \
+                     unique across issuers; pin each code to a single issuer."
+                ));
             }
         }
         Ok(())
@@ -708,6 +723,24 @@ mod tests {
             issuer: Some("GNOTAREALISSUER".into()),
         }];
         let err = cfg.validate_addresses().unwrap_err().to_string();
+        assert!(err.contains("USDC"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_addresses_rejects_duplicate_asset_codes() {
+        let mut cfg = sample_config();
+        cfg.accepted_assets = vec![
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
+            },
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
+            },
+        ];
+        let err = cfg.validate_addresses().unwrap_err().to_string();
+        assert!(err.contains("duplicate code"), "got: {err}");
         assert!(err.contains("USDC"), "got: {err}");
     }
 

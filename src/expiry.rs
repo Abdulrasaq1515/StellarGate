@@ -149,6 +149,7 @@ mod tests {
                 memo: "EXPMEMO",
                 amount: "10",
                 asset: "XLM",
+                asset_issuer: None,
                 webhook_url: Some(&webhook_url),
                 // Already overdue: sweep_once must expire it immediately.
                 ttl_secs: -10,
@@ -229,6 +230,7 @@ mod tests {
                 memo: "EXPMEMOONCE",
                 amount: "10",
                 asset: "XLM",
+                asset_issuer: None,
                 webhook_url: Some(&webhook_url),
                 ttl_secs: -10,
             },

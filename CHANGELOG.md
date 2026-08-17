@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Intent settlement pins the issuer.** `POST /payments` stored only the asset
+  code, so `verify()` accepted a Horizon payment from *any* allow-list issuer of
+  that code. Two `USDC` issuers could settle each other's intents. Duplicate
+  codes are now rejected at boot, each intent persists `asset_issuer`, and
+  settlement matches that issuer — not the allow-list union. Existing rows are
+  backfilled from `ACCEPTED_ASSETS` (issue #222).
+
 - **Background-task supervisor.** A panic in the poller, stream listener,
   sweeper, retention worker, or webhook redrive used to end that task for the
   life of the process while HTTP and `/health` kept serving. Each worker is

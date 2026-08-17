@@ -664,6 +664,32 @@ async fn test_asset_is_case_insensitive() {
 }
 
 #[tokio::test]
+async fn test_create_persists_asset_issuer() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let body = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "5", "asset": "USDC" }))
+        .await
+        .json::<Value>();
+    assert_eq!(body["asset"], "USDC");
+    assert_eq!(
+        body["asset_issuer"],
+        "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+    );
+
+    let xlm = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await
+        .json::<Value>();
+    assert_eq!(xlm["asset"], "XLM");
+    assert!(xlm["asset_issuer"].is_null());
+}
+
+#[tokio::test]
 async fn test_webhook_url_https_accepted_on_testnet() {
     let mut cfg = make_config();
     cfg.webhook_allow_private_targets = true;
