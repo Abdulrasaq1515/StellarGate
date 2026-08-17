@@ -614,6 +614,9 @@ async fn settle(
 pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon poller disabled");
+        // Stay alive until shutdown so the supervisor does not treat a
+        // deliberate idle as an unexpected return and restart us.
+        let _ = shutdown.changed().await;
         return;
     }
 
@@ -682,6 +685,7 @@ fn parse_sse_block(block: &str) -> SseEvent {
 pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon stream listener disabled");
+        let _ = shutdown.changed().await;
         return;
     }
 

@@ -926,6 +926,12 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_webhook_deliveries_total` | counter | Delivery outcomes |
 | `stellargate_webhook_retries_total` | counter | Retry attempts |
 | `stellargate_webhook_delivery_latency_ms` | histogram | End-to-end delivery latency |
+| `stellargate_tasks_started_total` | counter | Background task starts (including restarts) |
+| `stellargate_tasks_stopped_total` | counter | Clean background task stops |
+| `stellargate_tasks_failed_total` | counter | Background task panics |
+| `stellargate_task_restarts_total` | counter | Supervisor restarts, labelled by `task` |
+| `stellargate_task_running` | gauge | `1` if the named task is running |
+| `stellargate_task_consecutive_failures` | gauge | Consecutive panics since the last stable run |
 
 Structured logs (via `tracing`) carry an `x-request-id` on every request, propagated to responses. Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
 

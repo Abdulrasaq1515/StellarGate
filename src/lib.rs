@@ -8,15 +8,30 @@ pub mod money;
 pub mod retention;
 pub mod ssrf;
 pub mod strkey;
+pub mod supervise;
 pub mod webhook;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Consecutive panics at or above this mark a required task as crash-looping.
+/// `/health` fails while any required task is crash-looping, even if the
+/// supervisor has already spawned a replacement (issue #316).
+pub const CRASH_LOOP_THRESHOLD: u32 = 3;
+
+/// Snapshot of one background task, used to render `/metrics`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    pub name: &'static str,
+    pub running: bool,
+    pub restarts: u64,
+    pub consecutive_failures: u32,
+}
+
 /// Tracks background task health: per-task liveness for `/health`, the last
 /// successful on-chain progress for `/ready`'s cursor-freshness check, and
-/// started/stopped/failure counts for monitoring and alerting.
+/// started/stopped/failure/restart counts for monitoring and alerting.
 #[derive(Clone)]
 pub struct TaskHealth {
     inner: Arc<TaskHealthInner>,
@@ -31,6 +46,10 @@ struct TaskHealthInner {
     failed: AtomicU64,
     /// Per-task liveness, keyed by the name passed to [`TaskHealth::task_started`].
     running: Mutex<HashMap<&'static str, bool>>,
+    /// Supervisor restarts after a panic or unexpected return, keyed by task name.
+    restarts: Mutex<HashMap<&'static str, u64>>,
+    /// Consecutive panics since the last stable run, keyed by task name.
+    consecutive_failures: Mutex<HashMap<&'static str, u32>>,
     /// Task names that must be running for `/health` to pass. Declared by the
     /// process that spawns the tasks (main.rs), so "expected" is a deployment
     /// decision rather than something the probe has to guess.
@@ -47,6 +66,8 @@ impl Default for TaskHealthInner {
             stopped: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             running: Mutex::new(HashMap::new()),
+            restarts: Mutex::new(HashMap::new()),
+            consecutive_failures: Mutex::new(HashMap::new()),
             required: Mutex::new(Vec::new()),
             last_success_unix: AtomicI64::new(0),
         }
@@ -82,6 +103,59 @@ impl TaskHealth {
         // A failed task is by definition not running; reflect that in the
         // liveness map even if `task_stopped` never ran for it.
         self.inner.running.lock().unwrap().insert(name, false);
+        let mut consecutive = self.inner.consecutive_failures.lock().unwrap();
+        *consecutive.entry(name).or_insert(0) += 1;
+    }
+
+    /// Record that the supervisor is about to spawn a replacement after a
+    /// panic or unexpected return. Distinct from [`task_started`]: a restart
+    /// is the event operators alert on (issue #316).
+    pub fn task_restarted(&self, name: &'static str) {
+        let mut restarts = self.inner.restarts.lock().unwrap();
+        *restarts.entry(name).or_insert(0) += 1;
+    }
+
+    /// The inner task has been running without panicking long enough to treat
+    /// as stable. Clears the consecutive-failure streak so a one-off panic
+    /// later does not keep `/health` red forever.
+    pub fn note_stable(&self, name: &'static str) {
+        self.inner
+            .consecutive_failures
+            .lock()
+            .unwrap()
+            .insert(name, 0);
+    }
+
+    pub fn started(&self) -> u64 {
+        self.inner.started.load(Ordering::Relaxed)
+    }
+
+    pub fn stopped(&self) -> u64 {
+        self.inner.stopped.load(Ordering::Relaxed)
+    }
+
+    pub fn failed(&self) -> u64 {
+        self.inner.failed.load(Ordering::Relaxed)
+    }
+
+    pub fn restarts(&self, name: &'static str) -> u64 {
+        self.inner
+            .restarts
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn consecutive_failures(&self, name: &'static str) -> u32 {
+        self.inner
+            .consecutive_failures
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Names of required tasks that are not currently running. Empty when the
@@ -93,6 +167,48 @@ impl TaskHealth {
             .iter()
             .copied()
             .filter(|name| running.get(name) != Some(&true))
+            .collect()
+    }
+
+    /// Required tasks whose consecutive panics have reached
+    /// [`CRASH_LOOP_THRESHOLD`]. Empty when none are crash-looping.
+    pub fn crash_looping_required_tasks(&self) -> Vec<&'static str> {
+        let consecutive = self.inner.consecutive_failures.lock().unwrap();
+        let required = self.inner.required.lock().unwrap();
+        required
+            .iter()
+            .copied()
+            .filter(|name| consecutive.get(name).copied().unwrap_or(0) >= CRASH_LOOP_THRESHOLD)
+            .collect()
+    }
+
+    /// Per-task snapshot for Prometheus exposition. Includes every required
+    /// name plus any other name the supervisor has touched.
+    pub fn snapshot(&self) -> Vec<TaskSnapshot> {
+        let running = self.inner.running.lock().unwrap();
+        let restarts = self.inner.restarts.lock().unwrap();
+        let consecutive = self.inner.consecutive_failures.lock().unwrap();
+        let required = self.inner.required.lock().unwrap();
+
+        let mut names: Vec<&'static str> = required.clone();
+        for name in running
+            .keys()
+            .chain(restarts.keys())
+            .chain(consecutive.keys())
+        {
+            if !names.contains(name) {
+                names.push(*name);
+            }
+        }
+        names.sort_unstable();
+        names
+            .into_iter()
+            .map(|name| TaskSnapshot {
+                name,
+                running: running.get(name).copied().unwrap_or(false),
+                restarts: restarts.get(name).copied().unwrap_or(0),
+                consecutive_failures: consecutive.get(name).copied().unwrap_or(0),
+            })
             .collect()
     }
 
@@ -150,7 +266,7 @@ pub struct AppState {
     pub auth_metrics: metrics::AuthMetrics,
     /// Background task health: per-task liveness (drives `/health`), the last
     /// successful on-chain progress (drives `/ready`'s cursor-freshness check),
-    /// and started/stopped/failure counts for monitoring and alerting.
+    /// and started/stopped/failure/restart counts for monitoring and alerting.
     pub task_health: TaskHealth,
 }
 
@@ -209,6 +325,37 @@ mod tests {
         health.task_started("poller");
         health.task_failed("poller");
         assert_eq!(health.dead_required_tasks(), vec!["poller"]);
+        assert_eq!(health.failed(), 1);
+        assert_eq!(health.consecutive_failures("poller"), 1);
+    }
+
+    #[test]
+    fn three_consecutive_failures_are_crash_looping() {
+        let health = TaskHealth::new();
+        health.require("poller");
+        health.task_started("poller");
+        for _ in 0..CRASH_LOOP_THRESHOLD {
+            health.task_failed("poller");
+            health.task_restarted("poller");
+            health.task_started("poller");
+        }
+        assert_eq!(health.crash_looping_required_tasks(), vec!["poller"]);
+        assert_eq!(health.restarts("poller"), CRASH_LOOP_THRESHOLD as u64);
+        // Currently running again — dead list is empty, crash-loop list is not.
+        assert!(health.dead_required_tasks().is_empty());
+    }
+
+    #[test]
+    fn note_stable_clears_crash_loop() {
+        let health = TaskHealth::new();
+        health.require("poller");
+        for _ in 0..CRASH_LOOP_THRESHOLD {
+            health.task_failed("poller");
+        }
+        assert_eq!(health.crash_looping_required_tasks(), vec!["poller"]);
+        health.note_stable("poller");
+        assert!(health.crash_looping_required_tasks().is_empty());
+        assert_eq!(health.consecutive_failures("poller"), 0);
     }
 
     #[test]

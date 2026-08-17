@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Background-task supervisor.** A panic in the poller, stream listener,
+  sweeper, retention worker, or webhook redrive used to end that task for the
+  life of the process while HTTP and `/health` kept serving. Each worker is
+  now supervised: panics are logged and counted when they happen, the task is
+  restarted with bounded exponential backoff, crash-loops fail `/health`, and
+  start/stop/fail/restart counters are exported on `/metrics` (issue #316).
+
 ### Added
 
 - **API versioning.** Public routes are now served under `/v1` alongside a

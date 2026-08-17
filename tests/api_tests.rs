@@ -190,6 +190,59 @@ async fn test_health_fails_when_required_task_stopped() {
         .contains("poller"));
 }
 
+/// A required task that keeps panicking must fail /health even if the
+/// supervisor has already spawned a replacement (issue #316).
+#[tokio::test]
+async fn test_health_fails_when_required_task_crash_looping() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.task_started("poller");
+    for _ in 0..stellargate::CRASH_LOOP_THRESHOLD {
+        health.task_failed("poller");
+        health.task_restarted("poller");
+        health.task_started("poller");
+    }
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let res = server.get("/health").await;
+    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let body = res.json::<Value>();
+    assert_eq!(body["status"], "unavailable");
+    assert!(
+        body["reason"].as_str().unwrap().contains("crash-looping"),
+        "got: {body}"
+    );
+}
+
+/// Task panics and restarts must show up on /metrics so a crash-loop is
+/// scrapeable (issue #316).
+#[tokio::test]
+async fn test_task_health_is_exported_on_metrics() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.task_started("poller");
+    health.task_failed("poller");
+    health.task_restarted("poller");
+    health.task_started("poller");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let res = server.get("/metrics").await;
+    res.assert_status_ok();
+    let body = res.text();
+    assert!(
+        body.contains("stellargate_tasks_failed_total 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_task_restarts_total{task=\"poller\"} 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_task_running{task=\"poller\"} 1"),
+        "got: {body}"
+    );
+}
+
 /// A stale detection cursor must make /ready fail even though Horizon itself
 /// is reachable — reachable dependencies plus a dead poller is not readiness
 /// (issue #315).

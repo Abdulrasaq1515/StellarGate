@@ -687,21 +687,37 @@ async fn root(headers: axum::http::HeaderMap) -> impl IntoResponse {
 }
 
 /// Liveness probe — cheap by design, and fails only on conditions a restart
-/// would fix: an expected background task is no longer running (issue #315).
+/// would fix: an expected background task is no longer running (issue #315),
+/// or a required task is crash-looping under the supervisor (issue #316).
 /// A poller or listener that died at startup must not leave the process
 /// looking healthy forever, so this checks [`TaskHealth`](crate::TaskHealth)
 /// rather than just returning a hard-coded ok.
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let dead = state.task_health.dead_required_tasks();
-    if dead.is_empty() {
+    let looping = state.task_health.crash_looping_required_tasks();
+    if dead.is_empty() && looping.is_empty() {
         return Json(json!({ "status": "ok" })).into_response();
+    }
+
+    let mut reasons = Vec::new();
+    if !dead.is_empty() {
+        reasons.push(format!(
+            "background task(s) not running: {}",
+            dead.join(", ")
+        ));
+    }
+    if !looping.is_empty() {
+        reasons.push(format!(
+            "background task(s) crash-looping: {}",
+            looping.join(", ")
+        ));
     }
 
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
             "status": "unavailable",
-            "reason": format!("background task(s) not running: {}", dead.join(", ")),
+            "reason": reasons.join("; "),
         })),
     )
         .into_response()
@@ -790,7 +806,11 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
 
 /// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let body = crate::metrics::render(&state.webhook_metrics, &state.auth_metrics);
+    let body = crate::metrics::render(
+        &state.webhook_metrics,
+        &state.auth_metrics,
+        &state.task_health,
+    );
     (
         StatusCode::OK,
         [(

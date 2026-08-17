@@ -31,6 +31,7 @@ pub async fn run_retention_worker(state: Arc<AppState>, mut shutdown: watch::Rec
         && state.config.idempotency_retention_days <= 0
     {
         info!("retention worker disabled (both retention windows are 0)");
+        let _ = shutdown.changed().await;
         return;
     }
 
