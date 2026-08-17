@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: request bodies are now closed.** `POST /payments` and
+  `POST /merchants/:id/keys` reject any field they do not recognise with `400`
+  `unknown_field` instead of silently discarding it. Previously a body could
+  carry `merchant_id` — which `openapi.yaml` still advertised, though the
+  handler has always taken the merchant from the API key — and receive a `201`
+  describing an intent on a tenant the caller did not choose. The interaction
+  with `asset` was worse: it defaults to `XLM` when absent, so
+  `{"amount":"100","assset":"USDC"}` created a 100 XLM intent and reported
+  success. `merchant_id` has been removed from the OpenAPI request schema and
+  both schemas are now `additionalProperties: false`. Clients currently sending
+  extra fields will start receiving `400` (issue #329).
+
 ### Fixed
 
 - **Intent settlement pins the issuer.** `POST /payments` stored only the asset

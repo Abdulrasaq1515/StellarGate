@@ -441,10 +441,37 @@ Every error response uses the same shape:
 
 The `code` field is stable across releases and is what you should branch on.
 
+**Request bodies are closed.** Every JSON body is validated against exactly the
+fields its endpoint accepts, and anything else is rejected with `400`
+`unknown_field` naming the offending field. A typo is not quietly dropped:
+
+```bash
+curl -X POST http://localhost:3000/v1/payments \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"amount": "100", "assset": "USDC"}'
+```
+
+```json
+{
+  "error": "invalid request body: Failed to deserialize the JSON body into the target type: unknown field `assset`, expected one of `amount`, `asset`, `webhook_url`",
+  "code": "unknown_field"
+}
+```
+
+This matters most where a field has a default. `asset` defaults to `XLM` when
+absent, so before this the request above created a **100 XLM** intent and
+returned `201` describing it — the single transposed character was recoverable
+only by reading the response back carefully. `merchant_id` was the other sharp
+edge: earlier revisions of `openapi.yaml` advertised it, but the handler has
+always taken the merchant from the API key, so a client that sent it believed
+it was choosing the tenant and was not.
+
 | Code | HTTP | Meaning |
 |---|---|---|
 | `unauthorized` | `401` | Missing/invalid API key or admin secret |
 | `invalid_request` | `400` | Malformed JSON or a deserialization failure |
+| `unknown_field` | `400` | Request body contained a field the endpoint does not accept |
 | `unsupported_media_type` | `415` | `Content-Type` is not `application/json` |
 | `unsupported_asset` | `400` | Asset is not in `ACCEPTED_ASSETS` |
 | `invalid_amount` | `400` | Not a positive decimal with ≤ 7 decimal places |
@@ -582,6 +609,10 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
 | `amount` | string | ✅ | Positive decimal, ≤ 7 decimal places |
 | `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. |
 | `webhook_url` | string | ❌ | ≤ 2048 chars; scheme must be allowed; HTTPS required on `public`; SSRF-checked |
+
+Any other field is rejected with `400` `unknown_field` — see [Error
+Envelope](#error-envelope). In particular there is no `merchant_id` field: the
+merchant comes from the API key and cannot be overridden by the body.
 
 | Header | Required | Description |
 |---|---|---|
