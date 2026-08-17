@@ -966,13 +966,26 @@ Compose network, so the API cannot be hit over plaintext via the VM's IP.
 
 ## Database Migrations
 
-Schema is managed with [`sqlx::migrate!`](https://docs.rs/sqlx/latest/sqlx/macro.migrate.html). Numbered SQL files in `migrations/` are applied automatically at startup, so a fresh database and an existing one converge on the same schema. sqlx records applied migrations in `_sqlx_migrations`, running each exactly once.
+Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), called once from `main` before the HTTP listener binds. It is hand-written Rust, not a migration runner:
 
-**Adding a migration**
+- Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
+- New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
+- A few one-time data backfills (populating `processed_transactions` from legacy rows, normalising pre-RFC 3339 timestamps) run alongside them.
 
-1. Create `migrations/<next_number>_<description>.sql` (e.g. `0003_add_refunds.sql`).
-2. Write the `CREATE TABLE` / `ALTER TABLE` statements.
-3. Run `cargo test` — the suite boots against an in-memory database and applies every migration, so syntax errors surface immediately.
+Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
+
+> [!IMPORTANT]
+> The `migrations/` directory is **not read at runtime.** Nothing in the codebase calls `sqlx::migrate!`, and the SQL in that directory has drifted from the live schema — it is missing `merchants`, `api_keys`, `processed_transactions`, and the `webhook_deliveries.event_type` column. Treat `db::migrate` as the only source of schema truth until this is resolved.
+>
+> Tracked in #92 (this documentation), #93 (the two diverging sources), and #268 (adopting a recorded schema version).
+
+**Changing the schema**
+
+1. Add the statement to `db::migrate` in `src/db.rs`, keeping it idempotent — it will run on every startup of every existing deployment.
+2. For a new column on an existing table, follow the `pragma_table_info` probe pattern already used for `expires_at` and `event_type`. SQLite rejects a non-constant `DEFAULT` on `ALTER TABLE ... ADD COLUMN`, so add the column nullable and backfill it in a second statement.
+3. Run `cargo test` — the suite calls `db::migrate` against an in-memory database, so syntax errors surface immediately.
+
+Because there is no version tracking, a change that is *not* safe to re-run cannot currently be expressed. If you need one, resolve #268 first rather than working around it.
 
 ---
 
@@ -985,7 +998,9 @@ cargo fmt                   # format
 cargo clippy --all-targets -- -D warnings
 ```
 
-CI enforces all four on every pull request, plus a `cargo deny` supply-chain audit and a build on both the minimum supported Rust version and stable.
+CI enforces all four on every pull request, plus a [`cargo audit`](https://github.com/rustsec/rustsec) RustSec advisory scan (also run weekly on a schedule). The test suite runs on both the minimum supported Rust version (1.88) and stable; `cargo fmt` and `cargo clippy` currently run on stable only, which can differ from the pinned toolchain you get locally (#294).
+
+`deny.toml` is present but no workflow runs `cargo deny` yet, so its license, ban, and duplicate-version policy is not currently enforced (#293).
 
 **Test layout**
 
