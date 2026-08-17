@@ -144,7 +144,12 @@ curl https://your-domain.com/ready    # {"status":"ok"} once Horizon is reachabl
 ```
 
 `/ready` returning `503` with a `"reason"` field tells you immediately whether
-the database or Horizon is the problem.
+the database, Horizon, or the payment-detection cursor is the problem. Once a
+gateway is configured, `/ready` also requires a successful Horizon poll (or
+stream event) within `POLL_INTERVAL_SECS × CURSOR_STALENESS_MULTIPLE` — so a
+poller that died at startup surfaces as `payment detection stalled` instead of
+leaving the probe green (issue #315). `/health` fails when an expected
+background task is no longer running, naming the dead task in its `reason`.
 
 The first build compiles the whole dependency tree and takes several minutes on
 a 1-OCPU shape. Subsequent deploys reuse the Docker layer cache.
@@ -225,7 +230,8 @@ outcomes, retries, delivery latency, and auth success/failure.
 
 | Signal | Why it matters |
 |---|---|
-| `/ready` failing | Horizon or the database is unreachable — payments will not be detected |
+| `/ready` failing | Horizon or the database is unreachable, **or** the payment-detection cursor is stale — payments will not be detected |
+| `/health` failing | An expected background task (poller, stream, sweeper, retention, redrive) died — a restart is the fix |
 | `stellargate_webhook_deliveries_total{outcome="failed"}` rising | Merchants are not learning about completed payments |
 | `cursor_age_secs` climbing in logs | The listener is falling behind the chain |
 | `stellargate_auth_attempts_total{outcome="failure"}` spiking | Credential stuffing, or a broken integration |

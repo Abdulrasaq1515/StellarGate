@@ -3,6 +3,7 @@
 //! everything on shutdown.
 
 use anyhow::Result;
+use futures_util::FutureExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -77,26 +78,46 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let health = state.task_health.clone();
 
+    /* Declare which background tasks are expected to keep running: `/health`
+    fails while any required task is not running, so a poller or listener that
+    died at startup stops being invisible (issue #315). The poller and stream
+    are only expected once a gateway wallet is configured — without one they
+    idle by design ("the listener stays idle until this is set"). */
+    if state.config.gateway_configured() {
+        health.require("poller");
+        if state.config.listener_mode == ListenerMode::Stream {
+            health.require("stream");
+        }
+    }
+    health.require("sweeper");
+    health.require("retention");
+    health.require("redrive");
+
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
         spawn_task(
             &health,
+            "stream",
             horizon::run_stream_listener(state.clone(), shutdown_rx.clone()),
         )
     });
     let poller = spawn_task(
         &health,
+        "poller",
         horizon::run_poller(state.clone(), shutdown_rx.clone()),
     );
     let sweeper = spawn_task(
         &health,
+        "sweeper",
         expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
     );
     let retention = spawn_task(
         &health,
+        "retention",
         retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
     );
     let redrive = spawn_task(
         &health,
+        "redrive",
         webhook::run_redrive_worker(state.clone(), shutdown_rx),
     );
 
@@ -113,12 +134,12 @@ async fn main() -> Result<()> {
 
     let _ = shutdown_tx.send(true);
     let drain = async {
-        join_task(poller, &health).await;
-        join_task(sweeper, &health).await;
-        join_task(redrive, &health).await;
-        join_task(retention, &health).await;
+        join_task(poller, &health, "poller").await;
+        join_task(sweeper, &health, "sweeper").await;
+        join_task(redrive, &health, "redrive").await;
+        join_task(retention, &health, "retention").await;
         if let Some(handle) = stream {
-            join_task(handle, &health).await;
+            join_task(handle, &health, "stream").await;
         }
     };
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
@@ -172,26 +193,34 @@ async fn report_trustlines(state: &Arc<AppState>) {
 
 /// Spawn a background task, keeping [`TaskHealth`] accurate across its
 /// lifetime: counted as started before it runs and as stopped when it returns
-/// normally. A panic is recorded instead by [`join_task`] at shutdown.
-fn spawn_task<F>(health: &TaskHealth, task: F) -> JoinHandle<()>
+/// (normally or by panicking). A panic is caught inside the task so it is
+/// logged and recorded at the moment it happens — not only at shutdown — which
+/// is what lets `/health` notice a dead task immediately (issues #104, #105,
+/// #315).
+fn spawn_task<F>(health: &TaskHealth, name: &'static str, task: F) -> JoinHandle<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
     let health = health.clone();
-    health.task_started();
+    health.task_started(name);
     tokio::spawn(async move {
-        task.await;
-        health.task_stopped();
+        let outcome = std::panic::AssertUnwindSafe(task).catch_unwind().await;
+        if outcome.is_err() {
+            warn!(task = name, "background task panicked; marking it stopped");
+            health.task_failed(name);
+        }
+        health.task_stopped(name);
     })
 }
 
-/// Await a background task. A `JoinError` means it panicked, which is recorded
-/// so the failure counter — and any alert watching it — fires.
-async fn join_task(handle: JoinHandle<()>, health: &TaskHealth) {
+/// Await a background task during shutdown. Panics are caught inside
+/// [`spawn_task`], so a `JoinError` here is unexpected; if one does surface it
+/// is recorded so the failure counter — and any alert watching it — fires.
+async fn join_task(handle: JoinHandle<()>, health: &TaskHealth, name: &'static str) {
     if let Err(e) = handle.await {
         if e.is_panic() {
-            warn!("background task panicked");
-            health.task_failed();
+            warn!(task = name, "background task panicked");
+            health.task_failed(name);
         }
     }
 }

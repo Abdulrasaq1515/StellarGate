@@ -141,6 +141,7 @@ mod tests {
             webhook_delivery_retention_days: delivery_days,
             idempotency_retention_days: idempotency_days,
             poll_interval_secs: 10,
+            cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 1000,
             db_pool_max_connections: 1,

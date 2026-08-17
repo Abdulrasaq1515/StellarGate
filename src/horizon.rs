@@ -452,6 +452,11 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
         }
     }
 
+    /* A completed cycle is on-chain progress even with nothing to settle — the
+    cursor advanced and the poller is alive. This heartbeat is what /ready's
+    cursor-freshness check measures (issue #315). */
+    state.task_health.note_success();
+
     Ok(settled)
 }
 
@@ -806,6 +811,9 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
             if let Some(cursor_age_secs) = hp.created_at.as_deref().and_then(elapsed_secs) {
                 info!(cursor_age_secs, "stream cursor advanced");
             }
+            /* Receiving a payment record means the stream is alive and the
+            cursor moved — the same heartbeat /ready's freshness check uses. */
+            state.task_health.note_success();
             if let Err(e) = reconcile_payment(state, &hp).await {
                 warn!(error = %e, "failed to reconcile streamed payment");
             }
