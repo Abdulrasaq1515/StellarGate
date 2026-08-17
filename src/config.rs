@@ -153,6 +153,11 @@ pub struct Config {
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
     pub payment_ttl_secs: u64,
+    /// Maximum number of overdue intents the expiry sweeper transitions in one
+    /// sweep. Batching keeps each sweeper write short — SQLite has a single
+    /// writer, so one unbounded sweep over a large backlog would stall payment
+    /// writes until it finished (issue #323).
+    pub expiry_batch_size: i64,
     /// Maximum number of requests per second allowed per client IP before the
     /// rate-limit middleware responds with `429 Too Many Requests`.
     pub rate_limit_requests_per_sec: u32,
@@ -276,6 +281,7 @@ impl Config {
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
             cursor_staleness_multiple: parse_env("CURSOR_STALENESS_MULTIPLE", 3)?,
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
+            expiry_batch_size: parse_env("EXPIRY_BATCH_SIZE", 500)?,
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
             db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10)?,
             db_busy_timeout_ms: parse_env("DB_BUSY_TIMEOUT_MS", 5000)?,
@@ -335,6 +341,7 @@ impl Config {
     /// - `PAYMENT_TTL_SECS == 0` → every intent expires the moment it is created
     /// - `PAYMENT_TTL_SECS < POLL_INTERVAL_SECS` → intents expire before the
     ///   poller ever scans them, so payments land but are never matched
+    /// - `EXPIRY_BATCH_SIZE <= 0` → the expiry sweeper never transitions anything
     /// - `WEBHOOK_RETRY_ATTEMPTS == 0` → webhooks are never delivered
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
@@ -372,6 +379,14 @@ impl Config {
                  the poller ever gets a chance to detect it.",
                 self.payment_ttl_secs,
                 self.poll_interval_secs
+            ));
+        }
+
+        if self.expiry_batch_size <= 0 {
+            return Err(anyhow::anyhow!(
+                "EXPIRY_BATCH_SIZE must be > 0 (got {}). \
+                 A zero or negative batch would make the expiry sweeper a no-op.",
+                self.expiry_batch_size
             ));
         }
 
@@ -492,6 +507,7 @@ impl std::fmt::Debug for Config {
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("cursor_staleness_multiple", &self.cursor_staleness_multiple)
             .field("payment_ttl_secs", &self.payment_ttl_secs)
+            .field("expiry_batch_size", &self.expiry_batch_size)
             .field(
                 "rate_limit_requests_per_sec",
                 &self.rate_limit_requests_per_sec,
@@ -589,6 +605,7 @@ mod tests {
             poll_interval_secs: 10,
             cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
+            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 10,
             db_pool_max_connections: 10,
             db_busy_timeout_ms: 5000,
@@ -666,6 +683,7 @@ mod tests {
             poll_interval_secs: 10,
             cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
+            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 10,
             db_pool_max_connections: 10,
             db_busy_timeout_ms: 5000,
@@ -971,6 +989,19 @@ mod tests {
         cfg.webhook_retry_attempts = 1;
         cfg.webhook_retry_delay_ms = 0; // no retries, so no burst
         assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn timing_rejects_zero_expiry_batch() {
+        let mut cfg = timing_config();
+        cfg.expiry_batch_size = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("EXPIRY_BATCH_SIZE"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_allows_default_expiry_batch() {
+        assert!(timing_config().validate_timing().is_ok());
     }
 
     #[test]
