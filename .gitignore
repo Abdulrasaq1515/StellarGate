@@ -1,6 +1,7 @@
 /target
-.env
 *.db
 
 # Live deployment secrets — never commit.
 deploy/stellargate.env
+config.bat
+node_modules
