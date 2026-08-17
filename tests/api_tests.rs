@@ -41,6 +41,7 @@ fn make_config() -> Config {
         poll_interval_secs: 10,
         cursor_staleness_multiple: 3,
         payment_ttl_secs: 3600,
+        expiry_batch_size: 500,
         /* High enough that these tests never trip the limiter; dedicated
         rate-limit coverage lives in tests/rate_limit_tests.rs. */
         rate_limit_requests_per_sec: 1000,
