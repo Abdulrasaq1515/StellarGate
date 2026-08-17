@@ -852,15 +852,58 @@ Manually re-send a delivery. The stored payload and event type are replayed verb
 
 ### `GET /health`
 
-Liveness probe — cheap, and fails only on conditions a restart would fix. Returns `200 OK` while the process is running **and** every expected background task (poller, stream, sweeper, retention, redrive) is running. A task that died — a panic, or a poller that exited at startup — returns `503` naming the dead task, so a process whose payment detection is gone never looks healthy forever. The poller and stream are only "expected" once a gateway wallet is configured; without one they idle by design.
+Liveness probe — cheap, and fails only on conditions a restart would fix. Returns `200 OK` while the process is running **and** every expected background task (poller, stream, sweeper, retention, redrive) is running. A task that died — a panic, or a poller that exited at startup — returns `503` naming the dead task, so a process whose payment detection is gone never looks healthy forever.
 
 ```json
-{ "status": "ok" }
+{
+  "status": "ok",
+  "tasks": { "expected": 5, "live": 5, "disabled": [] }
+}
 ```
 
 ```json
-{ "status": "unavailable", "reason": "background task(s) not running: poller" }
+{
+  "status": "unavailable",
+  "reason": "background task(s) not running: poller",
+  "tasks": { "expected": 5, "live": 4, "disabled": [] }
+}
 ```
+
+`tasks` answers "how many workers should be running, and how many are?" — a
+question the process could not previously answer at all. **`expected` already
+excludes workers that configuration has deliberately switched off**, so a
+poll-only deployment (no stream listener) or one with both retention windows set
+to `0` does not read as permanently degraded:
+
+```json
+{
+  "status": "ok",
+  "tasks": {
+    "expected": 4,
+    "live": 4,
+    "disabled": [
+      { "task": "retention", "reason": "both WEBHOOK_DELIVERY_RETENTION_DAYS and IDEMPOTENCY_RETENTION_DAYS are 0" }
+    ]
+  }
+}
+```
+
+#### Why a worker stopped
+
+Each worker returns an explicit reason rather than leaving the supervisor to
+infer one, and the three are handled differently:
+
+| Exit | Restarted? | Logged at | `/health` |
+|---|---|---|---|
+| Shutdown requested | no | `info` | n/a — the process is going away |
+| Disabled by configuration | **no** — terminal, reported once at boot | `info` | listed under `disabled`; **not** a failure |
+| Fatal error | **yes**, with bounded backoff | **`error`**, naming the task | counts as not running |
+
+The distinction is load-bearing. Retention exiting because both windows are `0`
+is a deployment choice; the stream listener exiting because its HTTP client
+would not build is a fault that silently ends stream-based payment detection.
+Both used to be recorded identically as "stopped", so the counters could not
+separate them and neither could anyone reading them.
 
 ### `GET /ready`
 
@@ -1056,6 +1099,17 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_task_restarts_total` | counter | Supervisor restarts, labelled by `task` |
 | `stellargate_task_running` | gauge | `1` if the named task is running |
 | `stellargate_task_consecutive_failures` | gauge | Consecutive panics since the last stable run |
+| `stellargate_tasks_expected` | gauge | Workers this deployment expects to be running, excluding any disabled by configuration |
+| `stellargate_tasks_live` | gauge | Expected workers currently running |
+| `stellargate_task_disabled` | gauge | `1` if the named task exited because configuration gave it nothing to do |
+
+**Alert on `stellargate_tasks_live < stellargate_tasks_expected`.** That
+comparison was not previously possible: `stellargate_tasks_stopped_total` was
+overloaded across clean shutdown, configuration-disabled exit and fault, so
+`started − stopped − failed` was not a live count and there was nothing to
+compare it against. `stellargate_task_disabled` is what separates "switched off
+on purpose" from "not running", which `stellargate_task_running` alone reports
+identically.
 
 Structured logs (via `tracing`) carry an `x-request-id` on every request, propagated to responses. Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
 

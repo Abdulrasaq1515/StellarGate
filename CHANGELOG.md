@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Background tasks report *why* they exited.** `spawn_task` counted a start,
+  and counted a stop when the future returned — with no way to tell "returned
+  because shutdown was signalled" from "returned early because something went
+  wrong". Several workers return permanently on a startup condition, and each
+  looked exactly like a clean shutdown: `run_retention_worker` exiting because
+  both retention windows are `0` (a deployment choice) recorded the same thing
+  as `run_stream_listener` exiting because its HTTP client would not build (a
+  `warn!` followed by a permanent end to stream-based payment detection).
+  Workers now return an explicit `TaskExit` — `ShutdownRequested`,
+  `DisabledByConfig` or `Fatal` — and the supervisor acts on it: a fatal exit is
+  logged at **`error`** naming the task and restarted, a config-disabled exit is
+  reported once at boot and is terminal, and neither is confused with an
+  ordinary stop (issue #317).
+
 ### Added
+
+- **Expected-versus-live worker counts on `/health` and `/metrics`.** After boot
+  there was no way to answer "how many workers should be running, and how many
+  are?" — the information existed, but `stopped` was overloaded across three
+  different meanings, so the arithmetic would have been wrong even once exposed.
+  `/health` now carries a `tasks` object (`expected`, `live`, `disabled` with
+  reasons) and `/metrics` exports `stellargate_tasks_expected`,
+  `stellargate_tasks_live` and `stellargate_task_disabled`. `expected` excludes
+  deliberately-disabled workers, so a poll-only or retention-disabled deployment
+  does not read as permanently degraded, and
+  `stellargate_tasks_live < stellargate_tasks_expected` is a usable alert
+  (issues #317, #282, #103).
 
 - **`X-RateLimit-*` response headers.** Every response now carries
   `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` for the

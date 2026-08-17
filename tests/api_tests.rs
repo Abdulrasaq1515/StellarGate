@@ -171,6 +171,98 @@ async fn test_health_ok_when_required_task_running() {
     assert_eq!(res.json::<Value>()["status"], "ok");
 }
 
+// ── Expected-versus-live worker counts (issue #317) ──────────────────────────
+
+/// After boot there was no way to answer "how many workers should be running,
+/// and how many are?" — the information existed but `stopped` was overloaded
+/// across clean shutdown, config-disabled exit and fault, so the arithmetic
+/// would have been wrong even once exposed.
+#[tokio::test]
+async fn test_health_reports_expected_and_live_task_counts() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.require("sweeper");
+    health.task_started("poller");
+    health.task_started("sweeper");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let res = server.get("/health").await;
+    res.assert_status_ok();
+    let tasks = &res.json::<Value>()["tasks"];
+    assert_eq!(tasks["expected"], 2);
+    assert_eq!(tasks["live"], 2);
+    assert_eq!(tasks["disabled"].as_array().unwrap().len(), 0);
+}
+
+/// A worker switched off by configuration is neither dead nor expected. A
+/// poll-only deployment, or one with retention disabled, must not read as
+/// permanently degraded.
+#[tokio::test]
+async fn test_health_excludes_config_disabled_tasks_from_expected() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.require("retention");
+    health.task_started("poller");
+    health.task_disabled("retention", "both retention windows are 0");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let res = server.get("/health").await;
+    res.assert_status_ok();
+    let body = res.json::<Value>();
+    assert_eq!(body["status"], "ok", "a disabled worker is not a failure");
+    assert_eq!(body["tasks"]["expected"], 1);
+    assert_eq!(body["tasks"]["live"], 1);
+
+    let disabled = body["tasks"]["disabled"].as_array().unwrap();
+    assert_eq!(disabled.len(), 1);
+    assert_eq!(disabled[0]["task"], "retention");
+    assert_eq!(disabled[0]["reason"], "both retention windows are 0");
+}
+
+/// A genuine death shows up as a shortfall, not just a boolean.
+#[tokio::test]
+async fn test_health_shows_a_shortfall_when_a_task_dies() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.require("sweeper");
+    health.task_started("poller");
+    health.task_started("sweeper");
+    health.task_stopped("sweeper");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let res = server.get("/health").await;
+    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let tasks = &res.json::<Value>()["tasks"];
+    assert_eq!(tasks["expected"], 2);
+    assert_eq!(tasks["live"], 1);
+}
+
+#[tokio::test]
+async fn test_metrics_expose_expected_and_live_task_counts() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.require("retention");
+    health.task_started("poller");
+    health.task_disabled("retention", "both retention windows are 0");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains("stellargate_tasks_expected 1"),
+        "expected count must exclude the disabled worker:\n{body}"
+    );
+    assert!(body.contains("stellargate_tasks_live 1"), "{body}");
+    assert!(
+        body.contains("stellargate_task_disabled{task=\"retention\"} 1"),
+        "a disabled worker must be distinguishable from one that is merely \
+         not running:\n{body}"
+    );
+    assert!(
+        body.contains("stellargate_task_disabled{task=\"poller\"} 0"),
+        "{body}"
+    );
+}
+
 /// A required background task that stopped (a poller that died at startup)
 /// must make /health fail — a process whose payment detection is dead must
 /// not look healthy forever (issue #315).
