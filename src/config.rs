@@ -408,9 +408,8 @@ impl Config {
         ];
         if WEBHOOK_PLACEHOLDERS.contains(&secret.as_str()) || secret.starts_with("REPLACE_ME_") {
             return Err(anyhow::anyhow!(
-                "WEBHOOK_SECRET is set to a known placeholder value ({:?}). \
-                 Replace it with a strong, randomly-generated secret.",
-                secret
+                "WEBHOOK_SECRET is set to a known placeholder value ({secret:?}). \
+                 Replace it with a strong, randomly-generated secret."
             ));
         }
         if secret.len() < 32 {

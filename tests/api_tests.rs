@@ -1286,9 +1286,7 @@ async fn test_amount_canonicalization_on_create_get_list() {
         assert_eq!(
             body["amount"].as_str().unwrap(),
             expected_canonical,
-            "create response should canonicalize amount: {} -> {}",
-            input,
-            expected_canonical
+            "create response should canonicalize amount: {input} -> {expected_canonical}"
         );
 
         let payment_id = body["id"].as_str().unwrap().to_string();
@@ -1307,8 +1305,7 @@ async fn test_amount_canonicalization_on_create_get_list() {
         assert_eq!(
             body["amount"].as_str().unwrap(),
             *expected_canonical,
-            "get response should return canonical form for input: {}",
-            input
+            "get response should return canonical form for input: {input}"
         );
     }
 
@@ -1358,9 +1355,7 @@ async fn test_whole_amount_canonicalization() {
         assert_eq!(
             body["amount"].as_str().unwrap(),
             expected,
-            "whole amount {} should canonicalize to {}",
-            input,
-            expected
+            "whole amount {input} should canonicalize to {expected}"
         );
     }
 }

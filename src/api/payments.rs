@@ -425,7 +425,7 @@ pub async fn list(
 }
 
 fn encode_cursor(ts: &str, id: &str) -> String {
-    hex::encode(format!("{}\t{}", ts, id))
+    hex::encode(format!("{ts}\t{id}"))
 }
 
 fn decode_cursor(raw: &str) -> Option<(String, String)> {
