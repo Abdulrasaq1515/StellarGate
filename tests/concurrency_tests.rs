@@ -123,6 +123,7 @@ async fn seed_pending_payment(pool: &db::Db, webhook_url: Option<&str>) -> Strin
             memo: "ABCD1234",
             amount: "10",
             asset: "XLM",
+            asset_issuer: None,
             webhook_url,
             ttl_secs: 3600,
         },

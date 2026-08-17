@@ -239,7 +239,7 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet Horizon |
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
-| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. | `XLM,USDC:<testnet issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. Duplicate codes are refused: Stellar codes are not unique across issuers, and two entries sharing a code used to settle each other's intents (issue #222). | `XLM,USDC:<testnet issuer>` |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
 
 ### Trustlines
@@ -598,6 +598,7 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
   "memo": "A1B2C3D4",
   "amount": "10",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "pending",
   "created_at": "2026-04-29T15:00:00Z",
   "expires_at": "2026-04-29T16:00:00Z"
@@ -637,6 +638,7 @@ curl http://localhost:3000/payments/$ID -H "Authorization: Bearer $API_KEY"
   "memo": "A1B2C3D4",
   "amount": "10",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "pending",
   "tx_hash": null,
   "paid_amount": null,
@@ -835,6 +837,7 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
   "amount": "10",
   "paid_amount": "12.5",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "completed",
   "delta": "2.5"
 }
@@ -1013,7 +1016,7 @@ Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), calle
 
 - Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
 - New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
-- A few one-time data backfills (populating `processed_transactions` from legacy rows, normalising pre-RFC 3339 timestamps) run alongside them.
+- A few one-time data backfills (populating `processed_transactions` from legacy rows, filling `asset_issuer` from `ACCEPTED_ASSETS`, normalising pre-RFC 3339 timestamps) run alongside them.
 
 Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
 

@@ -89,6 +89,7 @@ async fn create_test_payment(state: &AppState, webhook_url: &str) -> db::Payment
             memo: "MEMOTEST",
             amount: "10",
             asset: "XLM",
+            asset_issuer: None,
             webhook_url: Some(webhook_url),
             ttl_secs: 3600,
         },

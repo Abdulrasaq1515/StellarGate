@@ -32,6 +32,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             memo TEXT NOT NULL UNIQUE,
             amount TEXT NOT NULL,
             asset TEXT NOT NULL DEFAULT 'XLM',
+            asset_issuer TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             webhook_url TEXT,
             tx_hash TEXT,
@@ -68,6 +69,20 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    /* Pin each intent to the issuer it was priced in. Rows written before this
+    column existed only stored the asset *code*; `backfill_asset_issuers` fills
+    them from the current allow-list after config loads (issue #222). */
+    let has_asset_issuer: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'asset_issuer'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_asset_issuer == 0 {
+        sqlx::query("ALTER TABLE payments ADD COLUMN asset_issuer TEXT")
+            .execute(pool)
+            .await?;
+    }
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
         .execute(pool)
@@ -273,6 +288,31 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Fill `asset_issuer` on rows that only stored a code, using the current
+/// allow-list. Duplicate codes are rejected at boot, so each code maps to at
+/// most one issuer. Native assets stay NULL.
+pub async fn backfill_asset_issuers(
+    pool: &Db,
+    accepted: &[crate::config::AcceptedAsset],
+) -> Result<()> {
+    for asset in accepted {
+        let Some(issuer) = asset.issuer.as_deref() else {
+            continue;
+        };
+        sqlx::query(
+            "UPDATE payments
+                SET asset_issuer = ?
+              WHERE upper(asset) = upper(?)
+                AND (asset_issuer IS NULL OR asset_issuer = '')",
+        )
+        .bind(issuer)
+        .bind(&asset.code)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Payment {
     pub id: String,
@@ -289,6 +329,10 @@ pub struct Payment {
     pub updated_at: String,
     /// When this intent stops being `pending` and is swept to `expired`.
     pub expires_at: String,
+    /// Issuer account for a credit asset; `None` for native XLM. Settlement
+    /// matches this issuer, not any allow-list entry that shares the code
+    /// (issue #222).
+    pub asset_issuer: Option<String>,
 }
 
 fn row_to_payment(row: &sqlx::sqlite::SqliteRow) -> Payment {
@@ -306,6 +350,7 @@ fn row_to_payment(row: &sqlx::sqlite::SqliteRow) -> Payment {
         created_at: normalize_ts(&row.get::<String, _>("created_at")),
         updated_at: normalize_ts(&row.get::<String, _>("updated_at")),
         expires_at: normalize_ts(&row.get::<String, _>("expires_at")),
+        asset_issuer: row.get("asset_issuer"),
     }
 }
 
@@ -317,6 +362,8 @@ pub struct NewPayment<'a> {
     pub memo: &'a str,
     pub amount: &'a str,
     pub asset: &'a str,
+    /// Issuer for `asset`; `None` for native XLM.
+    pub asset_issuer: Option<&'a str>,
     pub webhook_url: Option<&'a str>,
     /// Seconds from now until the intent expires. The expiry timestamp is
     /// computed by SQLite at insert time as `now + ttl_secs`.
@@ -336,8 +383,8 @@ pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
     clock and RFC 3339 format as created_at. */
     let ttl_modifier = format!("{:+} seconds", new.ttl_secs);
     sqlx::query(
-        "INSERT INTO payments (id, merchant_id, destination_address, memo, amount, asset, webhook_url, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now',?))",
+        "INSERT INTO payments (id, merchant_id, destination_address, memo, amount, asset, asset_issuer, webhook_url, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now',?))",
     )
     .bind(new.id)
     .bind(new.merchant_id)
@@ -345,6 +392,7 @@ pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
     .bind(new.memo)
     .bind(&canonical_amount)
     .bind(new.asset)
+    .bind(new.asset_issuer)
     .bind(new.webhook_url)
     .bind(&ttl_modifier)
     .execute(pool)
@@ -401,7 +449,7 @@ pub async fn save_idempotency_key(
 
 pub async fn get_payment(pool: &Db, id: &str) -> Result<Option<Payment>> {
     let row = sqlx::query(
-        "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
          FROM payments WHERE id = ?",
     )
@@ -427,7 +475,7 @@ pub async fn list_payments(
 ) -> Result<(Vec<Payment>, i64)> {
     let (rows, total) = if let Some(s) = status {
         let rows = sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
@@ -449,7 +497,7 @@ pub async fn list_payments(
         (rows, total)
     } else {
         let rows = sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+            "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments WHERE merchant_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
@@ -480,7 +528,7 @@ pub async fn list_payments_keyset(
     let rows = match (status, cursor) {
         (None, None) => {
             sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments WHERE merchant_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
             )
@@ -492,7 +540,7 @@ pub async fn list_payments_keyset(
 
         (None, Some((ts, cid))) => {
             sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
              WHERE merchant_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
@@ -509,7 +557,7 @@ pub async fn list_payments_keyset(
 
         (Some(s), None) => {
             sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
             )
@@ -522,7 +570,7 @@ pub async fn list_payments_keyset(
 
         (Some(s), Some((ts, cid))) => {
             sqlx::query(
-                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
              WHERE merchant_id = ? AND status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
@@ -547,7 +595,7 @@ pub async fn list_payments_keyset(
 /// yet, so an overdue intent is never polled.
 pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     let rows = sqlx::query(
-        "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
          FROM payments
          WHERE status IN ('pending', 'underpaid')
@@ -560,36 +608,18 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// Transition up to `batch` watchable payments whose TTL has elapsed to
-/// `expired`, returning the rows that were swept so the caller can fire
-/// `payment.expired` webhooks.
-///
-/// The whole batch is transitioned in a single `UPDATE … RETURNING` — one
-/// round-trip instead of one guarded `UPDATE` per intent (issue #323). The
-/// `WHERE … status IN ('pending','underpaid')` guard remains what makes a
-/// concurrent settlement win the race: the subquery and update run under one
-/// write lock, so a payment that settles in between is never selected here
-/// (if the settlement committed first) and a payment this statement sweeps is
-/// rejected by the settlement's own guard (issue #155) — never double-reported.
-/// `RETURNING` yields exactly the rows this statement actually transitioned.
-///
-/// `batch` bounds each statement, so a large backlog drains over several
-/// sweeps instead of one long write lock.
-pub async fn expire_overdue(pool: &Db, batch: i64) -> Result<Vec<Payment>> {
-    let rows = sqlx::query(
-        "UPDATE payments
-            SET status = 'expired',
-                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-          WHERE id IN (
-              SELECT id FROM payments
-               WHERE status IN ('pending', 'underpaid')
-                 AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
-               ORDER BY created_at ASC
-               LIMIT ?
-          )
-          RETURNING id, merchant_id, destination_address, memo, amount, asset,
-                    status, webhook_url, tx_hash, paid_amount, created_at,
-                    updated_at, expires_at",
+/// Transition every watchable payment whose TTL has elapsed to `expired`,
+/// returning the rows that were swept so the caller can fire `payment.expired`
+/// webhooks. Each row is updated with a guard on a watchable status so a payment
+/// that settles concurrently is left untouched and not double-reported.
+pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
+    let overdue = sqlx::query(
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
+                webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
+         FROM payments
+         WHERE status IN ('pending', 'underpaid')
+           AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
+         ORDER BY created_at ASC",
     )
     .bind(batch)
     .fetch_all(pool)
@@ -600,7 +630,7 @@ pub async fn expire_overdue(pool: &Db, batch: i64) -> Result<Vec<Payment>> {
 
 pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Payment>> {
     let row = sqlx::query(
-        "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
          FROM payments
          WHERE memo = ?
@@ -1273,6 +1303,7 @@ mod tests {
             memo,
             amount: "10",
             asset: "XLM",
+            asset_issuer: None,
             webhook_url: None,
             ttl_secs,
         }
@@ -1291,6 +1322,73 @@ mod tests {
             .await
             .unwrap();
         assert!(dead.expires_at < dead.created_at);
+    }
+
+    #[tokio::test]
+    async fn create_persists_asset_issuer() {
+        let pool = memory_db().await;
+        let usdc = create_payment(
+            &pool,
+            NewPayment {
+                id: "usdc",
+                merchant_id: "m",
+                destination_address: "GGATEWAY",
+                memo: "MEMOUSDC",
+                amount: "5",
+                asset: "USDC",
+                asset_issuer: Some("GUSDC"),
+                webhook_url: None,
+                ttl_secs: 3600,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(usdc.asset_issuer.as_deref(), Some("GUSDC"));
+
+        let xlm = create_payment(&pool, new_payment("xlm", "MEMOXLM", 3600))
+            .await
+            .unwrap();
+        assert_eq!(xlm.asset_issuer, None);
+    }
+
+    #[tokio::test]
+    async fn backfill_fills_null_issuer_from_allow_list() {
+        let pool = memory_db().await;
+        sqlx::query(
+            "INSERT INTO payments
+                (id, merchant_id, destination_address, memo, amount, asset, status, expires_at)
+             VALUES ('legacy', 'm', 'GGATEWAY', 'MEMOLEG', '5', 'USDC', 'pending',
+                     strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        backfill_asset_issuers(
+            &pool,
+            &[crate::config::AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GUSDC".into()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let p = get_payment(&pool, "legacy").await.unwrap().unwrap();
+        assert_eq!(p.asset_issuer.as_deref(), Some("GUSDC"));
+
+        // Already-pinned rows are left alone.
+        backfill_asset_issuers(
+            &pool,
+            &[crate::config::AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GOTHER".into()),
+            }],
+        )
+        .await
+        .unwrap();
+        let p = get_payment(&pool, "legacy").await.unwrap().unwrap();
+        assert_eq!(p.asset_issuer.as_deref(), Some("GUSDC"));
     }
 
     #[tokio::test]
