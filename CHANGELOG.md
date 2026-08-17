@@ -18,9 +18,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it, so a browser client could previously see the `429` but none of the
   headers explaining it. The bucket/quota model is now documented per route in
   the README and in `openapi.yaml` (issue #327).
+- **Dead-letter view for webhook deliveries.** Once a delivery exhausted its
+  attempts it was marked `failed` and left there, findable only by knowing the
+  payment id and calling `GET /payments/:id/webhooks` — backwards, since the
+  reason to go looking is normally "a merchant says they are missing events"
+  and a payment id is exactly what the person asking does not have. Answering
+  it meant querying SQLite directly on the production volume, and a merchant
+  could not self-serve at all. `GET /v1/payments/webhooks?status=failed` now
+  lists a merchant's deliveries across every payment, cursor-paginated with the
+  same conventions as `GET /payments` and scoped by a join rather than a
+  caller-supplied filter (issue #319).
+- **Bulk webhook recovery.** `POST /v1/payments/webhooks/redeliver` requeues
+  failed deliveries — all of them, or up to 100 named ids — so a merchant who
+  has fixed their receiver can recover what they missed. It sends nothing
+  itself: rows go back to `pending` with `attempts = 0` and are retried by the
+  redrive worker, whose concurrency limit and backoff already bound the
+  outbound rate, so a bulk requeue cannot exhaust the redrive budget or
+  stampede a receiver that has only just come back up (issues #319, #235).
+
+### Changed
+
+- **Unacknowledged terminal webhook failures survive retention.** A `failed`
+  delivery was deleted after `WEBHOOK_DELIVERY_RETENTION_DAYS`, so the evidence
+  that an event was permanently lost expired on a timer whether or not anyone
+  had looked at it — precisely when it was most likely to be asked for. Such a
+  row is now exempt until it is acknowledged (requeueing acknowledges it). To
+  avoid trading one unbounded table for another, a retained failure is
+  **compacted** once past the window: the row stays, its `payload` is cleared.
+  The payload is the largest column and its only consumer is redelivery, which
+  is not something anyone does to a months-old failure, so the record stays
+  queryable indefinitely at a few hundred bytes (issue #319).
 
 ### Fixed
 
+- **SSRF-blocked webhook deliveries are counted as terminal failures.** A
+  target that resolves into a blocked range can never succeed, but neither the
+  inline dispatch path nor the redrive path incremented
+  `stellargate_webhook_deliveries_total{outcome="failed"}` — leaving an entire
+  class of permanent failure invisible to the counter and to any alert built on
+  it (issues #319, #233).
 - **`openapi.yaml` declares its security schemes.** The spec had no
   `components.securitySchemes` block and no `security` key on any operation, so
   every route read as unauthenticated — a client generated from it exposed no
