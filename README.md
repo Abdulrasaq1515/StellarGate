@@ -240,7 +240,7 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet Horizon |
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
-| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. | `XLM,USDC:<testnet issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. Duplicate codes are refused: Stellar codes are not unique across issuers, and two entries sharing a code used to settle each other's intents (issue #222). | `XLM,USDC:<testnet issuer>` |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
 
 ### Trustlines
@@ -308,6 +308,11 @@ XLM free to cover one per asset.
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
 | `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
+| `EXPIRY_BATCH_SIZE` | Maximum overdue intents the expiry sweeper transitions per sweep | `500` |
+
+Intents are expired in bounded batches (`EXPIRY_BATCH_SIZE`) so a large
+backlog drains over several sweeps instead of one long write lock — SQLite has
+a single writer.
 
 ### Webhooks
 
@@ -491,10 +496,37 @@ Every error response uses the same shape:
 
 The `code` field is stable across releases and is what you should branch on.
 
+**Request bodies are closed.** Every JSON body is validated against exactly the
+fields its endpoint accepts, and anything else is rejected with `400`
+`unknown_field` naming the offending field. A typo is not quietly dropped:
+
+```bash
+curl -X POST http://localhost:3000/v1/payments \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"amount": "100", "assset": "USDC"}'
+```
+
+```json
+{
+  "error": "invalid request body: Failed to deserialize the JSON body into the target type: unknown field `assset`, expected one of `amount`, `asset`, `webhook_url`",
+  "code": "unknown_field"
+}
+```
+
+This matters most where a field has a default. `asset` defaults to `XLM` when
+absent, so before this the request above created a **100 XLM** intent and
+returned `201` describing it — the single transposed character was recoverable
+only by reading the response back carefully. `merchant_id` was the other sharp
+edge: earlier revisions of `openapi.yaml` advertised it, but the handler has
+always taken the merchant from the API key, so a client that sent it believed
+it was choosing the tenant and was not.
+
 | Code | HTTP | Meaning |
 |---|---|---|
 | `unauthorized` | `401` | Missing/invalid API key or admin secret |
 | `invalid_request` | `400` | Malformed JSON or a deserialization failure |
+| `unknown_field` | `400` | Request body contained a field the endpoint does not accept |
 | `unsupported_media_type` | `415` | `Content-Type` is not `application/json` |
 | `unsupported_asset` | `400` | Asset is not in `ACCEPTED_ASSETS` |
 | `invalid_amount` | `400` | Not a positive decimal with ≤ 7 decimal places |
@@ -633,6 +665,10 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
 | `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. |
 | `webhook_url` | string | ❌ | ≤ 2048 chars; scheme must be allowed; HTTPS required on `public`; SSRF-checked |
 
+Any other field is rejected with `400` `unknown_field` — see [Error
+Envelope](#error-envelope). In particular there is no `merchant_id` field: the
+merchant comes from the API key and cannot be overridden by the body.
+
 | Header | Required | Description |
 |---|---|---|
 | `Content-Type: application/json` | ✅ | Anything else returns `415` |
@@ -648,6 +684,7 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
   "memo": "A1B2C3D4",
   "amount": "10",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "pending",
   "created_at": "2026-04-29T15:00:00Z",
   "expires_at": "2026-04-29T16:00:00Z"
@@ -687,6 +724,7 @@ curl http://localhost:3000/payments/$ID -H "Authorization: Bearer $API_KEY"
   "memo": "A1B2C3D4",
   "amount": "10",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "pending",
   "tx_hash": null,
   "paid_amount": null,
@@ -885,6 +923,7 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
   "amount": "10",
   "paid_amount": "12.5",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "completed",
   "delta": "2.5"
 }
@@ -1063,7 +1102,7 @@ Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), calle
 
 - Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
 - New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
-- A few one-time data backfills (populating `processed_transactions` from legacy rows, normalising pre-RFC 3339 timestamps) run alongside them.
+- A few one-time data backfills (populating `processed_transactions` from legacy rows, filling `asset_issuer` from `ACCEPTED_ASSETS`, normalising pre-RFC 3339 timestamps) run alongside them.
 
 Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
 

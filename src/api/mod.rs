@@ -1,4 +1,4 @@
-use crate::api::payments::{AppError, JsonBody};
+use crate::api::payments::{AppError, OptionalJsonBody};
 use crate::{db, AppState};
 use axum::{
     extract::{ConnectInfo, Path, Request, State},
@@ -339,7 +339,7 @@ async fn provision_merchant(
 async fn issue_api_key(
     State(state): State<Arc<AppState>>,
     Path(merchant_id): Path<String>,
-    body: Option<JsonBody<IssueKeyRequest>>,
+    OptionalJsonBody(body): OptionalJsonBody<IssueKeyRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     if !db::merchant_exists(&state.pool, &merchant_id).await? {
         return Err(AppError::not_found(
@@ -348,7 +348,7 @@ async fn issue_api_key(
         ));
     }
 
-    let label = body.and_then(|JsonBody(b)| b.label);
+    let label = body.and_then(|b| b.label);
     if let Some(l) = &label {
         if l.len() > 100 {
             return Err(AppError::bad_request(
@@ -449,7 +449,13 @@ async fn revoke_api_key(
     ))
 }
 
+/// The optional `POST /merchants/:id/keys` body.
+///
+/// `deny_unknown_fields` for the same reason as `CreatePaymentRequest`
+/// (issue #329): a mistyped `lable` should say so rather than quietly issuing
+/// an unlabelled key.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IssueKeyRequest {
     label: Option<String>,
 }

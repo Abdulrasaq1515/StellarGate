@@ -144,6 +144,7 @@ mod tests {
             poll_interval_secs: 10,
             cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
+            expiry_batch_size: 1,
             rate_limit_requests_per_sec: 1000,
             db_pool_max_connections: 1,
             db_busy_timeout_ms: 5000,

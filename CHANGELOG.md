@@ -132,6 +132,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   short offset page returns `null` instead of a dangling cursor. The migration
   path from offset to cursor pagination is documented in the README; offset
   mode is marked deprecated (issues #328, #269).
+- **Expiry sweeping now batches transitions.** `expire_overdue` previously
+  issued one guarded `UPDATE` per overdue intent, costing N round-trips and N
+  write-lock acquisitions per sweep — a real burden on the single SQLite
+  writer after an outage leaves a large backlog overdue at once. It now
+  transitions a bounded batch in a single `UPDATE … RETURNING`, so each sweep
+  is one write sized by `EXPIRY_BATCH_SIZE` (default `500`) and the backlog
+  drains over several sweeps. The `status IN ('pending','underpaid')` guard and
+  the "only rows actually transitioned produce a webhook" property are
+  preserved (issue #323).
 - **The build.** `main` did not compile. An unclosed block in
   `rate_limit_middleware` plus a reversion to the pre-`moka` `Mutex` API, a
   duplicated struct field and an unterminated character literal in `config.rs`,
