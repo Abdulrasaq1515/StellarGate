@@ -13,6 +13,10 @@ paths:
     get:
       operationId: health
       summary: Health check
+      # Explicitly unauthenticated. Stating this is not redundant: without it a
+      # reader cannot tell "no credential required" from "the spec forgot to
+      # say", which is the ambiguity this whole block exists to remove.
+      security: []
       responses:
         "200":
           description: Service is up
@@ -25,6 +29,8 @@ paths:
     post:
       operationId: createPayment
       summary: Create a payment intent
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -62,14 +68,8 @@ paths:
                   value:
                     error: "unsupported asset 'EURC'; supported: XLM, USDC"
                     code: unsupported_asset
-                unknown_field:
-                  summary: Unrecognized field in the request body
-                  value:
-                    error: >-
-                      invalid request body: Failed to deserialize the JSON body
-                      into the target type: unknown field `merchant_id`,
-                      expected one of `amount`, `asset`, `webhook_url`
-                    code: unknown_field
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "429":
           description: >-
             Rate limit exceeded. The request fell into the `payments` bucket,
@@ -98,6 +98,11 @@ paths:
     get:
       operationId: listPayments
       summary: List payments
+      description: >-
+        Scoped to the merchant that owns the API key. There is no parameter for
+        selecting a different merchant.
+      security:
+        - bearerAuth: []
       parameters:
         - name: status
           in: query
@@ -137,11 +142,46 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /payments/{id}:
     get:
       operationId: getPayment
       summary: Get a payment by ID
+      description: >-
+        Authentication is optional here and changes what comes back, so this is
+        the one operation whose security requirement is genuinely a choice
+        rather than a gate. It stays reachable without a credential so a
+        checkout page can poll it directly.
+
+
+        **No credential** returns a minimal public projection — `id`, `status`
+        and `expires_at`. Enough to answer "has this been paid yet", and
+        nothing else. It deliberately omits `merchant_id`, every amount and
+        `tx_hash`: payment ids travel through logs, referrers and browser
+        history, so anything on this response should be treated as effectively
+        public.
+
+
+        **The owning merchant's key** returns the full record.
+
+
+        **Another merchant's key** returns `404`, the same answer an unknown id
+        gets. A `403` would confirm the payment exists and belongs to someone
+        else.
+
+
+        **An invalid or revoked key** returns `401` rather than silently
+        falling back to the public view, so a typo'd credential says so instead
+        of leaving the caller wondering why fields are missing.
+      security:
+        # An empty requirement alongside the scheme is how OpenAPI expresses
+        # "auth optional, but it changes the response". Flattening this to a
+        # single requirement would misdocument the endpoint most likely to be
+        # integrated against.
+        - {}              # anonymous  -> PublicPaymentView
+        - bearerAuth: []  # owner      -> Payment
       parameters:
         - name: id
           in: path
@@ -151,13 +191,22 @@ paths:
             format: uuid
       responses:
         "200":
-          description: Payment found
+          description: >-
+            Payment found. The schema depends on the credential: the full
+            Payment for the owning merchant, PublicPaymentView for an
+            anonymous caller.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Payment"
+                oneOf:
+                  - $ref: "#/components/schemas/Payment"
+                  - $ref: "#/components/schemas/PublicPaymentView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
-          description: Payment not found
+          description: >-
+            No such payment, or it belongs to another merchant — the two are
+            deliberately indistinguishable.
           content:
             application/json:
               schema:
@@ -167,6 +216,8 @@ paths:
     get:
       operationId: listWebhookDeliveries
       summary: List webhook deliveries for a payment
+      security:
+        - bearerAuth: []
       parameters:
         - name: id
           in: path
@@ -181,6 +232,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListWebhookDeliveriesResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           description: Payment not found
           content:
@@ -192,6 +245,8 @@ paths:
     post:
       operationId: redeliverWebhook
       summary: Re-attempt a webhook delivery
+      security:
+        - bearerAuth: []
       parameters:
         - name: id
           in: path
@@ -208,6 +263,8 @@ paths:
       responses:
         "200":
           description: Redelivery succeeded
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           description: Payment or delivery not found
           content:
@@ -234,48 +291,46 @@ paths:
                     code: webhook_delivery_failed
 
 components:
-  # Every response from every operation carries the X-RateLimit-* family, so a
-  # client can pace itself before being throttled rather than discovering the
-  # limit by hitting it. They are declared once here and referenced where they
-  # matter most; a 429 additionally carries Retry-After.
-  #
-  # All four are listed in Access-Control-Expose-Headers, without which a
-  # browser client could see the 429 but none of the headers explaining it.
-  headers:
-    RetryAfter:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
       description: >-
-        Delta-seconds until a single further request would be permitted,
-        derived from the limiter's own state. Note that quotas are per-second,
-        so one cell replenishes in under a second and this integer value
-        (RFC 9110) currently reports 1 at every configured rate — use
-        X-RateLimit-Remaining for pacing.
-      schema:
-        type: integer
-        minimum: 1
-        example: 1
-    XRateLimitLimit:
+        Merchant API key, issued by POST /merchants or POST
+        /merchants/{id}/keys and sent as `Authorization: Bearer <key>`. The
+        merchant is derived from the key — it is never taken from a request
+        body or query parameter — so a key scopes every payment operation to
+        exactly one tenant.
+    adminSecret:
+      type: apiKey
+      in: header
+      name: X-Admin-Secret
       description: >-
-        The bucket's effective quota, with the per-bucket multiplier already
-        applied (read-only routes get 5x the configured base rate).
-      schema:
-        type: integer
-        example: 50
-    XRateLimitRemaining:
-      description: Requests still available in this bucket right now.
-      schema:
-        type: integer
-        minimum: 0
-        example: 49
-    XRateLimitReset:
+        Operator secret from ADMIN_PROVISIONING_SECRET. Guards merchant
+        provisioning and the API-key lifecycle routes only; it is never
+        accepted on a payment route. An unset ADMIN_PROVISIONING_SECRET
+        disables those routes entirely rather than leaving them open.
+
+  responses:
+    Unauthorized:
       description: >-
-        Delta-seconds until the bucket is back to full capacity. Always >=
-        Retry-After, which covers only the next single request. A delta rather
-        than an epoch timestamp, so a client with a skewed clock still gets a
-        usable answer.
-      schema:
-        type: integer
-        minimum: 0
-        example: 1
+        Missing, malformed, invalid, or revoked credential. Uses the standard
+        error envelope with code `unauthorized`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            missing_key:
+              summary: No Authorization header
+              value:
+                error: missing or invalid Authorization header
+                code: unauthorized
+            invalid_key:
+              summary: Key did not match any merchant
+              value:
+                error: invalid API key
+                code: unauthorized
 
   schemas:
     HealthResponse:
@@ -341,6 +396,23 @@ components:
         updated_at:
           type: string
           format: date-time
+        expires_at:
+          type: string
+          format: date-time
+
+    PublicPaymentView:
+      type: object
+      description: >-
+        What GET /payments/{id} returns to a caller with no credential. Enough
+        to poll for completion, with nothing that identifies the merchant or
+        the sum involved.
+      required: [id, status, expires_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/PaymentStatus"
         expires_at:
           type: string
           format: date-time

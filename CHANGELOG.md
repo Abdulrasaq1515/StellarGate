@@ -21,15 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`Retry-After` is derived from the limiter instead of hard-coded.** Every
-  `429` returned `Retry-After: 1` regardless of configuration. `governor`
-  computes exactly this value — `check()` returns `Err(NotUntil<_>)`, whose
-  `wait_time_from` is the duration until the request would be permitted — and
-  the code discarded it. Under the current per-second quotas the derived answer
-  still rounds to `1`, since a cell replenishes in under a second and
-  `Retry-After` is an integer per RFC 9110; the value is now correct by
-  construction rather than by coincidence, so it stays right if the quota shape
-  changes (issue #327).
+- **`openapi.yaml` declares its security schemes.** The spec had no
+  `components.securitySchemes` block and no `security` key on any operation, so
+  every route read as unauthenticated — a client generated from it exposed no
+  way to supply an API key, sent none, and got `401` on every call, leaving the
+  integrator's first impression that the API was broken rather than that the
+  spec was incomplete. It also misrepresented the security posture to anyone
+  reviewing the contract. `bearerAuth` (merchant API key) and `adminSecret`
+  (`X-Admin-Secret`) are now defined, `bearerAuth` is attached to every
+  protected payment operation, `/health` declares `security: []` explicitly,
+  and each protected operation documents its `401` shape.
+  `GET /payments/{id}` is genuinely tri-modal, so its optional-auth behaviour
+  is expressed as `[{}, {bearerAuth: []}]` with a `PublicPaymentView` schema
+  for the anonymous projection, rather than flattened to a single requirement
+  (issue #325).
 
 - **Background-task supervisor.** A panic in the poller, stream listener,
   sweeper, retention worker, or webhook redrive used to end that task for the

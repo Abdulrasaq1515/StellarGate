@@ -483,6 +483,12 @@ only, because a sunset header is a commitment and none has been made.
 
 `GET /payments/:id` is reachable without a key so a checkout page can poll it directly, but **what it returns depends on who is asking** — an unauthenticated caller gets a minimal projection with no merchant or financial detail. See the endpoint below.
 
+Both schemes are declared in [`openapi.yaml`](openapi.yaml) as `bearerAuth` and
+`adminSecret`, and each operation carries its own `security` requirement, so a
+generated SDK exposes a way to supply credentials and sends them without manual
+modification. `GET /payments/:id` declares `[{}, {bearerAuth: []}]` — the
+OpenAPI spelling of "auth is optional but changes the response".
+
 ### Error Envelope
 
 Every error response uses the same shape:
