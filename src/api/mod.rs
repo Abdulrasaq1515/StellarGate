@@ -2,12 +2,14 @@ use crate::api::payments::{AppError, OptionalJsonBody};
 use crate::{db, AppState};
 use axum::{
     extract::{ConnectInfo, Path, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
     Json,
 };
+use governor::clock::{Clock, DefaultClock};
+use governor::middleware::StateInformationMiddleware;
 use ipnet::IpNet;
 use moka::sync::Cache;
 use serde_json::{json, Value};
@@ -59,8 +61,21 @@ struct RateLimitState {
     ///   so limiter state for quiet IPs is automatically reclaimed.
     /// - moka uses internal sharding, eliminating the single global lock that
     ///   the old `Mutex` imposed.
-    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter>>,
+    ///
+    /// Built `with_middleware::<StateInformationMiddleware>` so a successful
+    /// `check()` returns a `StateSnapshot` rather than `()`. That snapshot is
+    /// where `X-RateLimit-Remaining` comes from; without it the limiter can
+    /// only answer "allowed or not", and a client has no way to pace itself
+    /// before being throttled (issue #327).
+    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter<StateInformationMiddleware>>>,
 }
+
+/// Rate-limit headers. Named here so the CORS `expose_headers` list and the
+/// middleware cannot drift apart — a header a browser client can't read is the
+/// same as one that was never sent.
+const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
+const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
+const X_RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
 
 impl RateLimitState {
     fn new(requests_per_sec: u32, trusted_proxies: Vec<IpNet>) -> Self {
@@ -445,40 +460,116 @@ struct IssueKeyRequest {
     label: Option<String>,
 }
 
+/// Enforce the per-(bucket, client) quota and describe it to the caller.
+///
+/// Every response — throttled or not — carries `X-RateLimit-Limit`,
+/// `X-RateLimit-Remaining` and `X-RateLimit-Reset`, so a client can pace itself
+/// *before* being throttled rather than discovering the limit by hitting it
+/// (issue #327).
+///
+/// On a rejection, `Retry-After` is derived from the limiter's own state.
+/// `governor` computes exactly this value — `check()` returns
+/// `Err(NotUntil<_>)`, whose `wait_time_from` is the duration until the request
+/// would be permitted — and the previous code discarded it in favour of a
+/// hard-coded `1`. That constant was wrong in both directions: too short and a
+/// well-behaved client that honours it retries straight into another `429`,
+/// generating exactly the load the limiter is shedding; too long and throughput
+/// is left on the table. It only looked right because the default quota is
+/// per-second, and grew steadily more wrong as `RATE_LIMIT_REQUESTS_PER_SEC`
+/// was tuned.
 async fn rate_limit_middleware(
     State(rate_limit): State<RateLimitState>,
     req: Request,
     next: Next,
 ) -> axum::response::Response {
-    if let Some(bucket) = rate_limited_bucket(&req) {
-        let key = rate_limit_key(bucket, &req, &rate_limit.trusted_proxies);
-        let base_rps = rate_limit.requests_per_sec;
-        let effective_rps = base_rps
-            .saturating_mul(bucket_rate_multiplier(bucket))
-            .max(1);
-        /* `get_with` clones the `Arc` out of the cache rather than handing back a
-        guard, so nothing borrowed from the cache is held across the `.await`
-        below. */
-        let limiter = rate_limit.limiters.get_with(key, || {
-            Arc::new(governor::RateLimiter::direct(governor::Quota::per_second(
-                NonZeroU32::new(effective_rps).unwrap(),
-            )))
-        });
+    let Some(bucket) = rate_limited_bucket(&req) else {
+        return next.run(req).await;
+    };
 
-        if limiter.check().is_err() {
-            return (
+    let key = rate_limit_key(bucket, &req, &rate_limit.trusted_proxies);
+    let base_rps = rate_limit.requests_per_sec;
+    let effective_rps = base_rps
+        .saturating_mul(bucket_rate_multiplier(bucket))
+        .max(1);
+    /* `get_with` clones the `Arc` out of the cache rather than handing back a
+    guard, so nothing borrowed from the cache is held across the `.await`
+    below. */
+    let limiter = rate_limit.limiters.get_with(key, || {
+        Arc::new(
+            governor::RateLimiter::direct(governor::Quota::per_second(
+                NonZeroU32::new(effective_rps).unwrap(),
+            ))
+            .with_middleware::<StateInformationMiddleware>(),
+        )
+    });
+
+    match limiter.check() {
+        Ok(snapshot) => {
+            let remaining = snapshot.remaining_burst_capacity();
+            let reset = reset_secs(snapshot.quota(), remaining, Duration::ZERO);
+            let mut res = next.run(req).await;
+            set_rate_limit_headers(res.headers_mut(), effective_rps, remaining, reset);
+            res
+        }
+        Err(not_until) => {
+            let wait = not_until.wait_time_from(DefaultClock::default().now());
+            let retry_after = retry_after_secs(wait);
+            let reset = reset_secs(not_until.quota(), 0, wait);
+
+            let mut res = (
                 StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, HeaderValue::from_static("1"))],
                 Json(json!({
                     "error": "rate limit exceeded",
                     "code": "rate_limit_exceeded"
                 })),
             )
                 .into_response();
+
+            let headers = res.headers_mut();
+            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+                headers.insert(header::RETRY_AFTER, value);
+            }
+            set_rate_limit_headers(headers, effective_rps, 0, reset);
+            res
         }
     }
+}
 
-    next.run(req).await
+/// `Retry-After`, in delta-seconds per RFC 9110.
+///
+/// Rounded *up*, with a floor of 1. Truncating would hand back a value the
+/// limiter has not actually reached — a 1.4s wait reported as `1` is a
+/// guaranteed second rejection — and `0` would tell a client honouring the
+/// header to retry immediately, i.e. to hot-loop.
+fn retry_after_secs(wait: Duration) -> u64 {
+    wait.as_secs_f64().ceil().max(1.0) as u64
+}
+
+/// Seconds until the bucket is back to full capacity.
+///
+/// `wait_for_next` is the delay before the *first* cell becomes available (zero
+/// when the request was allowed); the remaining cells refill one per
+/// `replenish_interval` after that. Reported as a delta rather than an epoch
+/// timestamp so a client with a skewed clock still gets a usable answer.
+fn reset_secs(quota: governor::Quota, remaining: u32, wait_for_next: Duration) -> u64 {
+    let missing = quota.burst_size().get().saturating_sub(remaining);
+    let refill = quota.replenish_interval().saturating_mul(missing);
+    // `wait_for_next` already covers the first missing cell on the throttled
+    // path, so it replaces one interval rather than adding to the total.
+    let total = refill.max(wait_for_next);
+    total.as_secs_f64().ceil() as u64
+}
+
+fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, reset: u64) {
+    for (name, value) in [
+        (X_RATELIMIT_LIMIT, limit as u64),
+        (X_RATELIMIT_REMAINING, remaining as u64),
+        (X_RATELIMIT_RESET, reset),
+    ] {
+        if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 /// Identifies which rate-limit bucket a request falls into.
@@ -658,6 +749,17 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
         .allow_headers([
             HeaderName::from_static("content-type"),
             HeaderName::from_static("authorization"),
+        ])
+        /* Without this a browser client can see the 429 but not the headers
+        explaining it: the CORS spec hides every response header outside the
+        safelist unless it is named here, and `Retry-After` is not on that
+        safelist. Emitting a self-pacing contract the browser cannot read would
+        be the same as not emitting it (issue #327). */
+        .expose_headers([
+            header::RETRY_AFTER,
+            X_RATELIMIT_LIMIT,
+            X_RATELIMIT_REMAINING,
+            X_RATELIMIT_RESET,
         ])
 }
 
@@ -1013,5 +1115,75 @@ mod tests {
     fn plain_peer_with_no_headers_uses_peer_address() {
         let req = req_with(Some(PEER), &[]);
         assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), PEER);
+    }
+
+    // ── reset_and_retry_after (issue #327) ───────────────────────────────────
+    //
+    // These are where the "derived, not fabricated" claim is actually pinned.
+    // The integration tests cannot do it: every quota the service builds is a
+    // `Quota::per_second(n)`, under which one cell replenishes in `1/n` seconds,
+    // so the wait is always sub-second and `Retry-After` — an integer per
+    // RFC 9110 — rounds to `1` at every configured rate. The hard-coded `1` was
+    // numerically indistinguishable from the truth for every reachable
+    // configuration, which is precisely why it survived review.
+    //
+    // A slow quota is where the two diverge, so that is what these use. They
+    // also mean the derivation stays correct if the quota shape ever changes
+    // (a per-minute window, a burst allowance) without anyone remembering that
+    // a constant elsewhere encodes an assumption about it.
+
+    /// A ten-minute replenish interval: the derived answer is 600, a fabricated
+    /// one is 1.
+    #[test]
+    fn retry_after_follows_a_slow_quota_instead_of_a_constant() {
+        assert_eq!(retry_after_secs(Duration::from_secs(600)), 600);
+    }
+
+    #[test]
+    fn retry_after_rounds_up_rather_than_truncating() {
+        // 1.4s truncated to 1 would retry into another rejection.
+        assert_eq!(retry_after_secs(Duration::from_millis(1_400)), 2);
+    }
+
+    #[test]
+    fn retry_after_never_tells_a_client_to_retry_immediately() {
+        assert_eq!(retry_after_secs(Duration::ZERO), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
+    }
+
+    fn slow_quota(period: Duration, burst: u32) -> governor::Quota {
+        governor::Quota::with_period(period)
+            .unwrap()
+            .allow_burst(NonZeroU32::new(burst).unwrap())
+    }
+
+    #[test]
+    fn reset_is_zero_when_the_bucket_is_untouched() {
+        let quota = slow_quota(Duration::from_secs(60), 5);
+        assert_eq!(reset_secs(quota, 5, Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn reset_counts_every_missing_cell_not_just_the_next_one() {
+        // 3 of 5 cells spent, one minute each to replenish → 180s to full.
+        let quota = slow_quota(Duration::from_secs(60), 5);
+        assert_eq!(reset_secs(quota, 2, Duration::ZERO), 180);
+    }
+
+    #[test]
+    fn reset_on_a_drained_bucket_covers_the_whole_refill() {
+        // Empty, with the next cell 60s out: still 5 × 60s to full capacity.
+        let quota = slow_quota(Duration::from_secs(60), 5);
+        assert_eq!(reset_secs(quota, 0, Duration::from_secs(60)), 300);
+    }
+
+    /// `Reset` is time-to-full and `Retry-After` is time-to-one-cell, so the
+    /// former can never be the smaller of the two. A client that waited
+    /// `Reset` and still got throttled would have no way to make progress.
+    #[test]
+    fn reset_is_never_shorter_than_retry_after() {
+        let quota = slow_quota(Duration::from_secs(600), 1);
+        let wait = Duration::from_secs(600);
+        assert!(reset_secs(quota, 0, wait) >= retry_after_secs(wait));
     }
 }

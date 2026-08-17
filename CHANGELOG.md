@@ -7,28 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Added
 
-- **BREAKING: request bodies are now closed.** `POST /payments` and
-  `POST /merchants/:id/keys` reject any field they do not recognise with `400`
-  `unknown_field` instead of silently discarding it. Previously a body could
-  carry `merchant_id` — which `openapi.yaml` still advertised, though the
-  handler has always taken the merchant from the API key — and receive a `201`
-  describing an intent on a tenant the caller did not choose. The interaction
-  with `asset` was worse: it defaults to `XLM` when absent, so
-  `{"amount":"100","assset":"USDC"}` created a 100 XLM intent and reported
-  success. `merchant_id` has been removed from the OpenAPI request schema and
-  both schemas are now `additionalProperties: false`. Clients currently sending
-  extra fields will start receiving `400` (issue #329).
+- **`X-RateLimit-*` response headers.** Every response now carries
+  `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` for the
+  bucket it fell into, so a client can pace itself before being throttled
+  instead of discovering the limit by hitting it. All four rate-limit headers
+  (including `Retry-After`) are listed in `Access-Control-Expose-Headers` — the
+  CORS spec hides everything outside its safelist, and `Retry-After` is not on
+  it, so a browser client could previously see the `429` but none of the
+  headers explaining it. The bucket/quota model is now documented per route in
+  the README and in `openapi.yaml` (issue #327).
 
 ### Fixed
 
-- **Intent settlement pins the issuer.** `POST /payments` stored only the asset
-  code, so `verify()` accepted a Horizon payment from *any* allow-list issuer of
-  that code. Two `USDC` issuers could settle each other's intents. Duplicate
-  codes are now rejected at boot, each intent persists `asset_issuer`, and
-  settlement matches that issuer — not the allow-list union. Existing rows are
-  backfilled from `ACCEPTED_ASSETS` (issue #222).
+- **`Retry-After` is derived from the limiter instead of hard-coded.** Every
+  `429` returned `Retry-After: 1` regardless of configuration. `governor`
+  computes exactly this value — `check()` returns `Err(NotUntil<_>)`, whose
+  `wait_time_from` is the duration until the request would be permitted — and
+  the code discarded it. Under the current per-second quotas the derived answer
+  still rounds to `1`, since a cell replenishes in under a second and
+  `Retry-After` is an integer per RFC 9110; the value is now correct by
+  construction rather than by coincidence, so it stays right if the quota shape
+  changes (issue #327).
 
 - **Background-task supervisor.** A panic in the poller, stream listener,
   sweeper, retention worker, or webhook redrive used to end that task for the

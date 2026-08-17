@@ -21,6 +21,7 @@ A payment gateway API built on [Stellar](https://stellar.org) for accepting, ver
 - [Dashboard](#dashboard)
 - [Configuration](#configuration)
   - [Trustlines](#trustlines)
+- [Rate Limiting](#rate-limiting)
 - [API Reference](#api-reference)
   - [Versioning](#versioning)
   - [API Key Lifecycle](#post-merchantsidkeys)
@@ -370,6 +371,60 @@ until it finished; a backlog drains over several cycles instead.
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite pool size. WAL allows one writer plus many readers. | `10` |
 | `DB_BUSY_TIMEOUT_MS` | Lock-acquisition wait before erroring. Must be `> 0` under concurrent load. | `5000` |
+
+---
+
+## Rate Limiting
+
+Every request is assigned to a **bucket**, and each bucket is limited
+independently per client IP — so provisioning a merchant can never eat into a
+client's payment quota, or vice versa. The client IP is resolved per
+`TRUSTED_PROXY_CIDRS` above.
+
+| Bucket | Routes | Quota |
+|---|---|---|
+| `payments` | `POST /payments` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
+| `merchants` | `POST /merchants` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
+| `redeliver` | `POST /payments/:id/webhooks/:delivery_id/redeliver` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
+| `default` | everything else, including all `GET` routes and the probes | `RATE_LIMIT_REQUESTS_PER_SEC` × 5 |
+
+Write and sensitive routes get the base rate; read-only traffic gets a more
+generous allowance so ordinary polling is not throttled. Redelivery is bucketed
+by *shape*, not by path — the URL carries payment and delivery ids, and keying
+on those would let every id mint its own limiter entry, which is both an
+unbounded map and a trivially bypassed limit.
+
+### Response headers
+
+**Every** response carries the current state of its bucket, so a client can pace
+itself before being throttled rather than discovering the limit by hitting it:
+
+| Header | Meaning |
+|---|---|
+| `X-RateLimit-Limit` | The bucket's effective quota, i.e. the multiplier is already applied |
+| `X-RateLimit-Remaining` | Requests still available in this bucket right now |
+| `X-RateLimit-Reset` | Delta-seconds until the bucket is back to **full** capacity |
+
+A `429` additionally carries `Retry-After`, in delta-seconds, derived from the
+limiter's own state — `governor` knows exactly when the next request would be
+permitted, and this is that value rounded up with a floor of `1`. `Retry-After`
+is time until a **single** request is permitted; `X-RateLimit-Reset` is time
+until the bucket is full, so `Reset` is never the smaller of the two.
+
+`Reset` is a delta rather than an epoch timestamp so that a client with a skewed
+clock still gets a usable answer.
+
+All four headers are listed in `Access-Control-Expose-Headers`. The CORS spec
+hides every response header outside its safelist unless it is named there, and
+`Retry-After` is not on that safelist — a self-pacing contract a browser cannot
+read would be the same as no contract at all.
+
+> **Note on precision.** Quotas are per-second, so a single cell replenishes in
+> `1 / RATE_LIMIT_REQUESTS_PER_SEC` seconds — always under a second. Since
+> `Retry-After` is an integer number of seconds (RFC 9110), it currently reports
+> `1` at every configured rate. It is derived rather than hard-coded so that it
+> stays correct if the quota shape changes; for pacing *now*, use
+> `X-RateLimit-Remaining`.
 
 ---
 
