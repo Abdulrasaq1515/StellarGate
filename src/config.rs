@@ -1,4 +1,5 @@
 use anyhow::Result;
+use ipnet::IpNet;
 
 /// How the service detects incoming on-chain payments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +174,15 @@ pub struct Config {
     /// `408 Request Timeout`, so a slow client or a stuck handler can't tie up
     /// a connection indefinitely. Defaults to 30 seconds.
     pub request_timeout_secs: u64,
+    /// CIDR blocks whose `X-Forwarded-For` / `X-Real-IP` headers are honoured
+    /// for rate-limit bucketing and auth-log source attribution (issue #330).
+    ///
+    /// Forwarding headers are client-supplied, so they are trusted ONLY when
+    /// the socket peer is one of these proxies; every other peer is attributed
+    /// by its own address and its headers are ignored. Empty (the default)
+    /// means no proxy is trusted and the headers are always ignored — the
+    /// safe default for a directly-exposed gateway.
+    pub trusted_proxy_cidrs: Vec<IpNet>,
 }
 
 impl Config {
@@ -268,6 +278,9 @@ impl Config {
             webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
             admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
             request_timeout_secs: parse_env("REQUEST_TIMEOUT_SECS", 30)?,
+            trusted_proxy_cidrs: parse_cidrs(
+                &std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
+            )?,
         };
         config.validate_addresses()?;
         config.validate_timing()?;
@@ -476,12 +489,34 @@ impl std::fmt::Debug for Config {
             )
             .field("admin_provisioning_secret", &"***")
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .finish()
     }
 }
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Parse `TRUSTED_PROXY_CIDRS`: a comma-separated list of CIDR blocks (IPv4 or
+/// IPv6), e.g. `TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.1.0/24`. Empty/unset
+/// means no trusted proxies, in which case forwarding headers are ignored
+/// entirely (issue #330). A malformed entry aborts boot — a mistyped
+/// allow-list must not silently degrade into trusting headers it shouldn't.
+fn parse_cidrs(raw: &str) -> Result<Vec<IpNet>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|entry| {
+            entry.parse::<IpNet>().map_err(|e| {
+                anyhow::anyhow!(
+                    "TRUSTED_PROXY_CIDRS contains an invalid CIDR {entry:?}: {e}. \
+                     Expected comma-separated CIDR blocks, e.g. 10.0.0.0/8. \
+                     Fix or remove the bad entry."
+                )
+            })
+        })
+        .collect()
 }
 
 /// Parse an env var into `T`.
@@ -544,6 +579,7 @@ mod tests {
             webhook_allow_private_targets: false,
             admin_provisioning_secret: "admin-super-secret".into(),
             request_timeout_secs: 30,
+            trusted_proxy_cidrs: vec![],
         };
         let output = format!("{cfg:?}");
         assert!(
@@ -619,6 +655,7 @@ mod tests {
             webhook_allow_private_targets: false,
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
+            trusted_proxy_cidrs: vec![],
         }
     }
 
@@ -988,6 +1025,58 @@ mod tests {
         assert!(
             err.contains("streem"),
             "error should echo the bad value; got: {err}"
+        );
+    }
+
+    // ── TRUSTED_PROXY_CIDRS ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_cidrs_empty_defaults_to_no_trusted_proxies() {
+        assert_eq!(parse_cidrs("").unwrap(), vec![]);
+        assert_eq!(parse_cidrs("  , ").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn parse_cidrs_accepts_comma_separated_v4_and_v6_blocks() {
+        let nets = parse_cidrs("10.0.0.0/8, 192.168.1.0/24, 2001:db8::/32").unwrap();
+        assert_eq!(nets.len(), 3);
+        assert_eq!(nets[0], "10.0.0.0/8".parse::<IpNet>().unwrap());
+        assert_eq!(nets[1], "192.168.1.0/24".parse::<IpNet>().unwrap());
+        assert_eq!(nets[2], "2001:db8::/32".parse::<IpNet>().unwrap());
+    }
+
+    #[test]
+    fn parse_cidrs_rejects_a_malformed_entry() {
+        let err = parse_cidrs("10.0.0.0/8, not-a-cidr")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("TRUSTED_PROXY_CIDRS"),
+            "error should name the variable; got: {err}"
+        );
+        assert!(
+            err.contains("not-a-cidr"),
+            "error should echo the bad value; got: {err}"
+        );
+    }
+
+    #[test]
+    fn startup_fails_on_invalid_trusted_proxy_cidr() {
+        run_with_env(
+            &[
+                (
+                    "WEBHOOK_SECRET",
+                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
+                ),
+                ("TRUSTED_PROXY_CIDRS", Some("banana")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("TRUSTED_PROXY_CIDRS"),
+                    "boot should abort on a malformed CIDR; got: {err}"
+                );
+            },
         );
     }
 }

@@ -38,6 +38,25 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
+
+    /* Client-IP trust boundary (issue #330): make the effective strategy
+    visible at boot so an operator can confirm forwarding headers are honored
+    exactly where they intend — only from configured trusted proxies, never
+    from arbitrary callers. */
+    if cfg.trusted_proxy_cidrs.is_empty() {
+        info!(
+            "client IP strategy: no trusted proxies configured — \
+             X-Forwarded-For/X-Real-IP are ignored; the socket peer address is \
+             used for rate limiting and auth attribution"
+        );
+    } else {
+        info!(
+            trusted_proxies = ?cfg.trusted_proxy_cidrs,
+            "client IP strategy: forwarding headers are honored only from \
+             trusted proxies; all other peers are attributed by socket address"
+        );
+    }
+
     let pool = open_pool(&cfg).await?;
     db::migrate(&pool).await?;
 
