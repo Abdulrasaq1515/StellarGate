@@ -608,18 +608,36 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// Transition every watchable payment whose TTL has elapsed to `expired`,
-/// returning the rows that were swept so the caller can fire `payment.expired`
-/// webhooks. Each row is updated with a guard on a watchable status so a payment
-/// that settles concurrently is left untouched and not double-reported.
-pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
-    let overdue = sqlx::query(
-        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
-                webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-         FROM payments
-         WHERE status IN ('pending', 'underpaid')
-           AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
-         ORDER BY created_at ASC",
+/// Transition up to `batch` watchable payments whose TTL has elapsed to
+/// `expired`, returning the rows that were swept so the caller can fire
+/// `payment.expired` webhooks.
+///
+/// The whole batch is transitioned in a single `UPDATE … RETURNING` — one
+/// round-trip instead of one guarded `UPDATE` per intent (issue #323). The
+/// `WHERE … status IN ('pending','underpaid')` guard remains what makes a
+/// concurrent settlement win the race: the subquery and update run under one
+/// write lock, so a payment that settles in between is never selected here
+/// (if the settlement committed first) and a payment this statement sweeps is
+/// rejected by the settlement's own guard (issue #155) — never double-reported.
+/// `RETURNING` yields exactly the rows this statement actually transitioned.
+///
+/// `batch` bounds each statement, so a large backlog drains over several
+/// sweeps instead of one long write lock.
+pub async fn expire_overdue(pool: &Db, batch: i64) -> Result<Vec<Payment>> {
+    let rows = sqlx::query(
+        "UPDATE payments
+            SET status = 'expired',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE id IN (
+              SELECT id FROM payments
+               WHERE status IN ('pending', 'underpaid')
+                 AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
+               ORDER BY created_at ASC
+               LIMIT ?
+          )
+          RETURNING id, merchant_id, destination_address, memo, amount, asset,
+                    asset_issuer, status, webhook_url, tx_hash, paid_amount,
+                    created_at, updated_at, expires_at",
     )
     .bind(batch)
     .fetch_all(pool)
