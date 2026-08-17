@@ -587,6 +587,131 @@ async fn test_create_invalid_asset() {
     res.assert_contains_header("x-request-id");
 }
 
+// ── Unknown request-body fields (issue #329) ─────────────────────────────────
+
+/// `merchant_id` is the sharpest case: `openapi.yaml` advertised it, so an
+/// integrator following the spec sent it believing they were choosing the
+/// tenant. It must be rejected, not silently dropped in favour of whichever
+/// merchant owns the key.
+#[tokio::test]
+async fn test_create_payment_rejects_unknown_field() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "merchant_id": "someone-elses-shop" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body = res.json::<Value>();
+    assert_eq!(body["code"], "unknown_field");
+    assert!(
+        body["error"].as_str().unwrap().contains("merchant_id"),
+        "the error must name the offending field, got: {}",
+        body["error"]
+    );
+}
+
+/// The interaction that made silent discarding expensive rather than untidy:
+/// `asset` defaults to `XLM`, so one transposed character used to mint a
+/// 100 XLM intent and return `201` describing it.
+#[tokio::test]
+async fn test_create_payment_rejects_misspelled_asset() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "100", "assset": "USDC" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body = res.json::<Value>();
+    assert_eq!(
+        body["code"], "unknown_field",
+        "a misspelled `asset` must not silently fall back to the XLM default"
+    );
+    assert!(body["error"].as_str().unwrap().contains("assset"));
+}
+
+/// The correctly-spelled fields still work — `deny_unknown_fields` must not
+/// have narrowed the accepted body.
+#[tokio::test]
+async fn test_create_payment_accepts_every_documented_field() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({
+            "amount": "100",
+            "asset": "USDC",
+            "webhook_url": "https://example.com/hook",
+        }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    assert_eq!(res.json::<Value>()["asset"], "USDC");
+}
+
+#[tokio::test]
+async fn test_issue_key_rejects_unknown_field() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let merchant_id = res.json::<Value>()["merchant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .post(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "lable": "typo" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body = res.json::<Value>();
+    assert_eq!(body["code"], "unknown_field");
+    assert!(body["error"].as_str().unwrap().contains("lable"));
+}
+
+/// The body on this endpoint is genuinely optional, so omitting it must still
+/// issue a key. Rejecting unknown fields must not turn "no body" into an error.
+#[tokio::test]
+async fn test_issue_key_without_a_body_still_succeeds() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let merchant_id = res.json::<Value>()["merchant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .post(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    assert!(res.json::<Value>()["label"].is_null());
+}
+
+/// A wrong *type* on a known field is still `invalid_request` — the new code is
+/// specific to unrecognised field names, not a rename of the generic one.
+#[tokio::test]
+async fn test_wrong_type_on_known_field_is_still_invalid_request() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": 10 }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_request");
+}
+
 #[tokio::test]
 async fn test_create_invalid_amount() {
     let server = test_server().await;
