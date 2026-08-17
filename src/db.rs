@@ -879,13 +879,27 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
 /// A row with `attempts == 0` (left behind by a crash between insert and its
 /// first send, not a delivery failure) is exempt from this backoff and is
 /// gated by `grace_secs` alone.
+///
+/// `jitter_secs` adds a per-row random offset in `[0, jitter_secs]` on top of
+/// whichever window applies, and is what actually decorrelates a co-failing
+/// batch (issue #318). The exponential backoff alone does not: rows that failed
+/// together share an `attempts` value and a near-identical `last_attempt`, so
+/// `initial * 2^(attempts-1)` resolves to the same instant for every one of
+/// them, and this query — which computes eligibility in SQL from `last_attempt`
+/// — re-clusters the batch on every pass. `RANDOM()` is evaluated per row per
+/// statement, so each pass admits a different random subset and a batch that
+/// failed together spreads over several intervals instead of moving as one
+/// block. Pass `0` to disable.
 pub async fn list_redrivable_deliveries(
     pool: &Db,
     max_attempts: i64,
     grace_secs: i64,
     backoff_initial_secs: i64,
     backoff_max_secs: i64,
+    jitter_secs: i64,
 ) -> Result<Vec<WebhookDelivery>> {
+    /* `ABS(RANDOM()) % (n+1)` yields [0, n]. Guarded on `jitter_secs > 0`:
+    `% 1` is a constant 0, and a zero modulus is a runtime error in SQLite. */
     let rows = sqlx::query(
         "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
          FROM webhook_deliveries
@@ -895,6 +909,7 @@ pub async fn list_redrivable_deliveries(
                  CASE WHEN attempts = 0 THEN ?
                       ELSE MAX(?, MIN(? * (1 << MIN(attempts - 1, 32)), ?))
                  END
+                 + CASE WHEN ? > 0 THEN ABS(RANDOM()) % (? + 1) ELSE 0 END
                ) || ' seconds') <= datetime('now')
          ORDER BY created_at ASC",
     )
@@ -903,6 +918,8 @@ pub async fn list_redrivable_deliveries(
     .bind(grace_secs)
     .bind(backoff_initial_secs)
     .bind(backoff_max_secs)
+    .bind(jitter_secs)
+    .bind(jitter_secs)
     .fetch_all(pool)
     .await?;
 
@@ -1611,7 +1628,9 @@ mod tests {
         .await
         .unwrap();
 
-        let candidates = list_redrivable_deliveries(&pool, 8, 0, 0, 0).await.unwrap();
+        let candidates = list_redrivable_deliveries(&pool, 8, 0, 0, 0, 0)
+            .await
+            .unwrap();
         let ids: Vec<&str> = candidates.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1695,18 +1714,92 @@ mod tests {
             .unwrap();
 
         // Freshly inserted, so a large grace window makes it ineligible...
-        assert!(list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
+        assert!(list_redrivable_deliveries(&pool, 8, 3600, 0, 0, 0)
             .await
             .unwrap()
             .is_empty());
         // ...while a zero grace window makes it immediately eligible.
         assert_eq!(
-            list_redrivable_deliveries(&pool, 8, 0, 0, 0)
+            list_redrivable_deliveries(&pool, 8, 0, 0, 0, 0)
                 .await
                 .unwrap()
                 .len(),
             1
         );
+    }
+
+    /// The redrive half of issue #318.
+    ///
+    /// Exponential backoff does not desynchronise a batch that failed
+    /// together: those rows share an `attempts` value and a near-identical
+    /// `last_attempt`, so their next-attempt times coincide and this query
+    /// hands the worker the whole cluster on one pass — which is precisely the
+    /// stampede the backoff was supposed to prevent.
+    ///
+    /// With jitter, each pass admits a random subset instead. 200 co-failing
+    /// rows and a 100-second window: the chance of all 200 clearing a random
+    /// `[0,100]` offset at once is nil, so a full batch means jitter is not
+    /// being applied.
+    #[tokio::test]
+    async fn jitter_desynchronises_a_batch_that_failed_together() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOJIT", 3600))
+            .await
+            .unwrap();
+
+        // 200 deliveries, all created and failed at the same instant.
+        for i in 0..200 {
+            let id = format!("sync-{i}");
+            save_webhook_delivery(&pool, &id, "p1", "http://x", "{}", "payment.completed")
+                .await
+                .unwrap();
+        }
+
+        // No jitter: every row clears the zero grace window, so the worker
+        // takes the entire cluster in one pass — the behaviour being fixed.
+        let unjittered = list_redrivable_deliveries(&pool, 8, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            unjittered.len(),
+            200,
+            "without jitter a co-failing batch moves as one block"
+        );
+
+        // With jitter, each row waits a random extra [0, 100] seconds.
+        let jittered = list_redrivable_deliveries(&pool, 8, 0, 0, 0, 100)
+            .await
+            .unwrap();
+        assert!(
+            jittered.len() < 200,
+            "jitter must spread the batch across passes, but all {} rows were \
+             returned at once",
+            jittered.len()
+        );
+    }
+
+    /// Jitter must only ever *delay* a row, never pull it forward past the
+    /// grace window that keeps the worker off a live `dispatch()`.
+    #[tokio::test]
+    async fn jitter_never_shortens_the_grace_window() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOJI2", 3600))
+            .await
+            .unwrap();
+        save_webhook_delivery(&pool, "fresh", "p1", "http://x", "{}", "payment.completed")
+            .await
+            .unwrap();
+
+        for _ in 0..50 {
+            assert!(
+                list_redrivable_deliveries(&pool, 8, 3600, 0, 0, 300)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a row inside its grace window must stay ineligible regardless \
+                 of the jitter draw"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1729,7 +1822,7 @@ mod tests {
         // attempts == 0 (never sent) is gated by grace_secs alone, not the
         // exponential backoff, even with a huge backoff floor configured.
         assert_eq!(
-            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600)
+            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600, 0)
                 .await
                 .unwrap()
                 .len(),
@@ -1753,7 +1846,7 @@ mod tests {
         // One failed attempt (attempts=1): backoff = initial * 2^0 = initial.
         // A huge initial delay makes it ineligible even with grace_secs=0.
         assert!(
-            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600)
+            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600, 0)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1762,7 +1855,7 @@ mod tests {
         // grace_secs is a floor under the backoff: even with backoff disabled
         // (initial=max=0), a large grace_secs still holds the row back.
         assert!(
-            list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
+            list_redrivable_deliveries(&pool, 8, 3600, 0, 0, 0)
                 .await
                 .unwrap()
                 .is_empty(),

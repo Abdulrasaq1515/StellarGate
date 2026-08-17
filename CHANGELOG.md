@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Inline webhook retries back off and jitter.** `dispatch()` slept a constant
+  `WEBHOOK_RETRY_DELAY_MS` between attempts, so every delivery that failed at
+  the same moment — which is what happens when a receiver goes down — retried in
+  lockstep and hit it again at exactly the same instants as it tried to come
+  back up. With the defaults, a receiver returning `503` for two minutes saw
+  three attempts per delivery at `t`, `t+5s`, `t+10s`; across a settlement burst
+  of N payments that is `3N` requests in three tight clusters. The delay is now
+  exponential (`base × 2^(attempt−1)`, capped by the new
+  `WEBHOOK_RETRY_MAX_DELAY_MS`) and jittered.
+
+  Jitter is applied to the **redrive** worker too, via the new
+  `WEBHOOK_REDRIVE_JITTER_SECS`. Exponential backoff alone does not
+  desynchronise anything: rows that failed together share an `attempts` value
+  and a near-identical `last_attempt`, so their next attempts coincide and the
+  worker re-clustered them on every pass.
+
+  The jitter is *equal* (`[ceiling/2, ceiling]`) rather than full
+  (`[0, ceiling]`), because full jitter can return a near-zero delay and this
+  service already rejects `WEBHOOK_RETRY_DELAY_MS=0` at boot for causing exactly
+  the retry bursts being avoided (issue #318).
+- **`WEBHOOK_REDRIVE_GRACE_SECS` is validated against the retry schedule.** The
+  grace window has to clear the worst-case inline delivery time or the redrive
+  worker can pick up a row whose `dispatch()` is still running and send it
+  twice. Making the inline delay exponential changed that arithmetic, so the
+  bound is now computed from the actual schedule and a too-short window is
+  rejected at boot instead of discovered in production (issues #238, #318).
+
 ### Added
 
 - **`X-RateLimit-*` response headers.** Every response now carries

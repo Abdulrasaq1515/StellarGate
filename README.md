@@ -321,9 +321,39 @@ a single writer.
 | `WEBHOOK_SECRET` | HMAC-SHA256 signing secret. Must be **≥ 32 characters**; known placeholder values are rejected at boot. | — |
 | `ALLOWED_WEBHOOK_SCHEMES` | Comma-separated URL schemes accepted for `webhook_url`. HTTPS is enforced on `public` regardless of this value. | `https` |
 | `WEBHOOK_RETRY_ATTEMPTS` | Inline delivery attempts | `3` |
-| `WEBHOOK_RETRY_DELAY_MS` | Delay between inline retries | `5000` |
+| `WEBHOOK_RETRY_DELAY_MS` | **Base** delay between inline retries — the first step of an exponential, jittered schedule, not a fixed interval | `5000` |
+| `WEBHOOK_RETRY_MAX_DELAY_MS` | Ceiling on one inline retry delay. Must be `≥` `WEBHOOK_RETRY_DELAY_MS`. | `60000` |
 | `WEBHOOK_TIMEOUT_SECS` | Per-attempt timeout; each retry is bounded independently | `10` |
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` | Bypasses the SSRF private-range check. **Development and tests only.** | `false` |
+
+#### Retry schedule
+
+Inline retries back off exponentially and are jittered. Both halves matter, and
+for different reasons.
+
+**Backoff**, because a constant delay meant a receiver returning `503` for two
+minutes produced — per delivery — three attempts at `t`, `t+5s`, `t+10s`. Across
+a settlement burst of N payments that is `3N` requests arriving in three tight
+clusters, precisely when the receiver is least able to absorb them.
+
+**Jitter**, because backoff alone desynchronises nothing. Deliveries that failed
+together share an attempt number, so a purely exponential schedule puts their
+next attempts at the same instant — the same lockstep, just spaced further
+apart.
+
+The delay before retry *n* is drawn uniformly from
+`[ceiling/2, ceiling]` where `ceiling = min(WEBHOOK_RETRY_DELAY_MS × 2^(n−1),
+WEBHOOK_RETRY_MAX_DELAY_MS)`. That is **equal** jitter rather than the more
+common full jitter over `[0, ceiling]`: full jitter can return a near-zero
+delay, and this service already rejects `WEBHOOK_RETRY_DELAY_MS=0` at boot
+because a zero delay causes exactly the retry bursts being avoided here. Equal
+jitter keeps a guaranteed floor under every retry while still spreading a
+co-failing batch across half the window.
+
+`WEBHOOK_REDRIVE_GRACE_SECS` is validated at boot against this schedule, so a
+grace window too short to clear the worst-case inline delivery — which would let
+the redrive worker send a delivery whose inline dispatch is still running — is
+rejected rather than discovered in production.
 
 ### Webhook Redrive Worker
 
@@ -337,6 +367,15 @@ Recovers deliveries left `pending`/`failed` by a process that exited mid-send or
 | `WEBHOOK_REDRIVE_GRACE_SECS` | Idle time required before the worker touches a row, so it never races an in-flight inline delivery. Also the floor under the backoff. | `60` |
 | `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Exponential backoff base: `initial × 2^(attempts−1)`. A row never attempted is exempt and gated only by the grace window. `0` disables growth. | `30` |
 | `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Backoff ceiling. Must be `≥` the initial value. | `900` |
+| `WEBHOOK_REDRIVE_JITTER_SECS` | Random extra delay (0–N seconds, drawn per row) on top of the window above. `0` disables. | `30` |
+
+The jitter is what actually decorrelates a batch. Rows that failed together
+share an `attempts` value and a near-identical `last_attempt`, so
+`initial × 2^(attempts−1)` resolves to the same instant for all of them and the
+worker — which computes eligibility in SQL — would hand itself the whole cluster
+on every pass. The offset is drawn per row per statement, so each pass admits a
+different random subset and the batch spreads over several intervals. It only
+ever delays a row, never pulls one forward past the grace window.
 
 ### Retention
 
