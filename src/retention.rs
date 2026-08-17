@@ -150,6 +150,7 @@ mod tests {
             webhook_allow_private_targets: false,
             admin_provisioning_secret: "admin".into(),
             request_timeout_secs: 30,
+            trusted_proxy_cidrs: vec![],
         }
     }
 

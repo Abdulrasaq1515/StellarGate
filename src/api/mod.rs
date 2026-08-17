@@ -8,9 +8,10 @@ use axum::{
     routing::{get, post},
     Json,
 };
+use ipnet::IpNet;
 use moka::sync::Cache;
 use serde_json::{json, Value};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +44,12 @@ const RATE_LIMITER_IDLE_TTL: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 struct RateLimitState {
     requests_per_sec: u32,
+    /// Trusted proxies from `TRUSTED_PROXY_CIDRS`. Forwarding headers
+    /// (`X-Forwarded-For` / `X-Real-IP`) are honoured only when the socket
+    /// peer is one of these; every other peer is bucketed by its own address
+    /// and its headers are ignored (issue #330). Empty means no proxy is
+    /// trusted and the headers are always ignored.
+    trusted_proxies: Vec<IpNet>,
     /// Bounded, TTL-evicting cache of per-(bucket, IP) rate limiters.
     ///
     /// Replaces the previous `Mutex<HashMap<...>>`:
@@ -56,13 +63,14 @@ struct RateLimitState {
 }
 
 impl RateLimitState {
-    fn new(requests_per_sec: u32) -> Self {
+    fn new(requests_per_sec: u32, trusted_proxies: Vec<IpNet>) -> Self {
         let limiters = Cache::builder()
             .max_capacity(RATE_LIMITER_MAX_KEYS)
             .time_to_idle(RATE_LIMITER_IDLE_TTL)
             .build();
         Self {
             requests_per_sec: requests_per_sec.max(1),
+            trusted_proxies,
             limiters,
         }
     }
@@ -70,7 +78,10 @@ impl RateLimitState {
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
-    let rate_limit = RateLimitState::new(state.config.rate_limit_requests_per_sec);
+    let rate_limit = RateLimitState::new(
+        state.config.rate_limit_requests_per_sec,
+        state.config.trusted_proxy_cidrs.clone(),
+    );
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
     axum::Router::new()
@@ -191,7 +202,7 @@ async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> axum::response::Response {
-    let source_ip = client_ip_key(&req);
+    let source_ip = client_ip_key(&req, &state.config.trusted_proxy_cidrs);
 
     let raw_key = req
         .headers()
@@ -434,7 +445,7 @@ async fn rate_limit_middleware(
     next: Next,
 ) -> axum::response::Response {
     if let Some(bucket) = rate_limited_bucket(&req) {
-        let key = rate_limit_key(bucket, &req);
+        let key = rate_limit_key(bucket, &req, &rate_limit.trusted_proxies);
         let base_rps = rate_limit.requests_per_sec;
         let effective_rps = base_rps
             .saturating_mul(bucket_rate_multiplier(bucket))
@@ -507,24 +518,96 @@ fn bucket_rate_multiplier(bucket: &str) -> u32 {
 /// Keyed by bucket + client so each bucket is rate-limited independently —
 /// provisioning a merchant should never eat into a client's payment quota (or
 /// vice versa).
-fn rate_limit_key(bucket: &str, req: &Request) -> String {
-    format!("{bucket}:{}", client_ip_key(req))
+fn rate_limit_key(bucket: &str, req: &Request, trusted_proxies: &[IpNet]) -> String {
+    format!("{bucket}:{}", client_ip_key(req, trusted_proxies))
 }
 
-fn client_ip_key(req: &Request) -> String {
-    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return addr.ip().to_string();
+/// Client key used when a request carries no peer address at all (the router
+/// is served without `into_make_service_with_connect_info`). Fail-closed:
+/// every such request shares this one key rather than trusting client-supplied
+/// forwarding headers (issue #330).
+const CLIENT_IP_UNKNOWN: &str = "unknown";
+
+/// Resolve the client IP used for rate-limit bucketing and auth-log source
+/// attribution.
+///
+/// `X-Forwarded-For` and `X-Real-IP` are client-supplied, so they are honoured
+/// ONLY when the socket peer is a configured trusted proxy
+/// (`TRUSTED_PROXY_CIDRS`). In every other case the peer's own address is used
+/// and the headers are ignored entirely:
+///
+/// - Untrusted peer (or no trusted proxies configured): the peer address wins,
+///   so a caller cannot rotate a header per request to evade rate limiting or
+///   poison the auth logs.
+/// - Trusted peer: the rightmost `X-Forwarded-For` hop that is not itself a
+///   trusted proxy is taken as the client, falling back to `X-Real-IP` and
+///   then the peer address. This preserves per-client attribution behind a
+///   reverse proxy without letting the proxy chain be forged.
+/// - No peer address available: fail closed to a single shared key
+///   ([`CLIENT_IP_UNKNOWN`]) with a one-time warning, regardless of headers.
+fn client_ip_key(req: &Request, trusted_proxies: &[IpNet]) -> String {
+    let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() else {
+        warn_missing_connect_info_once();
+        return CLIENT_IP_UNKNOWN.to_string();
+    };
+
+    let peer_ip = addr.ip();
+
+    // Untrusted peer: the forwarding headers are ignored entirely.
+    if !trusted_proxies.iter().any(|net| net.contains(&peer_ip)) {
+        return peer_ip.to_string();
     }
 
-    for name in ["x-forwarded-for", "x-real-ip"] {
-        if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
-            if let Some(first) = value.split(',').map(str::trim).find(|s| !s.is_empty()) {
-                return first.to_string();
+    // Trusted peer: walk X-Forwarded-For from the rightmost hop, skipping hops
+    // that are themselves trusted proxies, and take the first remaining value.
+    if let Some(value) = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
+        for hop in value.split(',').map(str::trim).rev() {
+            if hop.is_empty() {
+                continue;
+            }
+            match hop.parse::<IpAddr>() {
+                // A hop that is itself a trusted proxy was added by a proxy we
+                // trust — keep walking left toward the real client.
+                Ok(ip) if trusted_proxies.iter().any(|net| net.contains(&ip)) => continue,
+                // First hop that is not a trusted proxy: this is the client.
+                Ok(ip) => return ip.to_string(),
+                // Unparseable value: cannot be a trusted proxy, so treat it as
+                // the client rather than guessing.
+                Err(_) => return hop.to_string(),
             }
         }
     }
 
-    "local".to_string()
+    // No X-Forwarded-For, or every hop was a trusted proxy: fall back to the
+    // single-value X-Real-IP header, also gated on the trusted peer.
+    if let Some(value) = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        if let Ok(ip) = value.trim().parse::<IpAddr>() {
+            if !trusted_proxies.iter().any(|net| net.contains(&ip)) {
+                return ip.to_string();
+            }
+        }
+    }
+
+    peer_ip.to_string()
+}
+
+/// Warn once (per process) when a request has no peer address, i.e. the router
+/// is being served without `into_make_service_with_connect_info`. From then on
+/// every such request shares a single fail-closed client key, so an operator
+/// embedding the router sees exactly one warning instead of one per request.
+fn warn_missing_connect_info_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "no ConnectInfo peer address on request: forwarding headers are ignored and all \
+             such requests share one client key. Serve the router with \
+             into_make_service_with_connect_info to restore per-client attribution."
+        );
+    });
 }
 
 fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
@@ -765,5 +848,99 @@ mod tests {
         let server = TestServer::new(timeout_test_router(Duration::from_millis(200))).unwrap();
         let response = server.get("/fast").await;
         response.assert_status_ok();
+    }
+
+    // ── client_ip_key (issue #330) ───────────────────────────────────────────
+
+    /// Build a bare request with an optional peer IP and headers, the inputs
+    /// `client_ip_key` actually reads (extensions + headers).
+    fn req_with(peer: Option<&str>, headers: &[(&str, &str)]) -> Request<axum::body::Body> {
+        let mut req = Request::builder().body(axum::body::Body::empty()).unwrap();
+        if let Some(ip) = peer {
+            let addr = SocketAddr::new(ip.parse().unwrap(), 0);
+            req.extensions_mut().insert(ConnectInfo(addr));
+        }
+        for (name, value) in headers {
+            req.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        req
+    }
+
+    fn cidrs(list: &[&str]) -> Vec<IpNet> {
+        list.iter().map(|c| c.parse().unwrap()).collect()
+    }
+
+    /// TEST-NET-3 (RFC 5737) — documentation IPs, safe to use as fake clients.
+    const PEER: &str = "203.0.113.9";
+    const FAKE_CLIENT: &str = "198.51.100.7";
+
+    #[test]
+    fn untrusted_peer_ignores_spoofed_forwarding_headers() {
+        let req = req_with(
+            Some(PEER),
+            &[
+                ("x-forwarded-for", FAKE_CLIENT),
+                ("x-real-ip", "198.51.100.8"),
+            ],
+        );
+        assert_eq!(
+            client_ip_key(&req, &cidrs(&["10.0.0.0/8"])),
+            PEER,
+            "an untrusted peer must be attributed by its own address"
+        );
+    }
+
+    #[test]
+    fn headers_ignored_when_no_trusted_proxies_configured() {
+        // The acceptance criterion: with TRUSTED_PROXY_CIDRS unset, forwarding
+        // headers are ignored regardless of ConnectInfo.
+        let req = req_with(Some(PEER), &[("x-forwarded-for", FAKE_CLIENT)]);
+        assert_eq!(client_ip_key(&req, &[]), PEER);
+    }
+
+    #[test]
+    fn trusted_proxy_chain_takes_rightmost_non_trusted_hop() {
+        // Peer is a trusted proxy; the chain was appended by trusted proxies
+        // (rightmost first), so the leftmost client survives.
+        let req = req_with(
+            Some("10.0.0.1"),
+            &[("x-forwarded-for", "198.51.100.7, 10.0.0.5, 10.0.0.1")],
+        );
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), FAKE_CLIENT);
+    }
+
+    #[test]
+    fn trusted_proxy_chain_of_only_trusted_hops_falls_back_to_peer() {
+        let req = req_with(
+            Some("10.0.0.1"),
+            &[("x-forwarded-for", "10.0.0.9, 10.0.0.1")],
+        );
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), "10.0.0.1");
+    }
+
+    #[test]
+    fn trusted_proxy_honors_x_real_ip_when_no_forwarded_for() {
+        let req = req_with(Some("10.0.0.1"), &[("x-real-ip", FAKE_CLIENT)]);
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), FAKE_CLIENT);
+    }
+
+    #[test]
+    fn missing_connect_info_fails_closed_to_shared_key() {
+        // Router served without connect info: headers must never be trusted,
+        // and every request shares one key rather than minting per-header ones.
+        let req = req_with(None, &[("x-forwarded-for", FAKE_CLIENT)]);
+        assert_eq!(
+            client_ip_key(&req, &cidrs(&["10.0.0.0/8"])),
+            CLIENT_IP_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn plain_peer_with_no_headers_uses_peer_address() {
+        let req = req_with(Some(PEER), &[]);
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), PEER);
     }
 }
