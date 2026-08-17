@@ -412,6 +412,12 @@ pub async fn get_payment(pool: &Db, id: &str) -> Result<Option<Payment>> {
     Ok(row.as_ref().map(row_to_payment))
 }
 
+/// Offset variant of `list_payments_keyset`. Rows are ordered by
+/// `(created_at DESC, id DESC)` — exactly the keyset ordering — so a
+/// `next_cursor` minted from this page resumes in cursor mode without
+/// skipping or repeating rows. `created_at` is whole-second, so ties are
+/// common; leaving their order to SQLite lets offset pages repeat or skip
+/// rows and would make the migration cursor diverge from the keyset scan.
 pub async fn list_payments(
     pool: &Db,
     merchant_id: &str,
@@ -423,7 +429,7 @@ pub async fn list_payments(
         let rows = sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+             FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
         .bind(merchant_id)
         .bind(s)
@@ -445,7 +451,7 @@ pub async fn list_payments(
         let rows = sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE merchant_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+             FROM payments WHERE merchant_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
         .bind(merchant_id)
         .bind(limit)

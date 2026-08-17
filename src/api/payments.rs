@@ -411,8 +411,18 @@ pub async fn list(
         )
         .await?;
 
-        // Provide next_cursor to ease migration to keyset pagination.
-        let next_cursor = payments.last().map(|p| encode_cursor(&p.created_at, &p.id));
+        // A migration affordance, not a second pagination model: the caller
+        // may take this cursor as the *first* cursor and then stay in pure
+        // cursor mode from the next request on. `list_payments` orders by
+        // (created_at DESC, id DESC), identical to the keyset query, so the
+        // cursor resumes at the row after this page and never re-reads the
+        // whole-second tie group that ends it. A short page returns null,
+        // mirroring cursor mode.
+        let next_cursor = if payments.len() == limit as usize {
+            payments.last().map(|p| encode_cursor(&p.created_at, &p.id))
+        } else {
+            None
+        };
 
         Ok(Json(json!({
             "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
