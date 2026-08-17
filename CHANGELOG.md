@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`X-RateLimit-*` response headers.** Every response now carries
+  `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` for the
+  bucket it fell into, so a client can pace itself before being throttled
+  instead of discovering the limit by hitting it. All four rate-limit headers
+  (including `Retry-After`) are listed in `Access-Control-Expose-Headers` — the
+  CORS spec hides everything outside its safelist, and `Retry-After` is not on
+  it, so a browser client could previously see the `429` but none of the
+  headers explaining it. The bucket/quota model is now documented per route in
+  the README and in `openapi.yaml` (issue #327).
+
 ### Fixed
+
+- **`Retry-After` is derived from the limiter instead of hard-coded.** Every
+  `429` returned `Retry-After: 1` regardless of configuration. `governor`
+  computes exactly this value — `check()` returns `Err(NotUntil<_>)`, whose
+  `wait_time_from` is the duration until the request would be permitted — and
+  the code discarded it. Under the current per-second quotas the derived answer
+  still rounds to `1`, since a cell replenishes in under a second and
+  `Retry-After` is an integer per RFC 9110; the value is now correct by
+  construction rather than by coincidence, so it stays right if the quota shape
+  changes (issue #327).
 
 - **Background-task supervisor.** A panic in the poller, stream listener,
   sweeper, retention worker, or webhook redrive used to end that task for the
