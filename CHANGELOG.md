@@ -64,6 +64,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removing four near-identical spawn blocks and a macro that existed only to
   work around the same repetition. Behaviour unchanged.
 - README rewritten against the actual API surface.
+- **TLS switched from native-tls to rustls.** Both `sqlx` and `reqwest` now
+  use `rustls`-based feature flags, eliminating the system OpenSSL runtime
+  dependency and simplifying static/musl builds.
+- **Listener mode validation tightened.** An invalid `STELLAR_LISTENER_MODE`
+  value now fails fast at boot with a clear error instead of defaulting
+  silently to `stream`.
+- **Placeholder secrets rejected at boot.** Known placeholder values from
+  `.env.example` (e.g., `default-secret`, `your_webhook_signing_secret`) are
+  now detected and rejected during startup with a clear error to prevent
+  accidental production use of weak credentials.
 
 ### Security
 
