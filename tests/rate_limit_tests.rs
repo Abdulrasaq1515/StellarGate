@@ -38,6 +38,7 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
+        cursor_staleness_multiple: 3,
         payment_ttl_secs: 3600,
         rate_limit_requests_per_sec,
         db_pool_max_connections: 10,

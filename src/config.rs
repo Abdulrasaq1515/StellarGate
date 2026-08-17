@@ -142,6 +142,13 @@ pub struct Config {
     /// pruning.
     pub idempotency_retention_days: i64,
     pub poll_interval_secs: u64,
+    /// How many `POLL_INTERVAL_SECS` may elapse without a successful Horizon
+    /// poll (or stream event) before `/ready` reports the payment-detection
+    /// cursor as stale and returns `503`. A healthy poller cycles on the poll
+    /// interval, so the default of 3 tolerates a couple of missed cycles
+    /// (transient Horizon errors) while still catching a permanently dead
+    /// poller or a wedged stream (issue #315).
+    pub cursor_staleness_multiple: u32,
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
     pub payment_ttl_secs: u64,
@@ -257,6 +264,7 @@ impl Config {
             webhook_delivery_retention_days: parse_env("WEBHOOK_DELIVERY_RETENTION_DAYS", 30)?,
             idempotency_retention_days: parse_env("IDEMPOTENCY_RETENTION_DAYS", 7)?,
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
+            cursor_staleness_multiple: parse_env("CURSOR_STALENESS_MULTIPLE", 3)?,
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
             db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10)?,
@@ -326,6 +334,14 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "POLL_INTERVAL_SECS must be > 0 (got 0). \
                  A zero interval creates a tight polling loop at 100% CPU."
+            ));
+        }
+
+        if self.cursor_staleness_multiple == 0 {
+            return Err(anyhow::anyhow!(
+                "CURSOR_STALENESS_MULTIPLE must be > 0 (got 0). \
+                 A zero window would make /ready report a stale cursor the \
+                 moment the poller finishes a cycle."
             ));
         }
 
@@ -461,6 +477,7 @@ impl std::fmt::Debug for Config {
                 &self.webhook_redrive_backoff_max_secs,
             )
             .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("cursor_staleness_multiple", &self.cursor_staleness_multiple)
             .field("payment_ttl_secs", &self.payment_ttl_secs)
             .field(
                 "rate_limit_requests_per_sec",
@@ -535,6 +552,7 @@ mod tests {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
             db_pool_max_connections: 10,
@@ -610,6 +628,7 @@ mod tests {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
             db_pool_max_connections: 10,
@@ -849,6 +868,14 @@ mod tests {
     }
 
     #[test]
+    fn timing_rejects_zero_cursor_staleness_multiple() {
+        let mut cfg = timing_config();
+        cfg.cursor_staleness_multiple = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("CURSOR_STALENESS_MULTIPLE"), "got: {err}");
+    }
+
+    #[test]
     fn timing_rejects_zero_poll_interval() {
         let mut cfg = timing_config();
         cfg.poll_interval_secs = 0;
@@ -988,6 +1015,51 @@ mod tests {
         assert!(
             err.contains("streem"),
             "error should echo the bad value; got: {err}"
+        );
+    }
+
+    // ── CURSOR_STALENESS_MULTIPLE ────────────────────────────────────────────
+
+    /// Every `run_with_env` closure below must set a valid WEBHOOK_SECRET (and
+    /// anything else `from_env` hard-requires), otherwise the panic inside the
+    /// closure poisons the shared env-test mutex and every subsequent
+    /// `run_with_env` test fails at the lock.
+    const ENV_WEBHOOK_SECRET: &str = "a-very-long-and-secure-webhook-signing-secret-32-chars";
+
+    #[test]
+    fn cursor_staleness_multiple_defaults_to_three() {
+        run_with_env(&[("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET))], || {
+            assert_eq!(Config::from_env().unwrap().cursor_staleness_multiple, 3);
+        });
+    }
+
+    #[test]
+    fn cursor_staleness_multiple_parses_from_env() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("CURSOR_STALENESS_MULTIPLE", Some("7")),
+            ],
+            || {
+                assert_eq!(Config::from_env().unwrap().cursor_staleness_multiple, 7);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_staleness_multiple_rejects_non_numeric_value() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("CURSOR_STALENESS_MULTIPLE", Some("soon")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("CURSOR_STALENESS_MULTIPLE"),
+                    "boot should abort on a non-numeric value; got: {err}"
+                );
+            },
         );
     }
 }

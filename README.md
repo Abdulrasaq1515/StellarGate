@@ -305,6 +305,7 @@ XLM free to cover one per asset.
 |---|---|---|
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
+| `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
 
 ### Webhooks
@@ -727,19 +728,23 @@ Manually re-send a delivery. The stored payload and event type are replayed verb
 
 ### `GET /health`
 
-Liveness probe. Returns `200 OK` while the process is running.
+Liveness probe — cheap, and fails only on conditions a restart would fix. Returns `200 OK` while the process is running **and** every expected background task (poller, stream, sweeper, retention, redrive) is running. A task that died — a panic, or a poller that exited at startup — returns `503` naming the dead task, so a process whose payment detection is gone never looks healthy forever. The poller and stream are only "expected" once a gateway wallet is configured; without one they idle by design.
 
 ```json
 { "status": "ok" }
 ```
 
+```json
+{ "status": "unavailable", "reason": "background task(s) not running: poller" }
+```
+
 ### `GET /ready`
 
-Readiness probe. Runs `SELECT 1` against the database.
+Readiness probe. Runs `SELECT 1` against the database, probes Horizon (3 s timeout), and — once a gateway is configured — requires the payment-detection cursor to have advanced recently. The cursor is fresh when a successful poll or stream event landed within `POLL_INTERVAL_SECS × CURSOR_STALENESS_MULTIPLE`; a dead poller with a reachable Horizon is therefore `503`, not green.
 
 ```
 200 OK          — { "status": "ok" }
-503 Unavailable — { "status": "unavailable" }
+503 Unavailable — { "status": "unavailable", "reason": "database unreachable | Horizon unreachable: … | payment detection stalled: …" }
 ```
 
 ### `GET /metrics`

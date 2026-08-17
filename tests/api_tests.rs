@@ -10,6 +10,8 @@ use stellargate::{
     db, AppState,
 };
 use time::format_description::well_known::Rfc3339;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_config() -> Config {
     Config {
@@ -37,6 +39,7 @@ fn make_config() -> Config {
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
+        cursor_staleness_multiple: 3,
         payment_ttl_secs: 3600,
         /* High enough that these tests never trip the limiter; dedicated
         rate-limit coverage lives in tests/rate_limit_tests.rs. */
@@ -59,6 +62,16 @@ async fn test_server_with_pool() -> (TestServer, db::Db) {
 }
 
 async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
+    server_with_config_and_health(cfg, stellargate::TaskHealth::new()).await
+}
+
+/// Like [`server_with_config`], but with an explicitly-provided [`TaskHealth`]
+/// so tests can simulate a dead background task or a stale detection cursor
+/// (issue #315).
+async fn server_with_config_and_health(
+    cfg: Config,
+    task_health: stellargate::TaskHealth,
+) -> (TestServer, db::Db) {
     let pool = SqlitePoolOptions::new()
         .connect_with(
             SqliteConnectOptions::from_str(&cfg.database_url)
@@ -76,7 +89,7 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
-        task_health: stellargate::TaskHealth::new(),
+        task_health,
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
     let server = TestServer::new(router).unwrap();
@@ -138,6 +151,95 @@ async fn test_ready_ok_with_live_db() {
     let res = test_server().await.get("/ready").await;
     res.assert_status_ok();
     assert_eq!(res.json::<serde_json::Value>()["status"], "ok");
+}
+
+/// A gateway that is configured enough for the readiness probe to run its
+/// on-chain checks (a valid strkey; validation happens only in `from_env`).
+const CONFIGURED_GATEWAY: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+#[tokio::test]
+async fn test_health_ok_when_required_task_running() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.task_started("poller");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let res = server.get("/health").await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>()["status"], "ok");
+}
+
+/// A required background task that stopped (a poller that died at startup)
+/// must make /health fail — a process whose payment detection is dead must
+/// not look healthy forever (issue #315).
+#[tokio::test]
+async fn test_health_fails_when_required_task_stopped() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.task_started("poller");
+    health.task_stopped("poller");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let res = server.get("/health").await;
+    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.json::<Value>()["status"], "unavailable");
+    assert!(res.json::<Value>()["reason"]
+        .as_str()
+        .unwrap()
+        .contains("poller"));
+}
+
+/// A stale detection cursor must make /ready fail even though Horizon itself
+/// is reachable — reachable dependencies plus a dead poller is not readiness
+/// (issue #315).
+#[tokio::test]
+async fn test_ready_fails_when_cursor_stale() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    let mut cfg = make_config();
+    cfg.gateway_public = CONFIGURED_GATEWAY.into();
+    cfg.horizon_url = mock.uri();
+
+    let health = stellargate::TaskHealth::new();
+    health.set_last_success_unix(0); // never succeeded → maximally stale
+    let (server, _pool) = server_with_config_and_health(cfg, health).await;
+
+    let res = server.get("/ready").await;
+    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.json::<Value>()["status"], "unavailable");
+    assert!(res.json::<Value>()["reason"]
+        .as_str()
+        .unwrap()
+        .contains("stalled"));
+}
+
+/// A fresh cursor (the poller recently completed a cycle) must keep /ready
+/// green when Horizon is reachable.
+#[tokio::test]
+async fn test_ready_ok_when_cursor_fresh() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    let mut cfg = make_config();
+    cfg.gateway_public = CONFIGURED_GATEWAY.into();
+    cfg.horizon_url = mock.uri();
+
+    let health = stellargate::TaskHealth::new();
+    health.note_success();
+    let (server, _pool) = server_with_config_and_health(cfg, health).await;
+
+    let res = server.get("/ready").await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>()["status"], "ok");
 }
 
 #[tokio::test]

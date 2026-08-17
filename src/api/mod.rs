@@ -603,18 +603,39 @@ async fn root(headers: axum::http::HeaderMap) -> impl IntoResponse {
     }
 }
 
-async fn health() -> impl IntoResponse {
-    Json(json!({ "status": "ok" }))
+/// Liveness probe — cheap by design, and fails only on conditions a restart
+/// would fix: an expected background task is no longer running (issue #315).
+/// A poller or listener that died at startup must not leave the process
+/// looking healthy forever, so this checks [`TaskHealth`](crate::TaskHealth)
+/// rather than just returning a hard-coded ok.
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let dead = state.task_health.dead_required_tasks();
+    if dead.is_empty() {
+        return Json(json!({ "status": "ok" })).into_response();
+    }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "status": "unavailable",
+            "reason": format!("background task(s) not running: {}", dead.join(", ")),
+        })),
+    )
+        .into_response()
 }
 
-/// Readiness probe — returns 200 only when both the database AND Horizon are
-/// reachable. A pod that cannot reach Horizon cannot detect on-chain payments;
-/// routing traffic to it is worse than routing it elsewhere (issue #172).
+/// Readiness probe — returns 200 only when the database AND Horizon are
+/// reachable AND the payment-detection cursor is advancing. A pod that cannot
+/// reach Horizon cannot detect on-chain payments; routing traffic to it is
+/// worse than routing it elsewhere (issue #172). And a reachable Horizon plus
+/// a dead poller is indistinguishable from a healthy system, so the probe also
+/// requires a successful poll (or stream event) within a configurable window
+/// (issue #315).
 ///
 /// Uses a 3-second timeout on the Horizon check so a slow node never hangs
-/// the probe. The check is skipped when no gateway is configured
-/// (STELLAR_GATEWAY_PUBLIC=UNCONFIGURED) since without a gateway there is no
-/// on-chain work to do.
+/// the probe. Both the Horizon probe and the cursor-freshness check are
+/// skipped when no gateway is configured (STELLAR_GATEWAY_PUBLIC=UNCONFIGURED)
+/// since without a gateway there is no on-chain work to do.
 async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // 1. Database must respond.
     if db::ping(&state.pool).await.is_err() {
@@ -625,12 +646,36 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .into_response();
     }
 
-    // 2. Horizon must respond (only when a gateway wallet is configured).
+    // 2. Horizon must respond and the detection cursor must be fresh (only
+    //    when a gateway wallet is configured).
     if state.config.gateway_configured() {
         if let Err(reason) = check_horizon_ready(&state).await {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "status": "unavailable", "reason": reason })),
+            )
+                .into_response();
+        }
+
+        /* The poller/stream must have made progress recently. Horizon being
+        reachable says nothing about whether a worker is actually watching it
+        (issue #315): a poller that exited at startup leaves /ready green
+        forever without this check. The window is POLL_INTERVAL_SECS ×
+        CURSOR_STALENESS_MULTIPLE, so a healthy poller — which cycles on the
+        poll interval — always clears it. */
+        let staleness_limit =
+            state.config.poll_interval_secs as i64 * state.config.cursor_staleness_multiple as i64;
+        let cursor_age = state.task_health.last_success_age_secs();
+        if cursor_age > staleness_limit {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "unavailable",
+                    "reason": format!(
+                        "payment detection stalled: no successful poll or stream event in \
+                         {cursor_age}s (limit {staleness_limit}s)"
+                    ),
+                })),
             )
                 .into_response();
         }
