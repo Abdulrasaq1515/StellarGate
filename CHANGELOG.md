@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`openapi.yaml` declares its security schemes.** The spec had no
+  `components.securitySchemes` block and no `security` key on any operation, so
+  every route read as unauthenticated — a client generated from it exposed no
+  way to supply an API key, sent none, and got `401` on every call, leaving the
+  integrator's first impression that the API was broken rather than that the
+  spec was incomplete. It also misrepresented the security posture to anyone
+  reviewing the contract. `bearerAuth` (merchant API key) and `adminSecret`
+  (`X-Admin-Secret`) are now defined, `bearerAuth` is attached to every
+  protected payment operation, `/health` declares `security: []` explicitly,
+  and each protected operation documents its `401` shape.
+  `GET /payments/{id}` is genuinely tri-modal, so its optional-auth behaviour
+  is expressed as `[{}, {bearerAuth: []}]` with a `PublicPaymentView` schema
+  for the anonymous projection, rather than flattened to a single requirement
+  (issue #325).
+
 - **Background-task supervisor.** A panic in the poller, stream listener,
   sweeper, retention worker, or webhook redrive used to end that task for the
   life of the process while HTTP and `/health` kept serving. Each worker is
