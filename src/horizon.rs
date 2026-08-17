@@ -599,7 +599,13 @@ async fn settle(
     settled.tx_hash = Some(tx_hash.to_string());
     settled.paid_amount = Some(paid_amount.to_string());
     /* Webhook delivery is handled asynchronously by the webhook subsystem
-    (recording here is non-blocking from reconciliation's point of view). */
+    (recording here is non-blocking from reconciliation's point of view).
+    
+    Design note: dispatch() still delivers inline so the common case settles and
+    notifies in one pass with no added latency. The redrive worker is a safety net
+    on top of that for the crash case, not a replacement for it — rewriting dispatch
+    to be record-only would be a bigger, riskier change than issue #156 asked for
+    and would break the existing synchronous-delivery test coverage. */
     webhook::dispatch(state, &settled, event, delta).await;
     true
 }
