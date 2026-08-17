@@ -3,9 +3,7 @@
 //! everything on shutdown.
 
 use anyhow::Result;
-use futures_util::FutureExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use std::future::Future;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,7 +13,7 @@ use stellargate::{
     config::{Config, ListenerMode},
     db, expiry, horizon,
     metrics::{AuthMetrics, WebhookMetrics},
-    retention, webhook, AppState, TaskHealth,
+    retention, supervise, webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -94,32 +92,43 @@ async fn main() -> Result<()> {
     health.require("redrive");
 
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
-        spawn_task(
-            &health,
-            "stream",
-            horizon::run_stream_listener(state.clone(), shutdown_rx.clone()),
-        )
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(health.clone(), "stream", shutdown_rx.clone(), move || {
+            horizon::run_stream_listener(state.clone(), rx.clone())
+        })
     });
-    let poller = spawn_task(
-        &health,
-        "poller",
-        horizon::run_poller(state.clone(), shutdown_rx.clone()),
-    );
-    let sweeper = spawn_task(
-        &health,
-        "sweeper",
-        expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
-    );
-    let retention = spawn_task(
-        &health,
-        "retention",
-        retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
-    );
-    let redrive = spawn_task(
-        &health,
-        "redrive",
-        webhook::run_redrive_worker(state.clone(), shutdown_rx),
-    );
+    let poller = {
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(health.clone(), "poller", shutdown_rx.clone(), move || {
+            horizon::run_poller(state.clone(), rx.clone())
+        })
+    };
+    let sweeper = {
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(health.clone(), "sweeper", shutdown_rx.clone(), move || {
+            expiry::run_sweeper(state.clone(), rx.clone())
+        })
+    };
+    let retention = {
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(
+            health.clone(),
+            "retention",
+            shutdown_rx.clone(),
+            move || retention::run_retention_worker(state.clone(), rx.clone()),
+        )
+    };
+    let redrive = {
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(health.clone(), "redrive", shutdown_rx.clone(), move || {
+            webhook::run_redrive_worker(state.clone(), rx.clone())
+        })
+    };
 
     let addr = format!("0.0.0.0:{}", state.config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -191,35 +200,13 @@ async fn report_trustlines(state: &Arc<AppState>) {
     }
 }
 
-/// Spawn a background task, keeping [`TaskHealth`] accurate across its
-/// lifetime: counted as started before it runs and as stopped when it returns
-/// (normally or by panicking). A panic is caught inside the task so it is
-/// logged and recorded at the moment it happens — not only at shutdown — which
-/// is what lets `/health` notice a dead task immediately (issues #104, #105,
-/// #315).
-fn spawn_task<F>(health: &TaskHealth, name: &'static str, task: F) -> JoinHandle<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let health = health.clone();
-    health.task_started(name);
-    tokio::spawn(async move {
-        let outcome = std::panic::AssertUnwindSafe(task).catch_unwind().await;
-        if outcome.is_err() {
-            warn!(task = name, "background task panicked; marking it stopped");
-            health.task_failed(name);
-        }
-        health.task_stopped(name);
-    })
-}
-
-/// Await a background task during shutdown. Panics are caught inside
-/// [`spawn_task`], so a `JoinError` here is unexpected; if one does surface it
-/// is recorded so the failure counter — and any alert watching it — fires.
+/// Await a supervisor during shutdown. Panics are caught inside the
+/// supervisor's child spawn, so a `JoinError` here means the supervisor
+/// itself failed — record it so the failure counter still fires.
 async fn join_task(handle: JoinHandle<()>, health: &TaskHealth, name: &'static str) {
     if let Err(e) = handle.await {
         if e.is_panic() {
-            warn!(task = name, "background task panicked");
+            warn!(task = name, "supervisor panicked");
             health.task_failed(name);
         }
     }
