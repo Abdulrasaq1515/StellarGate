@@ -24,6 +24,7 @@ fn make_config() -> Config {
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
+        webhook_retry_max_delay_ms: 60_000,
         /* Both schemes are allowed here so the scheme allow-list isn't what
         rejects http:// — these tests cover the network-based rule (http is fine
         on testnet, HTTPS-only on public), which runs after this gate. */
@@ -35,6 +36,7 @@ fn make_config() -> Config {
         webhook_redrive_grace_secs: 60,
         webhook_redrive_backoff_initial_secs: 0,
         webhook_redrive_backoff_max_secs: 0,
+        webhook_redrive_jitter_secs: 0,
         retention_interval_secs: 3600,
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
