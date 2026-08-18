@@ -23,8 +23,28 @@ fn normalize_ts(raw: &str) -> String {
     s.to_string()
 }
 
+/// `LIKE` pattern every stored timestamp must match: strict RFC 3339 UTC with
+/// a `Z` suffix and no fractional seconds, e.g. `2026-04-29T15:00:00Z`. `_`
+/// matches exactly one character, so this pins the length and the position of
+/// every separator without needing per-digit character classes SQLite's
+/// dialect of `LIKE` cannot express.
+///
+/// Backing every timestamp `CHECK` constraint below (issue #314): every write
+/// path already produces exactly this format via `strftime('%Y-%m-%dT%H:%M:%SZ',
+/// ...)`, so this makes that a guarantee SQLite enforces rather than a
+/// convention a future write path could silently break — which is exactly how
+/// `expires_at` ended up compared as a lexical string against rows in the
+/// legacy `"YYYY-MM-DD HH:MM:SS"` form (no `T`, no `Z`), which sorts *before*
+/// every compliant timestamp and so reads as permanently expired.
+///
+/// Applies only to newly created tables: `CREATE TABLE IF NOT EXISTS` does not
+/// retroactively add a constraint to a table that already exists, so an
+/// upgrade of a running deployment does not gain this guarantee for rows
+/// already on disk — the startup normalisation below is what repairs those.
+const TS_PATTERN: &str = "____-__-__T__:__:__Z";
+
 pub async fn migrate(pool: &Db) -> Result<()> {
-    sqlx::query(
+    sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS payments (
             id TEXT PRIMARY KEY,
             merchant_id TEXT NOT NULL DEFAULT 'anonymous',
@@ -37,11 +57,14 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             webhook_url TEXT,
             tx_hash TEXT,
             paid_amount TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                CHECK (created_at LIKE '{TS_PATTERN}'),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                CHECK (updated_at LIKE '{TS_PATTERN}'),
             expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
+                CHECK (expires_at LIKE '{TS_PATTERN}')
         )",
-    )
+    ))
     .execute(pool)
     .await?;
 
@@ -96,7 +119,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
-    sqlx::query(
+    sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS webhook_deliveries (
             id TEXT PRIMARY KEY,
             payment_id TEXT NOT NULL,
@@ -105,11 +128,12 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             event_type TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
-            last_attempt TEXT,
-            acknowledged_at TEXT,
+            last_attempt TEXT CHECK (last_attempt IS NULL OR last_attempt LIKE '{TS_PATTERN}'),
+            acknowledged_at TEXT CHECK (acknowledged_at IS NULL OR acknowledged_at LIKE '{TS_PATTERN}'),
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                CHECK (created_at LIKE '{TS_PATTERN}')
         )",
-    )
+    ))
     .execute(pool)
     .await?;
 
@@ -148,26 +172,28 @@ pub async fn migrate(pool: &Db) -> Result<()> {
 
     /* Durable key/value state — used by the Horizon poller to persist its
     paging cursor so it resumes exactly where it left off across restarts. */
-    sqlx::query(
+    sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS kv_state (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                CHECK (updated_at LIKE '{TS_PATTERN}')
         )",
-    )
+    ))
     .execute(pool)
     .await?;
 
     /* Merchants are provisioned via POST /merchants. The raw API key is never
     stored; only its SHA-256 hex digest is persisted so a DB breach does not
     expose live credentials. */
-    sqlx::query(
+    sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS merchants (
             id TEXT PRIMARY KEY,
             api_key_hash TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                CHECK (created_at LIKE '{TS_PATTERN}')
         )",
-    )
+    ))
     .execute(pool)
     .await?;
 
@@ -179,18 +205,19 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     of the raw key so an operator can tell two keys apart in a list without the
     secret being recoverable. `revoked_at` is a tombstone rather than a delete
     so an audit trail survives revocation. */
-    sqlx::query(
+    sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS api_keys (
             id TEXT PRIMARY KEY,
             merchant_id TEXT NOT NULL,
             key_hash TEXT NOT NULL UNIQUE,
             prefix TEXT NOT NULL,
             label TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-            last_used_at TEXT,
-            revoked_at TEXT
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                CHECK (created_at LIKE '{TS_PATTERN}'),
+            last_used_at TEXT CHECK (last_used_at IS NULL OR last_used_at LIKE '{TS_PATTERN}'),
+            revoked_at TEXT CHECK (revoked_at IS NULL OR revoked_at LIKE '{TS_PATTERN}')
         )",
-    )
+    ))
     .execute(pool)
     .await?;
 
@@ -229,15 +256,16 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     maps to the payment id minted for the first request that used it, so a
     client retrying after a network blip gets the original payment back
     instead of a duplicate intent. */
-    sqlx::query(
+    sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS idempotency_keys (
             merchant_id TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
             payment_id TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                CHECK (created_at LIKE '{TS_PATTERN}'),
             PRIMARY KEY (merchant_id, idempotency_key)
         )",
-    )
+    ))
     .execute(pool)
     .await?;
 
@@ -247,15 +275,16 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     later poll cycle, over the stream, or from a concurrent reconciler) is an
     idempotent no-op instead of a double-credit. `amount_stroops` is the
     integer stroop value so SUM is exact. */
-    sqlx::query(
+    sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS processed_transactions (
             payment_id TEXT NOT NULL,
             tx_hash TEXT NOT NULL,
             amount_stroops INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                CHECK (created_at LIKE '{TS_PATTERN}'),
             PRIMARY KEY (payment_id, tx_hash)
         )",
-    )
+    ))
     .execute(pool)
     .await?;
 
@@ -289,10 +318,18 @@ pub async fn migrate(pool: &Db) -> Result<()> {
 
     /* Normalise legacy rows that were written by the old datetime('now') default,
     which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
-    startup — the WHERE clause skips rows that are already RFC 3339. */
+    startup — the WHERE clause skips rows that are already RFC 3339.
+
+    `expires_at` is included for the same reason as the others (issue #314):
+    left in the legacy space-separated form, it sorts *before* every compliant
+    "…T…Z" timestamp — 'T' (0x54) > ' ' (0x20) — so `expires_at > strftime(...)`
+    in list_pending/expire_overdue/find_pending_by_memo reads such a row as
+    already expired. It would never surface as a detectable payment again and
+    would be swept on the very next expiry cycle. */
     for tbl_col in [
         ("payments", "created_at"),
         ("payments", "updated_at"),
+        ("payments", "expires_at"),
         ("webhook_deliveries", "created_at"),
     ] {
         let sql = format!(
@@ -1669,6 +1706,130 @@ mod tests {
         let pending = list_pending(&pool).await.unwrap();
         let ids: Vec<&str> = pending.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["live"]);
+    }
+
+    // ── Legacy timestamp format (issue #314) ─────────────────────────────────
+
+    /// A row whose `expires_at` was written in the legacy
+    /// `"YYYY-MM-DD HH:MM:SS"` form (space separator, no `Z`) — as produced by
+    /// the old `datetime('now')` default — must not be misread as already
+    /// expired just because it sorts lexically before an RFC 3339 `"…T…Z"`
+    /// string, even when the date it encodes is far in the future.
+    ///
+    /// Bypasses the `expires_at` `CHECK` constraint via
+    /// `PRAGMA ignore_check_constraints`, on a single held connection so the
+    /// pragma and the write land on the same session — exactly how a
+    /// pre-#314 row would already exist on disk before an upgrade, since the
+    /// constraint is not retroactive for a table that already existed.
+    async fn seed_legacy_format_expiry(pool: &Db, id: &str, memo: &str, legacy_expires_at: &str) {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA ignore_check_constraints = 1")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO payments
+                (id, merchant_id, destination_address, memo, amount, asset, status, expires_at)
+             VALUES (?, 'm', 'GGATEWAY', ?, '10', 'XLM', 'pending', ?)",
+        )
+        .bind(id)
+        .bind(memo)
+        .bind(legacy_expires_at)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA ignore_check_constraints = 0")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_format_expiry_far_in_the_future_is_fixed_by_normalisation_and_then_findable() {
+        let pool = memory_db().await;
+        // 5 minutes from now, same calendar day in the overwhelming majority
+        // of runs — deliberately *not* a different year or day, since a
+        // different leading date digit would make the row compare greater
+        // regardless of the separator and wouldn't reproduce the bug at all.
+        // The reproduction needs an otherwise-identical date-time prefix so
+        // the single differing byte — ' ' (0x20) vs 'T' (0x54) — is what
+        // decides the (wrong) comparison outcome, exactly as issue #314
+        // describes.
+        let soon = time::OffsetDateTime::now_utc() + time::Duration::minutes(5);
+        let legacy_expires_at = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            soon.year(),
+            u8::from(soon.month()),
+            soon.day(),
+            soon.hour(),
+            soon.minute(),
+            soon.second()
+        );
+        seed_legacy_format_expiry(&pool, "legacy", "MEMOLEGACY", &legacy_expires_at).await;
+
+        // Before normalisation: the bug this issue describes. A row that will
+        // not expire for 70+ years is invisible to both detection paths.
+        assert!(
+            list_pending(&pool).await.unwrap().is_empty(),
+            "legacy-format row must reproduce the bug before normalisation runs"
+        );
+        assert!(find_pending_by_memo(&pool, "MEMOLEGACY")
+            .await
+            .unwrap()
+            .is_none());
+
+        // migrate() is re-run on every startup and is what applies the
+        // normalisation UPDATE — simulating the next process start.
+        migrate(&pool).await.unwrap();
+
+        let pending = list_pending(&pool).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "row must be detectable after normalisation"
+        );
+        assert_eq!(pending[0].id, "legacy");
+        assert!(pending[0].expires_at.contains('T') && pending[0].expires_at.ends_with('Z'));
+
+        let found = find_pending_by_memo(&pool, "MEMOLEGACY").await.unwrap();
+        assert_eq!(found.map(|p| p.id), Some("legacy".to_string()));
+    }
+
+    /// The companion case: a legacy-format row whose encoded date has already
+    /// passed must still be swept as overdue after normalisation — the fix
+    /// must not accidentally make every legacy row look perpetually fresh.
+    #[tokio::test]
+    async fn legacy_format_expiry_in_the_past_is_still_expired_after_normalisation() {
+        let pool = memory_db().await;
+        seed_legacy_format_expiry(&pool, "legacy-dead", "MEMODEAD", "2020-01-01 00:00:00").await;
+
+        migrate(&pool).await.unwrap();
+
+        assert!(list_pending(&pool).await.unwrap().is_empty());
+        let expired = expire_overdue(&pool, 10).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, "legacy-dead");
+        assert_eq!(expired[0].status, "expired");
+    }
+
+    /// The `CHECK` constraint itself: on a freshly created table (this test's
+    /// `:memory:` database always is one), a write that does not conform to
+    /// the RFC 3339 `Z` format must fail loudly at insert time rather than
+    /// being silently accepted and only caught by the next normalisation pass.
+    #[tokio::test]
+    async fn malformed_expires_at_is_rejected_at_insert_time_on_a_fresh_table() {
+        let pool = memory_db().await;
+        let result = sqlx::query(
+            "INSERT INTO payments
+                (id, merchant_id, destination_address, memo, amount, asset, status, expires_at)
+             VALUES ('bad', 'm', 'GGATEWAY', 'MEMOBAD', '10', 'XLM', 'pending', '2026-04-29 15:00:00')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "a space-separated, non-Z timestamp must violate the CHECK constraint"
+        );
     }
 
     #[tokio::test]
