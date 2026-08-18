@@ -698,11 +698,6 @@ pub async fn list_webhooks(
 
 // ── Dead-letter view (issue #319) ────────────────────────────────────────────
 
-/// Delivery statuses worth filtering on, and therefore the only ones accepted.
-/// Same allow-list treatment as the payment `status` filter: anything else is a
-/// guaranteed-empty result and is rejected rather than silently returning none.
-const VALID_DELIVERY_STATUSES: [&str; 3] = ["failed", "pending", "delivered"];
-
 #[derive(Deserialize)]
 pub struct ListDeliveriesQuery {
     /// Defaults to `failed` — the dead-letter case this endpoint exists for.

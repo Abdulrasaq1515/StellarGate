@@ -928,8 +928,8 @@ pub async fn list_redrivable_deliveries(
 ) -> Result<Vec<WebhookDelivery>> {
     /* `ABS(RANDOM()) % (n+1)` yields [0, n]. Guarded on `jitter_secs > 0`:
     `% 1` is a constant 0, and a zero modulus is a runtime error in SQLite. */
-    let rows = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+    let rows = sqlx::query(&format!(
+        "SELECT {DELIVERY_COLUMNS}
          FROM webhook_deliveries
          WHERE status IN ('pending', 'failed')
            AND attempts < ?
@@ -985,11 +985,11 @@ pub async fn list_webhook_deliveries_keyset(
 ) -> Result<Vec<WebhookDelivery>> {
     let rows = match (status, cursor) {
         (None, None) => {
-            sqlx::query(
-                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+            sqlx::query(&format!(
+                "SELECT {DELIVERY_COLUMNS}
                  FROM webhook_deliveries WHERE payment_id = ?
                  ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
+            ))
             .bind(payment_id)
             .bind(limit)
             .fetch_all(pool)
@@ -997,12 +997,12 @@ pub async fn list_webhook_deliveries_keyset(
         }
 
         (None, Some((ts, cid))) => {
-            sqlx::query(
-                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+            sqlx::query(&format!(
+                "SELECT {DELIVERY_COLUMNS}
                  FROM webhook_deliveries
                  WHERE payment_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
                  ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
+            ))
             .bind(payment_id)
             .bind(ts)
             .bind(ts)
@@ -1013,11 +1013,11 @@ pub async fn list_webhook_deliveries_keyset(
         }
 
         (Some(s), None) => {
-            sqlx::query(
-                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+            sqlx::query(&format!(
+                "SELECT {DELIVERY_COLUMNS}
                  FROM webhook_deliveries WHERE payment_id = ? AND status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
+            ))
             .bind(payment_id)
             .bind(s)
             .bind(limit)
@@ -1026,13 +1026,13 @@ pub async fn list_webhook_deliveries_keyset(
         }
 
         (Some(s), Some((ts, cid))) => {
-            sqlx::query(
-                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+            sqlx::query(&format!(
+                "SELECT {DELIVERY_COLUMNS}
                  FROM webhook_deliveries
                  WHERE payment_id = ? AND status = ?
                    AND (created_at < ? OR (created_at = ? AND id < ?))
                  ORDER BY created_at DESC, id DESC LIMIT ?",
-            )
+            ))
             .bind(payment_id)
             .bind(s)
             .bind(ts)
@@ -1045,6 +1045,66 @@ pub async fn list_webhook_deliveries_keyset(
     };
 
     Ok(rows.iter().map(row_to_webhook_delivery).collect())
+}
+
+/// Merchant-wide delivery listing, newest first. Used by `GET /payments/webhooks`
+/// (the dead-letter view, issue #319).
+pub async fn list_deliveries_for_merchant(
+    pool: &Db,
+    merchant_id: &str,
+    status: &str,
+    limit: i64,
+    cursor: Option<(&str, &str)>,
+) -> Result<Vec<WebhookDelivery>> {
+    let mut sql = String::from(
+        "SELECT d.id, d.payment_id, d.url, d.payload, d.event_type, d.status, d.attempts, \
+                d.last_attempt, d.acknowledged_at, d.created_at
+           FROM webhook_deliveries d
+           JOIN payments p ON p.id = d.payment_id
+          WHERE p.merchant_id = ? AND d.status = ?",
+    );
+    if cursor.is_some() {
+        sql.push_str(" AND (d.created_at < ? OR (d.created_at = ? AND d.id < ?))");
+    }
+    sql.push_str(" ORDER BY d.created_at DESC, d.id DESC LIMIT ?");
+
+    let mut query = sqlx::query(&sql).bind(merchant_id).bind(status);
+    if let Some((ts, id)) = cursor {
+        query = query.bind(ts).bind(ts).bind(id);
+    }
+    let rows = query.bind(limit).fetch_all(pool).await?;
+
+    Ok(rows.iter().map(row_to_webhook_delivery).collect())
+}
+
+/// Requeue a merchant's failed deliveries so the redrive worker retries them,
+/// and mark them acknowledged. Returns how many rows were affected.
+///
+/// `ids` empty means every failed delivery this merchant has.
+pub async fn requeue_failed_deliveries(
+    pool: &Db,
+    merchant_id: &str,
+    ids: &[String],
+) -> Result<u64> {
+    let mut sql = String::from(
+        "UPDATE webhook_deliveries
+            SET status = 'pending',
+                attempts = 0,
+                acknowledged_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE status = 'failed'
+            AND payment_id IN (SELECT id FROM payments WHERE merchant_id = ?)",
+    );
+    if !ids.is_empty() {
+        sql.push_str(" AND id IN (");
+        sql.push_str(&vec!["?"; ids.len()].join(","));
+        sql.push(')');
+    }
+
+    let mut query = sqlx::query(&sql).bind(merchant_id);
+    for id in ids {
+        query = query.bind(id);
+    }
+    Ok(query.execute(pool).await?.rows_affected())
 }
 
 /// Get a specific webhook delivery by id.
