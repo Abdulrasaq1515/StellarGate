@@ -106,6 +106,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT,
+            acknowledged_at TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
@@ -124,6 +125,23 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .await?;
     if has_event_type == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
+            .execute(pool)
+            .await?;
+    }
+
+    /* `acknowledged_at` records that somebody has seen a terminal failure and
+    acted on it — set by the bulk requeue/acknowledge endpoint. It exists so
+    retention can distinguish "this failure was dealt with" from "nobody has
+    looked at this yet", and refuse to delete the latter (issue #319). Rows
+    that predate the column are NULL, i.e. unacknowledged, which is the safe
+    reading: we do not know that anyone saw them. */
+    let has_acknowledged_at: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'acknowledged_at'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_acknowledged_at == 0 {
+        sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN acknowledged_at TEXT")
             .execute(pool)
             .await?;
     }
@@ -820,6 +838,10 @@ pub struct WebhookDelivery {
     pub status: String,
     pub attempts: i64,
     pub last_attempt: Option<String>,
+    /// When somebody acted on this delivery — requeued it, or explicitly
+    /// acknowledged it. `None` means nobody has looked at it yet, which is
+    /// what keeps a terminal failure exempt from retention (issue #319).
+    pub acknowledged_at: Option<String>,
     pub created_at: String,
 }
 
@@ -854,9 +876,15 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
         status: row.get("status"),
         attempts: row.get("attempts"),
         last_attempt: row.get("last_attempt"),
+        acknowledged_at: row.get("acknowledged_at"),
         created_at: normalize_ts(&row.get::<String, _>("created_at")),
     }
 }
+
+/// Columns every delivery read selects, in the order `row_to_webhook_delivery`
+/// expects. Kept in one place so adding a column cannot leave one query behind.
+const DELIVERY_COLUMNS: &str = "id, payment_id, url, payload, event_type, status, attempts, \
+                                last_attempt, acknowledged_at, created_at";
 
 /// Deliveries eligible for the background redrive worker: not yet delivered,
 /// under the attempt cap, and idle long enough that no in-flight `dispatch()`
@@ -912,7 +940,7 @@ pub async fn list_redrivable_deliveries(
                  + CASE WHEN ? > 0 THEN ABS(RANDOM()) % (? + 1) ELSE 0 END
                ) || ' seconds') <= datetime('now')
          ORDER BY created_at ASC",
-    )
+    ))
     .bind(max_attempts)
     .bind(grace_secs)
     .bind(grace_secs)
@@ -928,10 +956,10 @@ pub async fn list_redrivable_deliveries(
 
 /// Get all webhook deliveries for a payment, ordered by created_at descending.
 pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<WebhookDelivery>> {
-    let rows = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+    let rows = sqlx::query(&format!(
+        "SELECT {DELIVERY_COLUMNS}
          FROM webhook_deliveries WHERE payment_id = ? ORDER BY created_at DESC",
-    )
+    ))
     .bind(payment_id)
     .fetch_all(pool)
     .await?;
@@ -939,12 +967,91 @@ pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<
     Ok(rows.iter().map(row_to_webhook_delivery).collect())
 }
 
+/// Get a page of webhook deliveries for a payment with keyset (cursor)
+/// pagination, sharing the contracts used by `GET /payments`.
+///
+/// Rows are ordered by `(created_at DESC, id DESC)` — the same ordering and
+/// tie-break as the payments listing — so a `next_cursor` encoded from any
+/// page resumes exactly after its last row and never re-reads or skips the
+/// whole-second `created_at` tie group that ends the page. An optional
+/// `status` filter narrows to deliveries in that state (`pending`,
+/// `delivered`, or `failed`).
+pub async fn list_webhook_deliveries_keyset(
+    pool: &Db,
+    payment_id: &str,
+    status: Option<&str>,
+    limit: i64,
+    cursor: Option<(&str, &str)>,
+) -> Result<Vec<WebhookDelivery>> {
+    let rows = match (status, cursor) {
+        (None, None) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries WHERE payment_id = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (None, Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries
+                 WHERE payment_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(s), None) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries WHERE payment_id = ? AND status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(s)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(s), Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries
+                 WHERE payment_id = ? AND status = ?
+                   AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(s)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    Ok(rows.iter().map(row_to_webhook_delivery).collect())
+}
+
 /// Get a specific webhook delivery by id.
 pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookDelivery>> {
-    let row = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
-         FROM webhook_deliveries WHERE id = ?",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT {DELIVERY_COLUMNS} FROM webhook_deliveries WHERE id = ?",
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -1044,17 +1151,60 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u6
 
 /// Delete one batch of webhook deliveries that have finished and aged out.
 ///
-/// Only `delivered` and `failed` rows are eligible. A `pending` row is still
-/// owned by the redrive worker — pruning it would silently drop a delivery
-/// that was going to be retried. The worker marks rows `failed` once attempts
-/// are exhausted, so nothing stays exempt forever (issue #111).
+/// A `pending` row is still owned by the redrive worker — pruning it would
+/// silently drop a delivery that was going to be retried. The worker marks
+/// rows `failed` once attempts are exhausted, so nothing stays exempt forever
+/// (issue #111).
+///
+/// An **unacknowledged `failed`** row is also exempt. Deleting one destroys the
+/// only record that an event was permanently lost, on a timer, whether or not
+/// anybody looked at it — so the evidence for "we never received your webhook"
+/// expired exactly when it was most likely to be asked for (issue #319).
+/// Acknowledging or requeueing a delivery clears the exemption, and
+/// [`compact_stale_failed_deliveries`] keeps the retained rows from costing
+/// what a full delivery row costs.
 pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "DELETE FROM webhook_deliveries
           WHERE rowid IN (
               SELECT rowid FROM webhook_deliveries
-               WHERE status IN ('delivered','failed')
+               WHERE (status = 'delivered'
+                      OR (status = 'failed' AND acknowledged_at IS NOT NULL))
+                 AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               LIMIT ?
+          )",
+    )
+    .bind(&cutoff)
+    .bind(PRUNE_BATCH)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n)
+}
+
+/// Drop the stored payload of aged-out, unacknowledged `failed` deliveries,
+/// leaving a compact tombstone.
+///
+/// Exempting terminal failures from retention outright would trade one
+/// unbounded table for another, which is the problem retention was added to
+/// solve (issues #110, #111). `payload` is by far the largest column, and its
+/// only consumer is redelivery — which is not something anyone does to a
+/// months-old failure. Clearing it keeps the row (and therefore the answer to
+/// "did this event ever get through?") at a few hundred bytes, indefinitely.
+///
+/// The `payload <> ''` guard makes this idempotent: a row is compacted once,
+/// not rewritten on every cycle.
+pub async fn compact_stale_failed_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
+    let cutoff = format!("-{retention_days} days");
+    let n = sqlx::query(
+        "UPDATE webhook_deliveries
+            SET payload = ''
+          WHERE rowid IN (
+              SELECT rowid FROM webhook_deliveries
+               WHERE status = 'failed'
+                 AND acknowledged_at IS NULL
+                 AND payload <> ''
                  AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
                LIMIT ?
           )",

@@ -862,7 +862,17 @@ of either mode. Offset mode additionally returns `total` and `offset`.
 
 ### `GET /payments/:id/webhooks`
 
-List every delivery attempt for a payment. Requires the owning merchant's API key.
+List delivery attempts for a payment, newest first. Requires the owning merchant's API key.
+
+| Query param | Description | Default |
+|---|---|---|
+| `status` | Filter by delivery status: `pending`, `delivered`, or `failed` | — |
+| `limit` | Page size (clamped to `1..=100`) | `20` |
+| `cursor` | Keyset cursor from a previous `next_cursor` | — |
+
+`next_cursor` is `null` on the final page. To page through the history, start with a
+request that carries **no** `cursor`, then pass the previous response's `next_cursor`
+on each subsequent request.
 
 **`200 OK`**
 
@@ -879,13 +889,116 @@ List every delivery attempt for a payment. Requires the owning merchant's API ke
       "last_attempt": "2026-04-29T15:04:00Z",
       "created_at": "2026-04-29T15:03:59Z"
     }
-  ]
+  ],
+  "limit": 20,
+  "next_cursor": "3230..."
 }
 ```
 
 ### `POST /payments/:id/webhooks/:delivery_id/redeliver`
 
 Manually re-send a delivery. The stored payload and event type are replayed verbatim with a **fresh** timestamp and signature. The SSRF guard re-runs against the target.
+
+---
+
+### `GET /payments/webhooks`
+
+The **dead-letter view**: every delivery for the authenticated merchant, across
+all of their payments. Defaults to `status=failed`.
+
+This is the endpoint to reach for when a merchant says they are missing events,
+because that question arrives *without* a payment id —
+`GET /payments/:id/webhooks` can only answer it if you already know where to
+look.
+
+| Query | Default | Notes |
+|---|---|---|
+| `status` | `failed` | One of `failed`, `pending`, `delivered` |
+| `limit` | `20` | 1–100 |
+| `cursor` | — | Opaque keyset cursor, same convention as `GET /payments` |
+
+```bash
+curl "http://localhost:3000/v1/payments/webhooks?status=failed&limit=50" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+**`200 OK`**
+
+```json
+{
+  "deliveries": [
+    {
+      "id": "d1e2f3...",
+      "payment_id": "a1b2c3d4-...",
+      "url": "https://yourapp.com/webhooks/stellar",
+      "event": "payment.completed",
+      "status": "failed",
+      "attempts": 8,
+      "last_attempt": "2026-04-29T15:04:00Z",
+      "acknowledged_at": null,
+      "created_at": "2026-04-29T15:03:59Z"
+    }
+  ],
+  "status": "failed",
+  "limit": 50,
+  "next_cursor": "3230..."
+}
+```
+
+Scoping is a join to `payments`, not a filter you supply, so this can never
+return another merchant's deliveries. The signed `payload` is omitted — a
+listing is for triage, not replay.
+
+---
+
+### `POST /payments/webhooks/redeliver`
+
+Bulk recovery after you have fixed your receiver. Requeues failed deliveries so
+the background redrive worker retries them.
+
+```bash
+# Everything that failed
+curl -X POST http://localhost:3000/v1/payments/webhooks/redeliver \
+  -H "Authorization: Bearer $API_KEY"
+
+# Or just specific ones (max 100 per request)
+curl -X POST http://localhost:3000/v1/payments/webhooks/redeliver \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"delivery_ids": ["d1e2f3...", "d4e5f6..."]}'
+```
+
+**`200 OK`** — `{ "requeued": 42, "detail": "..." }`
+
+> This endpoint **sends nothing itself**. It resets matching rows to `pending`
+> with `attempts = 0` and hands them to the redrive worker, whose
+> `WEBHOOK_REDRIVE_CONCURRENCY` and exponential backoff already bound the
+> outbound rate. Requeueing ten thousand deliveries therefore costs one `UPDATE`
+> and cannot stampede a receiver that has only just come back up.
+
+Requeueing also **acknowledges** the delivery — see below.
+
+### Retention of failed deliveries
+
+A terminal failure is the evidence for "we never received your webhook", and
+that question usually arrives long after the fact. So a `failed` delivery that
+nobody has acknowledged is **exempt from
+`WEBHOOK_DELIVERY_RETENTION_DAYS`** and is not deleted on a timer.
+
+To keep that from trading one unbounded table for another, a retained failure is
+**compacted** once it ages past the window: the row survives, its stored
+`payload` is cleared. The payload's only consumer is redelivery, which is not
+something anyone does to a months-old failure, and it is by far the largest
+column — so the record of what was lost stays queryable indefinitely at a few
+hundred bytes.
+
+Requeueing via the endpoint above sets `acknowledged_at`, which returns the row
+to ordinary retention.
+
+Terminal failures are also counted in
+`stellargate_webhook_deliveries_total{outcome="failed"}` — **including** the
+SSRF-blocked path, which previously incremented nothing, leaving a whole class
+of permanent failure invisible to alerts.
 
 ---
 
