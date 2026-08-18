@@ -403,6 +403,18 @@ paths:
           schema:
             type: string
           description: Opaque cursor for keyset pagination (returned as next_cursor)
+        - name: include_total
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: >-
+            Offset pagination only; has no effect with cursor set. `total`
+            costs a full COUNT(*) scan over every matching row — SQLite has no
+            cached row count — so it is computed only when this is `true`,
+            and the `total` field is otherwise absent from the response
+            entirely (not `null`). Keyset (cursor) pagination is the
+            recommended approach and has never returned `total`.
       responses:
         "200":
           description: Paginated list of payments
@@ -967,7 +979,12 @@ components:
             $ref: "#/components/schemas/Payment"
         total:
           type: integer
-          description: Total matching rows (offset pagination only)
+          description: >-
+            Total matching rows. Offset pagination only, and only present when
+            the request set `include_total=true` — computing it is a full
+            `COUNT(*)` scan, so it is opt-in rather than sent on every
+            request. Omitted from the response (not `null`) when not
+            requested.
         limit:
           type: integer
         offset:
