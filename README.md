@@ -823,7 +823,17 @@ of either mode. Offset mode additionally returns `total` and `offset`.
 
 ### `GET /payments/:id/webhooks`
 
-List every delivery attempt for a payment. Requires the owning merchant's API key.
+List delivery attempts for a payment, newest first. Requires the owning merchant's API key.
+
+| Query param | Description | Default |
+|---|---|---|
+| `status` | Filter by delivery status: `pending`, `delivered`, or `failed` | — |
+| `limit` | Page size (clamped to `1..=100`) | `20` |
+| `cursor` | Keyset cursor from a previous `next_cursor` | — |
+
+`next_cursor` is `null` on the final page. To page through the history, start with a
+request that carries **no** `cursor`, then pass the previous response's `next_cursor`
+on each subsequent request.
 
 **`200 OK`**
 
@@ -840,7 +850,9 @@ List every delivery attempt for a payment. Requires the owning merchant's API ke
       "last_attempt": "2026-04-29T15:04:00Z",
       "created_at": "2026-04-29T15:03:59Z"
     }
-  ]
+  ],
+  "limit": 20,
+  "next_cursor": "3230..."
 }
 ```
 

@@ -626,18 +626,10 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// Transition up to `batch` watchable payments whose TTL has elapsed to
-/// `expired`, returning the rows that were swept so the caller can fire
-/// `payment.expired` webhooks.
-///
-/// The whole batch is transitioned in a single `UPDATE … RETURNING` — one
-/// round-trip instead of one guarded `UPDATE` per intent (issue #323). The
-/// `WHERE … status IN ('pending','underpaid')` guard remains what makes a
-/// concurrent settlement win the race: the subquery and update run under one
-/// write lock, so a payment that settles in between is never selected here
-/// (if the settlement committed first) and a payment this statement sweeps is
-/// rejected by the settlement's own guard (issue #155) — never double-reported.
-/// `RETURNING` yields exactly the rows this statement actually transitioned.
+/// Transition every watchable payment whose TTL has elapsed to `expired`,
+/// returning the rows that were swept so the caller can fire `payment.expired`
+/// webhooks. Each row is updated with a guard on a watchable status so a payment
+/// that settles concurrently is left untouched and not double-reported.
 ///
 /// `batch` bounds each statement, so a large backlog drains over several
 /// sweeps instead of one long write lock.
@@ -950,84 +942,84 @@ pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<
     Ok(rows.iter().map(row_to_webhook_delivery).collect())
 }
 
-/// List a *merchant's* deliveries across every one of their payments, filtered
-/// by status and paginated with the same keyset cursor the payments list uses
-/// (issue #319).
+/// Get a page of webhook deliveries for a payment with keyset (cursor)
+/// pagination, sharing the contracts used by `GET /payments`.
 ///
-/// This is the query the dead-letter view is built on. Answering "a merchant
-/// says they are missing events" previously required already knowing which
-/// payment to look at, which is backwards — the payment id is exactly what the
-/// person asking does not have. The only way to get the answer was to query
-/// SQLite directly on the production volume.
-///
-/// Scoping is a join to `payments`, not a filter the caller supplies, so a
-/// merchant can never read another tenant's deliveries.
-pub async fn list_deliveries_for_merchant(
+/// Rows are ordered by `(created_at DESC, id DESC)` — the same ordering and
+/// tie-break as the payments listing — so a `next_cursor` encoded from any
+/// page resumes exactly after its last row and never re-reads or skips the
+/// whole-second `created_at` tie group that ends the page. An optional
+/// `status` filter narrows to deliveries in that state (`pending`,
+/// `delivered`, or `failed`).
+pub async fn list_webhook_deliveries_keyset(
     pool: &Db,
-    merchant_id: &str,
-    status: &str,
+    payment_id: &str,
+    status: Option<&str>,
     limit: i64,
     cursor: Option<(&str, &str)>,
 ) -> Result<Vec<WebhookDelivery>> {
-    /* Ordered newest-first on (created_at DESC, id DESC) — the same ordering
-    and the same tie-break as the payments keyset query, so whole-second
-    collisions cannot make a page repeat or skip rows (issue #269). */
-    let mut sql = String::from(
-        "SELECT d.id, d.payment_id, d.url, d.payload, d.event_type, d.status, d.attempts, \
-                d.last_attempt, d.acknowledged_at, d.created_at
-           FROM webhook_deliveries d
-           JOIN payments p ON p.id = d.payment_id
-          WHERE p.merchant_id = ? AND d.status = ?",
-    );
-    if cursor.is_some() {
-        sql.push_str(" AND (d.created_at < ? OR (d.created_at = ? AND d.id < ?))");
-    }
-    sql.push_str(" ORDER BY d.created_at DESC, d.id DESC LIMIT ?");
+    let rows = match (status, cursor) {
+        (None, None) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries WHERE payment_id = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
 
-    let mut query = sqlx::query(&sql).bind(merchant_id).bind(status);
-    if let Some((ts, id)) = cursor {
-        query = query.bind(ts).bind(ts).bind(id);
-    }
-    let rows = query.bind(limit).fetch_all(pool).await?;
+        (None, Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries
+                 WHERE payment_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(s), None) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries WHERE payment_id = ? AND status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(s)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(s), Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries
+                 WHERE payment_id = ? AND status = ?
+                   AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(s)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
 
     Ok(rows.iter().map(row_to_webhook_delivery).collect())
-}
-
-/// Requeue a merchant's failed deliveries so the redrive worker retries them,
-/// and mark them acknowledged. Returns how many rows were affected.
-///
-/// Deliberately does **not** send anything itself. Resetting a row to
-/// `pending` with `attempts = 0` hands it to the existing redrive worker,
-/// whose `WEBHOOK_REDRIVE_CONCURRENCY` and backoff already bound the outbound
-/// rate — so requeueing ten thousand deliveries costs one `UPDATE` and cannot
-/// exhaust the redrive budget or stampede a receiver that has only just come
-/// back up (coordinating with issue #235).
-///
-/// `ids` empty means "every failed delivery this merchant has".
-pub async fn requeue_failed_deliveries(
-    pool: &Db,
-    merchant_id: &str,
-    ids: &[String],
-) -> Result<u64> {
-    let mut sql = String::from(
-        "UPDATE webhook_deliveries
-            SET status = 'pending',
-                attempts = 0,
-                acknowledged_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-          WHERE status = 'failed'
-            AND payment_id IN (SELECT id FROM payments WHERE merchant_id = ?)",
-    );
-    if !ids.is_empty() {
-        sql.push_str(" AND id IN (");
-        sql.push_str(&vec!["?"; ids.len()].join(","));
-        sql.push(')');
-    }
-
-    let mut query = sqlx::query(&sql).bind(merchant_id);
-    for id in ids {
-        query = query.bind(id);
-    }
-    Ok(query.execute(pool).await?.rows_affected())
 }
 
 /// Get a specific webhook delivery by id.

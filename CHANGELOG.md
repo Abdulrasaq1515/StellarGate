@@ -81,6 +81,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GET /payments/:id/webhooks` now paginates like the payments listing.**
+  The endpoint previously serialised every delivery row for a payment with no
+  `LIMIT`, so a payment with unbounded delivery activity (see issue #233) grew
+  the response without bound. It now supports a `status` filter
+  (`pending`/`delivered`/`failed`), a `limit` (default 20, max 100), and keyset
+  `cursor` pagination with `next_cursor` in the same contract as
+  `GET /payments` (issue #326).
 - **API versioning.** Public routes are now served under `/v1` alongside a
   documented deprecation policy. Unversioned paths keep working and return
   `Deprecation` and `Link: rel="successor-version"` headers pointing at their
