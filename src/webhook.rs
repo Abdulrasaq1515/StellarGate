@@ -151,6 +151,12 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         Ok(c) => c,
         Err(e) => {
             warn!(payment_id = %payment.id, %url, error = %e, "webhook blocked by SSRF guard");
+            /* This is a terminal failure and must be counted like one. It was
+            not, so an entire class of permanent failure — a target that
+            resolves into a blocked range — was invisible to
+            `stellargate_webhook_deliveries_total{outcome="failed"}` and to any
+            alert built on it (issues #319, #233). */
+            state.webhook_metrics.record_failed();
             let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", 0).await;
             return;
         }
@@ -293,6 +299,8 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
         Ok(c) => c,
         Err(e) => {
             warn!(delivery_id = %delivery.id, url = %delivery.url, error = %e, "redrive blocked by SSRF guard");
+            // Terminal, so counted — same gap as the inline path above.
+            state.webhook_metrics.record_failed();
             let _ =
                 db::update_webhook_delivery(&state.pool, &delivery.id, "failed", delivery.attempts)
                     .await;
