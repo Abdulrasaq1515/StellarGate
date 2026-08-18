@@ -1112,9 +1112,6 @@ pub async fn list_deliveries_for_merchant(
     limit: i64,
     cursor: Option<(&str, &str)>,
 ) -> Result<Vec<WebhookDelivery>> {
-    /* Ordered newest-first on (created_at DESC, id DESC) — the same ordering
-    and the same tie-break as the payments keyset query, so whole-second
-    collisions cannot make a page repeat or skip rows (issue #269). */
     let mut sql = String::from(
         "SELECT d.id, d.payment_id, d.url, d.payload, d.event_type, d.status, d.attempts, \
                 d.last_attempt, d.acknowledged_at, d.created_at
@@ -1139,14 +1136,7 @@ pub async fn list_deliveries_for_merchant(
 /// Requeue a merchant's failed deliveries so the redrive worker retries them,
 /// and mark them acknowledged. Returns how many rows were affected.
 ///
-/// Deliberately does **not** send anything itself. Resetting a row to
-/// `pending` with `attempts = 0` hands it to the existing redrive worker,
-/// whose `WEBHOOK_REDRIVE_CONCURRENCY` and backoff already bound the outbound
-/// rate — so requeueing ten thousand deliveries costs one `UPDATE` and cannot
-/// exhaust the redrive budget or stampede a receiver that has only just come
-/// back up (coordinating with issue #235).
-///
-/// `ids` empty means "every failed delivery this merchant has".
+/// `ids` empty means every failed delivery this merchant has.
 pub async fn requeue_failed_deliveries(
     pool: &Db,
     merchant_id: &str,
