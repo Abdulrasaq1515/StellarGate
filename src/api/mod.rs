@@ -162,6 +162,16 @@ fn api_v1(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
     both authenticated and anonymous callers — see `payments::get_by_id`. */
     let payments_authed = axum::Router::new()
         .route("/", post(payments::create).get(payments::list))
+        /* The dead-letter view: a merchant's deliveries across *all* their
+        payments (issue #319). Declared before `/:id` and matched ahead of it —
+        `webhooks` is a static segment, and matchit gives static segments
+        priority over parameters, so this can never be shadowed by a payment
+        whose id happens to be the literal string "webhooks". */
+        .route("/webhooks", get(payments::list_merchant_webhooks))
+        .route(
+            "/webhooks/redeliver",
+            post(payments::redeliver_webhooks_bulk),
+        )
         .route("/:id/webhooks", get(payments::list_webhooks))
         .route(
             "/:id/webhooks/:delivery_id/redeliver",
