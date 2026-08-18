@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Explicit WAL checkpoint/growth tuning, a measured write-throughput
+  ceiling, and a documented decision on Postgres.** `wal_autocheckpoint` and
+  `journal_size_limit` are now set explicitly at pool-open time instead of
+  left at SQLite's compiled-in defaults — the latter caps on-disk `-wal` file
+  growth even when a long-lived reader defers `PASSIVE` checkpointing
+  indefinitely. `tests/write_throughput_bench.rs` (`--ignored`, not part of
+  CI) measures the single-writer path directly and DEPLOYMENT.md now states
+  the result plus why a Postgres backend isn't in this change: `db::migrate`
+  is a hand-written, unversioned schema (issue #268 is the prerequisite for a
+  second backend to track in lockstep without drifting) (issue #321).
+
 - **Expected-versus-live worker counts on `/health` and `/metrics`.** After boot
   there was no way to answer "how many workers should be running, and how many
   are?" — the information existed, but `stopped` was overloaded across three
