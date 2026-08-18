@@ -1062,6 +1062,36 @@ mod tests {
     }
 
     #[test]
+    fn native_payment_does_not_settle_usdc_intent_without_issuer() {
+        /* `ACCEPTED_ASSETS=XLM,USDC` (no issuer) used to persist a USDC intent
+        with `asset_issuer: None`, and `verify()` treated issuer-less as native
+        — so 100 XLM settled a 100 USDC invoice (issue #221). */
+        let mut p = pending("USDC", "100");
+        p.asset_issuer = None;
+        let hp = native_payment("100.0000000", "MEMO1234", "GGATEWAY");
+        assert_eq!(verify(&p, &hp, 0), None);
+        // A real USDC credit payment must not match either — there is no issuer
+        // to pin the intent to.
+        let credit = HorizonPayment {
+            kind: "payment".into(),
+            amount: Some("100.0".into()),
+            asset_type: Some("credit_alphanum4".into()),
+            asset_code: Some("USDC".into()),
+            asset_issuer: Some("GUSDC".into()),
+            to: Some("GGATEWAY".into()),
+            transaction_hash: Some("TXHASH".into()),
+            transaction: Some(TransactionRef {
+                memo: Some("MEMO1234".into()),
+                memo_type: Some("text".into()),
+                successful: Some(true),
+            }),
+            paging_token: Some("1".into()),
+            created_at: None,
+        };
+        assert_eq!(verify(&p, &credit, 0), None);
+    }
+
+    #[test]
     fn same_code_from_a_different_issuer_does_not_settle() {
         /* Intent priced in USDC from issuer A. A Horizon payment of USDC from
         issuer B must not settle it, even though both share a code (issue #222). */

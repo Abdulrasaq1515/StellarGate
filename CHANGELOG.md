@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
+  (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
+  `verify()` treated that shape as native XLM — a customer could settle a USDC
+  invoice by sending XLM. Boot now refuses any non-`XLM` entry without an
+  issuer, and a native payment cannot settle a USDC intent even if that
+  misconfiguration is constructed by hand (issue #221).
+
 - **Background tasks report *why* they exited.** `spawn_task` counted a start,
   and counted a stop when the future returned — with no way to tell "returned
   because shutdown was signalled" from "returned early because something went
