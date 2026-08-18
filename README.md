@@ -820,6 +820,7 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 | `limit` | Page size, 1–100 | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
 | `offset` | Rows to skip (legacy; prefer `cursor`) | `0` |
+| `include_total` | Offset mode only. Compute and return `total`. | `false` |
 
 **`200 OK`** — cursor mode (no `cursor` parameter on the first request)
 
@@ -836,7 +837,6 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 ```json
 {
   "payments": [ { "id": "...", "status": "pending" } ],
-  "total": 42,
   "limit": 20,
   "offset": 0,
   "next_cursor": "3230..."
@@ -846,7 +846,30 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 Both modes order rows identically (`created_at DESC`, then `id DESC` to break
 the whole-second `created_at` ties), so a `next_cursor` returned by an offset
 page resumes cleanly in cursor mode. `next_cursor` is `null` on the final page
-of either mode. Offset mode additionally returns `total` and `offset`.
+of either mode. Offset mode additionally returns `offset`.
+
+> **`total` is opt-in (`?include_total=true`), not sent by default.** SQLite
+> has no cached row count, so computing `total` is a full `COUNT(*)` scan over
+> every matching row — on every list request, including the first page,
+> regardless of how deep into the results the caller actually looks. Most
+> clients render "next page" affordances from `next_cursor` alone and never
+> read `total`, so the default path no longer pays for it. Ask for it
+> explicitly when you need it:
+>
+> ```json
+> {
+>   "payments": [ { "id": "...", "status": "pending" } ],
+>   "total": 42,
+>   "limit": 20,
+>   "offset": 0,
+>   "next_cursor": "3230..."
+> }
+> ```
+>
+> `total` is entirely absent from the response (not `null`) when not
+> requested, so a client can tell "not computed" apart from "computed as
+> zero." Cursor mode has never returned `total` and `include_total` has no
+> effect there.
 
 > **Migration path.** Switch to cursor pagination by sending `cursor` instead
 > of `offset`. Start with a first request that carries **no** `cursor` and

@@ -484,15 +484,21 @@ pub async fn get_payment(pool: &Db, id: &str) -> Result<Option<Payment>> {
 /// skipping or repeating rows. `created_at` is whole-second, so ties are
 /// common; leaving their order to SQLite lets offset pages repeat or skip
 /// rows and would make the migration cursor diverge from the keyset scan.
+/// Offset-paginated page of a merchant's payments. Does **not** compute a row
+/// count — see [`count_payments`] (issue #320). SQLite has no cached row
+/// count, so a `COUNT(*)` here would scan every matching row on every list
+/// request (including the first page) purely to fill a `total` field most
+/// callers never read; keeping it a separate, opt-in query means the default
+/// list path never pays for it.
 pub async fn list_payments(
     pool: &Db,
     merchant_id: &str,
     status: Option<&str>,
     limit: i64,
     offset: i64,
-) -> Result<(Vec<Payment>, i64)> {
-    let (rows, total) = if let Some(s) = status {
-        let rows = sqlx::query(
+) -> Result<Vec<Payment>> {
+    let rows = if let Some(s) = status {
+        sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -502,19 +508,9 @@ pub async fn list_payments(
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
-        .await?;
-
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM payments WHERE merchant_id = ? AND status = ?",
-        )
-        .bind(merchant_id)
-        .bind(s)
-        .fetch_one(pool)
-        .await?;
-
-        (rows, total)
+        .await?
     } else {
-        let rows = sqlx::query(
+        sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments WHERE merchant_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -523,17 +519,30 @@ pub async fn list_payments(
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
-        .await?;
-
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ?")
-            .bind(merchant_id)
-            .fetch_one(pool)
-            .await?;
-
-        (rows, total)
+        .await?
     };
 
-    Ok((rows.iter().map(row_to_payment).collect(), total))
+    Ok(rows.iter().map(row_to_payment).collect())
+}
+
+/// Count a merchant's payments matching an optional status filter. Split out
+/// from [`list_payments`] so the default `GET /payments` path never pays for
+/// a full-table `COUNT(*)` — this only runs when a caller explicitly asks for
+/// `total` via `?include_total=true` (issue #320).
+pub async fn count_payments(pool: &Db, merchant_id: &str, status: Option<&str>) -> Result<i64> {
+    let total = if let Some(s) = status {
+        sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ? AND status = ?")
+            .bind(merchant_id)
+            .bind(s)
+            .fetch_one(pool)
+            .await?
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ?")
+            .bind(merchant_id)
+            .fetch_one(pool)
+            .await?
+    };
+    Ok(total)
 }
 
 pub async fn list_payments_keyset(

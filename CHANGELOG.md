@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported once at boot and is terminal, and neither is confused with an
   ordinary stop (issue #317).
 
+- **`GET /payments` no longer runs a full `COUNT(*)` by default.** The offset
+  branch issued a second query — `SELECT COUNT(*) FROM payments WHERE
+  merchant_id = ?` (plus `AND status = ?` when filtering) — on every call,
+  purely to fill `total`. SQLite has no cached row count, so this scanned
+  every matching row every time, including the first page, for a field most
+  clients never read (they render "next page" from `next_cursor` alone).
+  `total` is now computed only when the request sets `?include_total=true`,
+  and is entirely absent from the response — not `null` — otherwise. Keyset
+  (cursor) pagination is unaffected; it has never returned `total` and
+  remains the recommended approach (issue #320).
+
 ### Added
 
 - **Expected-versus-live worker counts on `/health` and `/metrics`.** After boot
