@@ -696,6 +696,149 @@ pub async fn list_webhooks(
     })))
 }
 
+// ── Dead-letter view (issue #319) ────────────────────────────────────────────
+
+/// Delivery statuses worth filtering on, and therefore the only ones accepted.
+/// Same allow-list treatment as the payment `status` filter: anything else is a
+/// guaranteed-empty result and is rejected rather than silently returning none.
+const VALID_DELIVERY_STATUSES: [&str; 3] = ["failed", "pending", "delivered"];
+
+#[derive(Deserialize)]
+pub struct ListDeliveriesQuery {
+    /// Defaults to `failed` — the dead-letter case this endpoint exists for.
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+/// `GET /payments/webhooks` — a merchant's deliveries across *all* their
+/// payments, defaulting to the failed ones.
+///
+/// Before this, a permanently-failed delivery was reachable only by knowing the
+/// payment id and calling `GET /payments/:id/webhooks`. That is backwards: the
+/// reason to go looking is almost always "a merchant says they are missing
+/// events", and a payment id is precisely what the person asking does not have.
+/// Answering it meant querying SQLite directly on the production volume, and a
+/// merchant could not self-serve at all.
+pub async fn list_merchant_webhooks(
+    State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+    Query(q): Query<ListDeliveriesQuery>,
+) -> Result<Json<Value>, AppError> {
+    let status = q.status.as_deref().unwrap_or("failed");
+    if !VALID_DELIVERY_STATUSES.contains(&status) {
+        return Err(AppError::bad_request(
+            "invalid_status",
+            format!(
+                "invalid delivery status '{}'; valid: {}",
+                status,
+                VALID_DELIVERY_STATUSES.join(", ")
+            ),
+        ));
+    }
+
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+    let cursor = match &q.cursor {
+        Some(raw) => Some(
+            decode_cursor(raw)
+                .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?,
+        ),
+        None => None,
+    };
+
+    let deliveries = db::list_deliveries_for_merchant(
+        &state.pool,
+        &merchant_id,
+        status,
+        limit,
+        cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
+    )
+    .await?;
+
+    let next_cursor = if deliveries.len() == limit as usize {
+        deliveries
+            .last()
+            .map(|d| encode_cursor(&d.created_at, &d.id))
+    } else {
+        None
+    };
+
+    Ok(Json(json!({
+        "deliveries": deliveries.iter().map(delivery_to_json).collect::<Vec<_>>(),
+        "status": status,
+        "limit": limit,
+        "next_cursor": next_cursor,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedeliverBulkRequest {
+    /// Specific deliveries to requeue. Omit (or send an empty list) to requeue
+    /// every failed delivery this merchant has.
+    pub delivery_ids: Option<Vec<String>>,
+}
+
+/// Cap on explicitly-listed ids per request, so the generated `IN (...)` stays
+/// a sane size. Requeueing *everything* is unaffected — it needs no id list.
+const MAX_BULK_DELIVERY_IDS: usize = 100;
+
+/// `POST /payments/webhooks/redeliver` — bulk recovery after a merchant has
+/// fixed their endpoint.
+///
+/// This endpoint sends nothing itself. It resets matching failed rows to
+/// `pending` with `attempts = 0` and hands them to the redrive worker, whose
+/// `WEBHOOK_REDRIVE_CONCURRENCY` and exponential backoff already bound the
+/// outbound rate. So requeueing ten thousand deliveries costs one `UPDATE`,
+/// cannot exhaust the redrive budget, and cannot stampede a receiver that has
+/// only just come back up (coordinating with issue #235).
+///
+/// Requeueing also acknowledges: somebody has now acted on these failures, so
+/// they stop being exempt from retention.
+pub async fn redeliver_webhooks_bulk(
+    State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+    OptionalJsonBody(body): OptionalJsonBody<RedeliverBulkRequest>,
+) -> Result<Json<Value>, AppError> {
+    let ids = body.and_then(|b| b.delivery_ids).unwrap_or_default();
+    if ids.len() > MAX_BULK_DELIVERY_IDS {
+        return Err(AppError::bad_request(
+            "too_many_delivery_ids",
+            format!(
+                "at most {MAX_BULK_DELIVERY_IDS} delivery_ids per request; \
+                 omit the field to requeue every failed delivery"
+            ),
+        ));
+    }
+
+    let requeued = db::requeue_failed_deliveries(&state.pool, &merchant_id, &ids).await?;
+    tracing::info!(%merchant_id, requeued, "failed webhook deliveries requeued for redrive");
+
+    Ok(Json(json!({
+        "requeued": requeued,
+        "detail": "requeued deliveries are retried by the background redrive \
+                   worker, subject to its concurrency limit and backoff",
+    })))
+}
+
+/// One delivery as the API exposes it. The stored `payload` is deliberately
+/// omitted — it is the signed event body, it can be large, and a listing is for
+/// triage rather than replay.
+fn delivery_to_json(d: &db::WebhookDelivery) -> Value {
+    json!({
+        "id": d.id,
+        "payment_id": d.payment_id,
+        "url": d.url,
+        "event": d.event(),
+        "status": d.status,
+        "attempts": d.attempts,
+        "last_attempt": d.last_attempt,
+        "acknowledged_at": d.acknowledged_at,
+        "created_at": d.created_at,
+    })
+}
+
 pub async fn redeliver_webhook(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
