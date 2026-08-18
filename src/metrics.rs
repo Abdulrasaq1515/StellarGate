@@ -207,11 +207,80 @@ impl Default for AuthMetrics {
     }
 }
 
+/// Outcome counters for the Horizon poller's cycles, so throttling or
+/// sustained failure is a queryable fact on the `/metrics` scrape rather than
+/// only a `warn!` line indistinguishable from a one-off blip (issue #313).
+#[derive(Clone)]
+pub struct HorizonMetrics {
+    inner: Arc<HorizonMetricsInner>,
+}
+
+struct HorizonMetricsInner {
+    /// Cycles that completed without error (whether or not anything settled).
+    success: AtomicU64,
+    /// Cycles that failed on a `429`/`503` from Horizon.
+    rate_limited: AtomicU64,
+    /// Cycles that failed for any other reason.
+    error: AtomicU64,
+}
+
+impl Default for HorizonMetricsInner {
+    fn default() -> Self {
+        Self {
+            success: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+            error: AtomicU64::new(0),
+        }
+    }
+}
+
+impl HorizonMetrics {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(HorizonMetricsInner::default()),
+        }
+    }
+
+    pub fn record_success(&self) {
+        self.inner.success.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_rate_limited(&self) {
+        self.inner.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_error(&self) {
+        self.inner.error.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Snapshot accessors ────────────────────────────────────────────────
+
+    pub fn success(&self) -> u64 {
+        self.inner.success.load(Ordering::Relaxed)
+    }
+    pub fn rate_limited(&self) -> u64 {
+        self.inner.rate_limited.load(Ordering::Relaxed)
+    }
+    pub fn error(&self) -> u64 {
+        self.inner.error.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for HorizonMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Prometheus text exposition ────────────────────────────────────────────────
 
-/// Render webhook delivery and auth outcome metrics as a Prometheus-compatible
-/// plain-text snapshot. Called by `GET /metrics`.
-pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics) -> String {
+/// Render webhook delivery, auth outcome, background-task, and Horizon poll
+/// metrics as a Prometheus-compatible plain-text snapshot. Called by
+/// `GET /metrics`.
+pub fn render(
+    webhook: &WebhookMetrics,
+    auth: &AuthMetrics,
+    tasks: &crate::TaskHealth,
+    horizon: &HorizonMetrics,
+) -> String {
     let mut out = String::with_capacity(1024);
 
     // stellargate_webhook_deliveries_total — counter vec by outcome
@@ -279,6 +348,126 @@ pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics) -> String {
     out.push_str(&format!(
         "stellargate_auth_attempts_total{{outcome=\"failure\",reason=\"internal_error\"}} {}\n",
         auth.failure_internal_error()
+    ));
+
+    // Background task counters (issue #316): a crash-looping worker must be
+    // visible on the scrape, not only as a log line at shutdown.
+    out.push_str(
+        "# HELP stellargate_tasks_started_total Total background task starts (including restarts).\n",
+    );
+    out.push_str("# TYPE stellargate_tasks_started_total counter\n");
+    out.push_str(&format!(
+        "stellargate_tasks_started_total {}\n",
+        tasks.started()
+    ));
+    out.push_str("# HELP stellargate_tasks_stopped_total Total background task clean stops.\n");
+    out.push_str("# TYPE stellargate_tasks_stopped_total counter\n");
+    out.push_str(&format!(
+        "stellargate_tasks_stopped_total {}\n",
+        tasks.stopped()
+    ));
+    out.push_str("# HELP stellargate_tasks_failed_total Total background task panics.\n");
+    out.push_str("# TYPE stellargate_tasks_failed_total counter\n");
+    out.push_str(&format!(
+        "stellargate_tasks_failed_total {}\n",
+        tasks.failed()
+    ));
+    out.push_str(
+        "# HELP stellargate_task_restarts_total Supervisor restarts of a background task after panic or unexpected return.\n",
+    );
+    out.push_str("# TYPE stellargate_task_restarts_total counter\n");
+    let snaps = tasks.snapshot();
+    for snap in &snaps {
+        out.push_str(&format!(
+            "stellargate_task_restarts_total{{task=\"{}\"}} {}\n",
+            snap.name, snap.restarts
+        ));
+    }
+    out.push_str(
+        "# HELP stellargate_task_running Whether the named background task is currently running (1) or not (0).\n",
+    );
+    out.push_str("# TYPE stellargate_task_running gauge\n");
+    for snap in &snaps {
+        out.push_str(&format!(
+            "stellargate_task_running{{task=\"{}\"}} {}\n",
+            snap.name,
+            if snap.running { 1 } else { 0 }
+        ));
+    }
+    out.push_str(
+        "# HELP stellargate_task_consecutive_failures Consecutive panics of a background task since it last ran stably.\n",
+    );
+    out.push_str("# TYPE stellargate_task_consecutive_failures gauge\n");
+    for snap in &snaps {
+        out.push_str(&format!(
+            "stellargate_task_consecutive_failures{{task=\"{}\"}} {}\n",
+            snap.name, snap.consecutive_failures
+        ));
+    }
+
+    /* Expected-versus-live (issue #317). The raw counters could not answer
+    "how many workers should be running, and how many are?": `stopped` was
+    overloaded across clean shutdown, configuration-disabled exit and fault, so
+    `started - stopped - failed` was not a live count and there was nothing to
+    compare it against. These two gauges are that comparison, and
+    `expected` already excludes deliberately-disabled workers. Alert on
+    `stellargate_tasks_live < stellargate_tasks_expected`. */
+    out.push_str(
+        "# HELP stellargate_tasks_expected Background workers this deployment expects to be running, excluding any disabled by configuration.\n",
+    );
+    out.push_str("# TYPE stellargate_tasks_expected gauge\n");
+    out.push_str(&format!(
+        "stellargate_tasks_expected {}\n",
+        tasks.expected_tasks()
+    ));
+    out.push_str("# HELP stellargate_tasks_live Expected background workers currently running.\n");
+    out.push_str("# TYPE stellargate_tasks_live gauge\n");
+    out.push_str(&format!("stellargate_tasks_live {}\n", tasks.live_tasks()));
+
+    /* Separates "switched off on purpose" from "not running", which
+    `stellargate_task_running` alone reports identically. */
+    out.push_str(
+        "# HELP stellargate_task_disabled Whether the named background task exited because configuration gave it nothing to do (1) or not (0).\n",
+    );
+    out.push_str("# TYPE stellargate_task_disabled gauge\n");
+    for snap in &snaps {
+        out.push_str(&format!(
+            "stellargate_task_disabled{{task=\"{}\"}} {}\n",
+            snap.name,
+            if snap.disabled_reason.is_some() { 1 } else { 0 }
+        ));
+    }
+
+    // stellargate_horizon_poll_cycles_total — counter vec by outcome (#313)
+    out.push_str(
+        "# HELP stellargate_horizon_poll_cycles_total Total Horizon poll cycles by outcome.\n",
+    );
+    out.push_str("# TYPE stellargate_horizon_poll_cycles_total counter\n");
+    out.push_str(&format!(
+        "stellargate_horizon_poll_cycles_total{{outcome=\"success\"}} {}\n",
+        horizon.success()
+    ));
+    out.push_str(&format!(
+        "stellargate_horizon_poll_cycles_total{{outcome=\"rate_limited\"}} {}\n",
+        horizon.rate_limited()
+    ));
+    out.push_str(&format!(
+        "stellargate_horizon_poll_cycles_total{{outcome=\"error\"}} {}\n",
+        horizon.error()
+    ));
+
+    /* Reuses TaskHealth's last-success timestamp rather than tracking a
+    second one: `note_success()` is already called at the end of every
+    successful `poll_once` (and by the stream listener), so it is already the
+    authoritative "on-chain detection last made progress" instant that
+    /ready's cursor-freshness check reads. */
+    out.push_str(
+        "# HELP stellargate_horizon_last_successful_poll_timestamp_seconds Unix timestamp of the last successful Horizon poll or stream event.\n",
+    );
+    out.push_str("# TYPE stellargate_horizon_last_successful_poll_timestamp_seconds gauge\n");
+    out.push_str(&format!(
+        "stellargate_horizon_last_successful_poll_timestamp_seconds {}\n",
+        tasks.last_success_unix()
     ));
 
     out
