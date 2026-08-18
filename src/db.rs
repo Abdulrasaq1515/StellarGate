@@ -24,218 +24,26 @@ fn normalize_ts(raw: &str) -> String {
 }
 
 pub async fn migrate(pool: &Db) -> Result<()> {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS payments (
-            id TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL DEFAULT 'anonymous',
-            destination_address TEXT NOT NULL,
-            memo TEXT NOT NULL UNIQUE,
-            amount TEXT NOT NULL,
-            asset TEXT NOT NULL DEFAULT 'XLM',
-            status TEXT NOT NULL DEFAULT 'pending',
-            webhook_url TEXT,
-            tx_hash TEXT,
-            paid_amount TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-            expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
-        )",
-    )
-    .execute(pool)
-    .await?;
+    sqlx::migrate!("./migrations").run(pool).await?;
 
-    /* Bring pre-existing payment tables up to schema. New databases already have
-    `expires_at` from the CREATE TABLE above; older ones need it added in
-    place. SQLite rejects a non-constant DEFAULT on ALTER ... ADD COLUMN, so we
-    add it nullable and backfill below. */
-    let has_expires_at: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
-    )
-    .fetch_one(pool)
-    .await?;
-    if has_expires_at == 0 {
-        sqlx::query("ALTER TABLE payments ADD COLUMN expires_at TEXT")
-            .execute(pool)
-            .await?;
-    }
-    /* Backfill any row without an expiry (legacy rows, or rows inserted in the
-    brief window before the column existed). `created_at + 1h` mirrors the
-    default TTL; SQLite's date functions accept the stored RFC 3339 `Z` form. */
-    sqlx::query(
-        "UPDATE payments
-            SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour')
-          WHERE expires_at IS NULL",
-    )
-    .execute(pool)
-    .await?;
+    // Transition period: backfill processed_transactions for existing deployments.
+    // This preserves the received-amount ledger for in-flight intents.
+    // Once all deployments are on the new schema, this can be removed.
+    backfill_processed_transactions(pool).await?;
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
-        .execute(pool)
-        .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
-        .execute(pool)
-        .await?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
-    )
-    .execute(pool)
-    .await?;
+    Ok(())
+}
 
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS webhook_deliveries (
-            id TEXT PRIMARY KEY,
-            payment_id TEXT NOT NULL,
-            url TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            event_type TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            attempts INTEGER NOT NULL DEFAULT 0,
-            last_attempt TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    /* Bring pre-existing delivery tables up to schema. `event_type` records
-    which event the payload represents so a redelivery can echo the original
-    `X-StellarGate-Event` header instead of guessing. Rows written before this
-    column existed stay NULL; readers fall back to the `event` field inside the
-    stored payload. */
-    let has_event_type: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'event_type'",
-    )
-    .fetch_one(pool)
-    .await?;
-    if has_event_type == 0 {
-        sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
-            .execute(pool)
-            .await?;
-    }
-
-    /* Durable key/value state — used by the Horizon poller to persist its
-    paging cursor so it resumes exactly where it left off across restarts. */
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS kv_state (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    /* Merchants are provisioned via POST /merchants. The raw API key is never
-    stored; only its SHA-256 hex digest is persisted so a DB breach does not
-    expose live credentials. */
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS merchants (
-            id TEXT PRIMARY KEY,
-            api_key_hash TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    /* API keys, one row per credential rather than one per merchant, so a key
-    can be rotated (issue a second, revoke the first) and revoked individually
-    without disturbing the merchant record.
-
-    Only the SHA-256 digest is stored; `prefix` keeps the first few characters
-    of the raw key so an operator can tell two keys apart in a list without the
-    secret being recoverable. `revoked_at` is a tombstone rather than a delete
-    so an audit trail survives revocation. */
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS api_keys (
-            id TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL,
-            key_hash TEXT NOT NULL UNIQUE,
-            prefix TEXT NOT NULL,
-            label TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-            last_used_at TEXT,
-            revoked_at TEXT
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    /* Authentication looks a key up by hash on every request, so this index is
-    load-bearing rather than an optimisation. */
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
-        .execute(pool)
-        .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_merchant ON api_keys(merchant_id)")
-        .execute(pool)
-        .await?;
-
-    /* Carry pre-existing single-key merchants across. Their raw key is not
-    recoverable, but the hash is all authentication needs, so keys issued
-    before this table existed keep working. The prefix is unknown for those
-    rows — mark them rather than inventing one. */
-    sqlx::query(
-        "INSERT OR IGNORE INTO api_keys (id, merchant_id, key_hash, prefix, label, created_at)
-         SELECT lower(hex(randomblob(16))), id, api_key_hash, 'legacy', 'migrated', created_at
-           FROM merchants
-          WHERE api_key_hash IS NOT NULL AND api_key_hash <> ''",
-    )
-    .execute(pool)
-    .await?;
-
-    /* `webhook_deliveries` is queried by payment_id on every delivery listing
-    and by the redrive worker; without this it is a full scan (issue #112). */
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment
-         ON webhook_deliveries(payment_id)",
-    )
-    .execute(pool)
-    .await?;
-
-    /* Idempotency keys for payment creation. A key is unique per merchant and
-    maps to the payment id minted for the first request that used it, so a
-    client retrying after a network blip gets the original payment back
-    instead of a duplicate intent. */
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS idempotency_keys (
-            merchant_id TEXT NOT NULL,
-            idempotency_key TEXT NOT NULL,
-            payment_id TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-            PRIMARY KEY (merchant_id, idempotency_key)
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    /* Every on-chain transaction we credit to an intent, one row per
-    (payment_id, tx_hash). The cumulative received amount for an intent is the
-    SUM of `amount_stroops` over its rows, so re-seeing a transaction (on a
-    later poll cycle, over the stream, or from a concurrent reconciler) is an
-    idempotent no-op instead of a double-credit. `amount_stroops` is the
-    integer stroop value so SUM is exact. */
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS processed_transactions (
-            payment_id TEXT NOT NULL,
-            tx_hash TEXT NOT NULL,
-            amount_stroops INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-            PRIMARY KEY (payment_id, tx_hash)
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
-    and a cumulative `paid_amount`, so upgrading preserves the received-amount
-    ledger for intents that are still in flight. Idempotent via ON CONFLICT, so
-    it is safe to run on every startup. */
+/// Backfill processed_transactions from legacy payments.tx_hash + paid_amount.
+/// Idempotent via ON CONFLICT; safe to run multiple times during transition.
+async fn backfill_processed_transactions(pool: &Db) -> Result<()> {
     let legacy = sqlx::query(
         "SELECT id, tx_hash, paid_amount FROM payments
          WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
+
     for row in &legacy {
         let id: String = row.get("id");
         let tx_hash: String = row.get("tx_hash");
@@ -252,22 +60,6 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .execute(pool)
             .await?;
         }
-    }
-
-    /* Normalise legacy rows that were written by the old datetime('now') default,
-    which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
-    startup — the WHERE clause skips rows that are already RFC 3339. */
-    for tbl_col in [
-        ("payments", "created_at"),
-        ("payments", "updated_at"),
-        ("webhook_deliveries", "created_at"),
-    ] {
-        let sql = format!(
-            "UPDATE {} SET {col} = replace({col}, ' ', 'T') || 'Z' WHERE {col} NOT LIKE '%T%'",
-            tbl_col.0,
-            col = tbl_col.1
-        );
-        sqlx::query(&sql).execute(pool).await?;
     }
 
     Ok(())

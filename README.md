@@ -966,26 +966,46 @@ Compose network, so the API cannot be hit over plaintext via the VM's IP.
 
 ## Database Migrations
 
-Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), called once from `main` before the HTTP listener binds. It is hand-written Rust, not a migration runner:
+Schema is managed using **sqlx::migrate!**, which runs migrations from `migrations/*.sql` at startup. Each migration runs exactly once and is recorded in the `_sqlx_migrations` table, enabling non-idempotent schema changes like column drops, type changes, and data transformations.
 
-- Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
-- New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
-- A few one-time data backfills (populating `processed_transactions` from legacy rows, normalising pre-RFC 3339 timestamps) run alongside them.
+**How it works:**
 
-Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
+1. `db::migrate()` in [`src/db.rs`](src/db.rs) calls `sqlx::migrate!("./migrations").run(pool)` at startup, before the HTTP listener binds.
+2. sqlx reads all `migrations/*.sql` files (in lexicographic order by filename).
+3. For each migration not already recorded in `_sqlx_migrations`, sqlx:
+   - Runs the SQL in a transaction
+   - Records the migration as applied with a checksum
+   - Commits the transaction
+4. Migrations already recorded are skipped, so they never re-run.
 
-> [!IMPORTANT]
-> The `migrations/` directory is **not read at runtime.** Nothing in the codebase calls `sqlx::migrate!`, and the SQL in that directory has drifted from the live schema — it is missing `merchants`, `api_keys`, `processed_transactions`, and the `webhook_deliveries.event_type` column. Treat `db::migrate` as the only source of schema truth until this is resolved.
->
-> Tracked in #92 (this documentation), #93 (the two diverging sources), and #268 (adopting a recorded schema version).
+**Migration naming convention:**
 
-**Changing the schema**
+`YYYYMMDDHHMMSS_description.sql` — timestamp prefix ensures ordering, description explains intent.
 
-1. Add the statement to `db::migrate` in `src/db.rs`, keeping it idempotent — it will run on every startup of every existing deployment.
-2. For a new column on an existing table, follow the `pragma_table_info` probe pattern already used for `expires_at` and `event_type`. SQLite rejects a non-constant `DEFAULT` on `ALTER TABLE ... ADD COLUMN`, so add the column nullable and backfill it in a second statement.
-3. Run `cargo test` — the suite calls `db::migrate` against an in-memory database, so syntax errors surface immediately.
+Example:
+```
+migrations/20260101000000_baseline.sql
+migrations/20260102000000_migrate_legacy_keys.sql
+migrations/20260103000000_backfill_processed_transactions.sql
+```
 
-Because there is no version tracking, a change that is *not* safe to re-run cannot currently be expressed. If you need one, resolve #268 first rather than working around it.
+**Adding a new migration:**
+
+1. Create `migrations/YYYYMMDDHHMMSS_description.sql` with your schema change.
+2. Write idempotent SQL when possible (for safety during development).
+3. For non-idempotent changes (column drops, type changes), ensure the migration runs only once — sqlx guarantees this.
+4. Run `cargo test` — the suite calls `db::migrate()` against an in-memory database, so syntax errors surface immediately.
+
+**For existing deployments:**
+
+The baseline migration (`20260101000000_baseline.sql`) contains the full schema that `db::migrate()` previously created. On first startup after upgrading:
+- sqlx will see no `_sqlx_migrations` table and create it
+- It will run the baseline migration (idempotent via `IF NOT EXISTS`)
+- Subsequent migrations apply cleanly
+
+**Transition period:**
+
+During the transition, `db::migrate()` also calls `backfill_processed_transactions()` to handle legacy data. Once all deployments are upgraded, this can be removed and made a one-time migration instead.
 
 ---
 
