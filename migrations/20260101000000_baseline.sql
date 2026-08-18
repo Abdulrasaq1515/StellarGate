@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS payments (
     memo TEXT NOT NULL UNIQUE,
     amount TEXT NOT NULL,
     asset TEXT NOT NULL DEFAULT 'XLM',
+    asset_issuer TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     webhook_url TEXT,
     tx_hash TEXT,
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     status TEXT NOT NULL DEFAULT 'pending',
     attempts INTEGER NOT NULL DEFAULT 0,
     last_attempt TEXT,
+    acknowledged_at TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
