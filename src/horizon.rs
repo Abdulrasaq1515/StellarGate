@@ -41,6 +41,7 @@
 //! The matching logic in [`verify`] is pure and unit-tested; the networked
 //! functions wrap it with I/O.
 
+use crate::supervise::TaskExit;
 use crate::{db, money, webhook, AppState};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -203,11 +204,12 @@ fn elapsed_secs(ts: &str) -> Option<i64> {
 /// intent (0 for a fresh `pending` payment, non-zero for an `underpaid` one).
 ///
 /// Returns `None` when the payment is unrelated (wrong type, destination, memo,
-/// or asset). When it matches, returns the verdict for the cumulative total.
+/// or asset — including a credit payment whose issuer does not match the
+/// issuer stored on the intent). When it matches, returns the verdict for the
+/// cumulative total.
 pub fn verify(
     payment: &db::Payment,
     hp: &HorizonPayment,
-    accepted_assets: &[crate::config::AcceptedAsset],
     already_paid_stroops: i64,
 ) -> Option<Verdict> {
     if hp.kind != "payment" {
@@ -228,18 +230,18 @@ pub fn verify(
         return None;
     }
 
-    let asset_matches = accepted_assets.iter().any(|a| {
-        if a.code != payment.asset {
-            return false;
+    /* Match the issuer this intent was priced in — not any allow-list entry
+    that happens to share the code. Two `USDC` issuers used to both settle an
+    intent that stored only the code (issue #222). */
+    let asset_matches = match payment.asset_issuer.as_deref().filter(|s| !s.is_empty()) {
+        None => {
+            payment.asset.eq_ignore_ascii_case("XLM") && hp.asset_type.as_deref() == Some("native")
         }
-        match a.issuer.as_deref() {
-            None => hp.asset_type.as_deref() == Some("native"),
-            Some(issuer) => {
-                hp.asset_code.as_deref() == Some(a.code.as_str())
-                    && hp.asset_issuer.as_deref() == Some(issuer)
-            }
+        Some(issuer) => {
+            hp.asset_code.as_deref() == Some(payment.asset.as_str())
+                && hp.asset_issuer.as_deref() == Some(issuer)
         }
-    });
+    };
     if !asset_matches {
         return None;
     }
@@ -268,8 +270,59 @@ pub fn verify(
     }
 }
 
+/// A Horizon HTTP failure, distinguishing throttling (`429 Too Many Requests`
+/// or `503 Service Unavailable`, carrying `Retry-After` when Horizon sends
+/// one) from any other failure. Before this, `fetch_recent_payments` turned
+/// every non-2xx response into an opaque `reqwest::Error` via
+/// `error_for_status()`, discarding the status code and headers — the poller
+/// had no way to tell "back off, and for how long" from an ordinary blip
+/// (issue #313).
+#[derive(Debug)]
+pub struct HorizonHttpError {
+    pub status: reqwest::StatusCode,
+    pub retry_after: Option<Duration>,
+    body: String,
+}
+
+impl std::fmt::Display for HorizonHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Horizon returned {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for HorizonHttpError {}
+
+impl HorizonHttpError {
+    /// `429`/`503` mean "back off", not "something is broken" — every other
+    /// non-2xx status is treated as an ordinary failure.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(
+            self.status,
+            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        )
+    }
+}
+
+/// Parse `Retry-After` as delta-seconds (RFC 9110) — the form every rate
+/// limiter this service talks to actually sends, including Horizon's. The
+/// HTTP-date form is not handled: nothing observed in the wild sends it for
+/// `429`/`503`, and misparsing a date as a much smaller or larger delay would
+/// be worse than falling back to the exponential backoff below.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
 /// Fetch the most recent payments into `account` from Horizon, newest first,
 /// with their transactions joined so memos are available.
+///
+/// A non-2xx response is returned as a [`HorizonHttpError`] rather than
+/// `error_for_status`'s opaque `reqwest::Error`, so a caller can tell a `429`/
+/// `503` — and any `Retry-After` Horizon attached — apart from an ordinary
+/// failure (issue #313).
 pub async fn fetch_recent_payments(
     client: &reqwest::Client,
     horizon_url: &str,
@@ -284,14 +337,25 @@ pub async fn fetch_recent_payments(
         cursor,
         limit
     );
-    let page: PaymentsPage = client
+    let resp = client
         .get(&url)
         .header("Accept", "application/json")
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let retry_after = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(HorizonHttpError {
+            status,
+            retry_after,
+            body,
+        }
+        .into());
+    }
+
+    let page: PaymentsPage = resp.json().await?;
     Ok(page.embedded.records)
 }
 
@@ -401,15 +465,28 @@ async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
     }
 }
 
+/// Requests a single `poll_once` call will issue before yielding back to the
+/// caller, even if Horizon still has more pages. Without this, a backlog that
+/// built up while Horizon was throttling (issue #313) would be drained in one
+/// cycle by looping until caught up — reissuing exactly the request volume
+/// that tripped the limit, immediately after it lifts. The cursor is
+/// checkpointed after every page, so stopping early costs nothing: the next
+/// cycle resumes exactly where this one stopped, `PAGE_LIMIT` records later
+/// per additional cycle.
+const MAX_PAGES_PER_CYCLE: usize = 25;
+
 /// Run one poll cycle: page forward from the persisted cursor through every
 /// payment that has landed since, settling any that satisfy a pending intent,
-/// until caught up. The cursor is advanced (and persisted) only after a page's
-/// records have been processed, so no record is ever skipped and a restart
-/// resumes exactly where it left off. Safe to call repeatedly; re-seeing an
-/// already-settled record is a no-op (its intent is no longer pending).
+/// until caught up or [`MAX_PAGES_PER_CYCLE`] pages have been fetched. The
+/// cursor is advanced (and persisted) only after a page's records have been
+/// processed, so no record is ever skipped and a restart (or the next cycle,
+/// if the page cap was hit) resumes exactly where it left off. Safe to call
+/// repeatedly; re-seeing an already-settled record is a no-op (its intent is
+/// no longer pending).
 pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
     let mut cursor = starting_cursor(state).await?;
     let mut settled = 0;
+    let mut pages = 0usize;
 
     loop {
         let page = fetch_recent_payments(
@@ -421,6 +498,7 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
         )
         .await?;
         let count = page.len();
+        pages += 1;
 
         for hp in &page {
             if let Some(token) = &hp.paging_token {
@@ -450,7 +528,20 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
         if count < PAGE_LIMIT as usize {
             break;
         }
+
+        if pages >= MAX_PAGES_PER_CYCLE {
+            debug!(
+                pages,
+                "poll cycle hit its per-cycle page cap; resuming next cycle"
+            );
+            break;
+        }
     }
+
+    /* A completed cycle is on-chain progress even with nothing to settle — the
+    cursor advanced and the poller is alive. This heartbeat is what /ready's
+    cursor-freshness check measures (issue #315). */
+    state.task_health.note_success();
 
     Ok(settled)
 }
@@ -483,14 +574,7 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
     unrelated traffic never pollutes the ledger. `verify` returns `None` for
     anything that does not satisfy this intent (wrong type/destination/memo/
     asset, or an unparseable amount). */
-    if verify(
-        &payment,
-        hp,
-        &state.config.accepted_assets,
-        already_paid_stroops,
-    )
-    .is_none()
-    {
+    if verify(&payment, hp, already_paid_stroops).is_none() {
         return Ok(false);
     }
 
@@ -599,17 +683,56 @@ async fn settle(
     settled.tx_hash = Some(tx_hash.to_string());
     settled.paid_amount = Some(paid_amount.to_string());
     /* Webhook delivery is handled asynchronously by the webhook subsystem
-    (recording here is non-blocking from reconciliation's point of view). */
+    (recording here is non-blocking from reconciliation's point of view).
+
+    Design note: dispatch() still delivers inline so the common case settles and
+    notifies in one pass with no added latency. The redrive worker is a safety net
+    on top of that for the crash case, not a replacement for it — rewriting dispatch
+    to be record-only would be a bigger, riskier change than issue #156 asked for
+    and would break the existing synchronous-delivery test coverage. */
     webhook::dispatch(state, &settled, event, delta).await;
     true
 }
 
+/// Floor and cap for the poller's failure backoff. Reuses the same
+/// equal-jitter schedule (`webhook::retry_delay`) the webhook redrive worker
+/// backs off with (issue #318) — the shape solves the same problem here:
+/// growth so repeated failures stop hammering Horizon at the configured poll
+/// interval, jitter so it doesn't retry in lockstep with itself every cycle.
+const POLL_BACKOFF_BASE: Duration = Duration::from_secs(1);
+const POLL_BACKOFF_MAX: Duration = Duration::from_secs(120);
+
+/// Choose how long to wait before the poller's next attempt, given this
+/// cycle's outcome (issue #313).
+///
+/// A `429`/`503` that carried `Retry-After` is honored exactly — Horizon told
+/// us how long to wait, and second-guessing it with our own backoff could
+/// still be too short. Every other failure (including a rate limit with no
+/// `Retry-After`) falls back to the exponential-with-jitter schedule, keyed
+/// on `consecutive_failures` so it keeps growing across repeated failures
+/// instead of resetting each cycle.
+fn next_poll_delay(consecutive_failures: u32, retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or_else(|| {
+        webhook::retry_delay(consecutive_failures, POLL_BACKOFF_BASE, POLL_BACKOFF_MAX)
+    })
+}
+
 /// Background loop that polls Horizon on the configured interval until the
 /// process shuts down. Idles (without polling) while no gateway is configured.
-pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+///
+/// A failed cycle no longer waits out the fixed `POLL_INTERVAL_SECS` before
+/// trying again at the same rate that likely caused it (issue #313): a `429`
+/// backs off for at least `Retry-After`, and repeated failures of any kind
+/// back off exponentially with jitter, both reset to the configured interval
+/// by the next success.
+pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) -> TaskExit {
     if !state.config.gateway_configured() {
-        warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon poller disabled");
-        return;
+        /* Previously this parked on the shutdown signal purely so the
+        supervisor would not read a deliberate idle as an unexpected return.
+        Saying so explicitly is both clearer and cheaper: the supervisor now
+        knows this is terminal-by-design, reports it once, and does not hold a
+        task open for the life of the process to convey it (issue #317). */
+        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
     }
 
     let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
@@ -619,18 +742,51 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
         "Horizon poller started"
     );
 
+    let mut consecutive_failures: u32 = 0;
+    let mut next_delay = interval;
+
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(next_delay) => {}
             _ = shutdown.changed() => {
                 info!("Horizon poller shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
+
         match poll_once(&state).await {
-            Ok(0) => debug!("poll: nothing to settle"),
-            Ok(n) => info!(settled = n, "poll cycle settled payments"),
-            Err(e) => warn!(error = %e, "poll cycle failed"),
+            Ok(n) => {
+                if n == 0 {
+                    debug!("poll: nothing to settle");
+                } else {
+                    info!(settled = n, "poll cycle settled payments");
+                }
+                state.horizon_metrics.record_success();
+                consecutive_failures = 0;
+                next_delay = interval;
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let horizon_err = e.downcast_ref::<HorizonHttpError>();
+                let rate_limited = horizon_err.is_some_and(|he| he.is_rate_limited());
+                let retry_after = horizon_err.and_then(|he| he.retry_after);
+
+                if rate_limited {
+                    state.horizon_metrics.record_rate_limited();
+                } else {
+                    state.horizon_metrics.record_error();
+                }
+
+                next_delay = next_poll_delay(consecutive_failures, retry_after);
+                warn!(
+                    error = %e,
+                    rate_limited,
+                    retry_after_secs = retry_after.map(|d| d.as_secs()),
+                    consecutive_failures,
+                    next_delay_secs = next_delay.as_secs(),
+                    "poll cycle failed"
+                );
+            }
         }
     }
 }
@@ -674,10 +830,12 @@ fn parse_sse_block(block: &str) -> SseEvent {
 /// automatically with exponential backoff, resuming from the last seen cursor
 /// so no payments are missed across a dropped connection. Idles (without
 /// connecting) while no gateway is configured.
-pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_stream_listener(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     if !state.config.gateway_configured() {
-        warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon stream listener disabled");
-        return;
+        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
     }
 
     info!(account = %state.config.gateway_public, "Horizon payment stream listener started");
@@ -691,8 +849,12 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
     {
         Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, "failed to build stream HTTP client; stream listener disabled");
-            return;
+            /* The case issue #317 calls out by name: this was a `warn!`
+            followed by a permanent exit, recorded as an ordinary stop. Payment
+            detection over the stream was simply gone, and nothing said so.
+            It is a fault, not a configuration choice, so it is reported as one
+            and the supervisor retries it. */
+            return TaskExit::Fatal(format!("failed to build stream HTTP client: {e}"));
         }
     };
 
@@ -713,7 +875,7 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
             }
             _ = shutdown.changed() => {
                 info!("Horizon stream listener shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
 
@@ -725,7 +887,7 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
             _ = tokio::time::sleep(backoff) => {}
             _ = shutdown.changed() => {
                 info!("Horizon stream listener shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
         backoff = (backoff * 2).min(max_backoff);
@@ -806,6 +968,9 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
             if let Some(cursor_age_secs) = hp.created_at.as_deref().and_then(elapsed_secs) {
                 info!(cursor_age_secs, "stream cursor advanced");
             }
+            /* Receiving a payment record means the stream is alive and the
+            cursor moved — the same heartbeat /ready's freshness check uses. */
+            state.task_health.note_success();
             if let Err(e) = reconcile_payment(state, &hp).await {
                 warn!(error = %e, "failed to reconcile streamed payment");
             }
@@ -820,6 +985,10 @@ mod tests {
     use super::*;
 
     fn pending(asset: &str, amount: &str) -> db::Payment {
+        let asset_issuer = match asset {
+            "USDC" => Some("GUSDC".into()),
+            _ => None,
+        };
         db::Payment {
             id: "id-1".into(),
             merchant_id: "m".into(),
@@ -834,6 +1003,7 @@ mod tests {
             created_at: "now".into(),
             updated_at: "now".into(),
             expires_at: "later".into(),
+            asset_issuer,
         }
     }
 
@@ -874,7 +1044,7 @@ mod tests {
         let p = pending("XLM", "10.00");
         let hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "10".into(),
@@ -887,7 +1057,7 @@ mod tests {
         let p = pending("XLM", "10");
         let hp = native_payment("12.5", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Overpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "12.5".into(),
@@ -900,7 +1070,7 @@ mod tests {
         let p = pending("XLM", "10");
         let hp = native_payment("9.9999999", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Underpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "9.9999999".into(),
@@ -914,14 +1084,14 @@ mod tests {
         let p = pending("XLM", "5");
         let hp1 = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert!(matches!(
-            verify(&p, &hp1, &test_assets(), 0),
+            verify(&p, &hp1, 0),
             Some(Verdict::Underpaid { .. })
         ));
 
         // Top-up: 2 XLM arrives; cumulative = 5 = expected — completes exactly.
         let hp2 = native_payment("2.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp2, &test_assets(), 30_000_000),
+            verify(&p, &hp2, 30_000_000),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "5".into(),
@@ -936,7 +1106,7 @@ mod tests {
         // Top-up of 3 XLM; cumulative = 6 > 5 — overpaid.
         let hp = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, &test_assets(), 30_000_000),
+            verify(&p, &hp, 30_000_000),
             Some(Verdict::Overpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "6".into(),
@@ -948,7 +1118,7 @@ mod tests {
     fn wrong_memo_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "OTHER", "GGATEWAY");
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     /// A `memo_id`/`memo_hash`/`memo_return` transaction that happens to
@@ -959,7 +1129,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().memo_type = Some("id".into());
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     #[test]
@@ -967,14 +1137,14 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().memo_type = None;
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     #[test]
     fn wrong_destination_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "MEMO1234", "GSOMEONEELSE");
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     #[test]
@@ -984,7 +1154,7 @@ mod tests {
         hp.asset_type = Some("credit_alphanum4".into());
         hp.asset_code = Some("USDC".into());
         hp.asset_issuer = Some("GUSDC".into());
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     #[test]
@@ -1007,7 +1177,7 @@ mod tests {
             created_at: None,
         };
         assert!(matches!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -1031,10 +1201,67 @@ mod tests {
             paging_token: Some("1".into()),
             created_at: None,
         };
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
         // Sanity: with the right issuer it would have matched.
         hp.asset_issuer = Some("GUSDC".into());
-        assert!(verify(&p, &hp, &test_assets(), 0).is_some());
+        assert!(verify(&p, &hp, 0).is_some());
+    }
+
+    #[test]
+    fn native_payment_does_not_settle_usdc_intent_without_issuer() {
+        /* `ACCEPTED_ASSETS=XLM,USDC` (no issuer) used to persist a USDC intent
+        with `asset_issuer: None`, and `verify()` treated issuer-less as native
+        — so 100 XLM settled a 100 USDC invoice (issue #221). */
+        let mut p = pending("USDC", "100");
+        p.asset_issuer = None;
+        let hp = native_payment("100.0000000", "MEMO1234", "GGATEWAY");
+        assert_eq!(verify(&p, &hp, 0), None);
+        // A real USDC credit payment must not match either — there is no issuer
+        // to pin the intent to.
+        let credit = HorizonPayment {
+            kind: "payment".into(),
+            amount: Some("100.0".into()),
+            asset_type: Some("credit_alphanum4".into()),
+            asset_code: Some("USDC".into()),
+            asset_issuer: Some("GUSDC".into()),
+            to: Some("GGATEWAY".into()),
+            transaction_hash: Some("TXHASH".into()),
+            transaction: Some(TransactionRef {
+                memo: Some("MEMO1234".into()),
+                memo_type: Some("text".into()),
+                successful: Some(true),
+            }),
+            paging_token: Some("1".into()),
+            created_at: None,
+        };
+        assert_eq!(verify(&p, &credit, 0), None);
+    }
+
+    #[test]
+    fn same_code_from_a_different_issuer_does_not_settle() {
+        /* Intent priced in USDC from issuer A. A Horizon payment of USDC from
+        issuer B must not settle it, even though both share a code (issue #222). */
+        let mut p = pending("USDC", "5");
+        p.asset_issuer = Some("GISSUER_A".into());
+        let mut hp = HorizonPayment {
+            kind: "payment".into(),
+            amount: Some("5.0".into()),
+            asset_type: Some("credit_alphanum4".into()),
+            asset_code: Some("USDC".into()),
+            asset_issuer: Some("GISSUER_B".into()),
+            to: Some("GGATEWAY".into()),
+            transaction_hash: Some("TXHASH".into()),
+            transaction: Some(TransactionRef {
+                memo: Some("MEMO1234".into()),
+                memo_type: Some("text".into()),
+                successful: Some(true),
+            }),
+            paging_token: Some("1".into()),
+            created_at: None,
+        };
+        assert_eq!(verify(&p, &hp, 0), None);
+        hp.asset_issuer = Some("GISSUER_A".into());
+        assert!(verify(&p, &hp, 0).is_some());
     }
 
     #[test]
@@ -1042,7 +1269,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.kind = "create_account".into();
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     /// A transaction Horizon reports as `successful: false` must never settle an
@@ -1052,11 +1279,11 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().successful = Some(false);
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
         // Sanity: the same record with `successful: true` would have completed.
         hp.transaction.as_mut().unwrap().successful = Some(true);
         assert!(matches!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -1068,7 +1295,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().successful = None;
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     fn native_balance() -> AccountBalance {
@@ -1164,7 +1391,7 @@ mod tests {
         let hp: HorizonPayment = serde_json::from_str(data).unwrap();
         let p = pending("XLM", "10.00");
         assert!(matches!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -1198,5 +1425,97 @@ mod tests {
             page.embedded.records[0].paging_token.as_deref(),
             Some("123456789-1")
         );
+    }
+
+    // ── Poller backoff (issue #313) ──────────────────────────────────────────
+
+    #[test]
+    fn retry_after_header_parses_delta_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn retry_after_header_absent_is_none() {
+        assert_eq!(parse_retry_after(&reqwest::header::HeaderMap::new()), None);
+    }
+
+    /// The HTTP-date form is deliberately not parsed (see `parse_retry_after`'s
+    /// doc comment) — an unrecognised value must fall back to `None`, not panic
+    /// or misparse into a nonsense duration.
+    #[test]
+    fn retry_after_header_http_date_form_is_ignored() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn is_rate_limited_true_for_429_and_503() {
+        for status in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let err = HorizonHttpError {
+                status,
+                retry_after: None,
+                body: String::new(),
+            };
+            assert!(err.is_rate_limited(), "{status} must be rate_limited");
+        }
+    }
+
+    #[test]
+    fn is_rate_limited_false_for_an_ordinary_server_error() {
+        let err = HorizonHttpError {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            retry_after: None,
+            body: String::new(),
+        };
+        assert!(!err.is_rate_limited());
+    }
+
+    /// A `Retry-After` from Horizon is honored exactly, not folded into or
+    /// capped by the exponential schedule.
+    #[test]
+    fn next_delay_honors_retry_after_over_the_backoff_schedule() {
+        assert_eq!(
+            next_poll_delay(1, Some(Duration::from_secs(300))),
+            Duration::from_secs(300),
+            "a large Retry-After must not be clamped by POLL_BACKOFF_MAX"
+        );
+        assert_eq!(
+            next_poll_delay(1, Some(Duration::from_millis(500))),
+            Duration::from_millis(500),
+            "a small Retry-After must still be honored, not raised to a floor"
+        );
+    }
+
+    /// Without a `Retry-After`, repeated failures back off exponentially:
+    /// equal jitter keeps each delay within `[ceiling/2, ceiling]`
+    /// (`webhook::retry_delay`'s contract), and the ceiling for
+    /// `consecutive_failures=10` has long since saturated at
+    /// `POLL_BACKOFF_MAX` (`POLL_BACKOFF_BASE * 2^9` vastly exceeds it) — so
+    /// unlike failure 1, whose ceiling is still `POLL_BACKOFF_BASE`, every
+    /// draw for failure 10 must land in the top half of the max.
+    #[test]
+    fn next_delay_without_retry_after_grows_with_consecutive_failures() {
+        let first = next_poll_delay(1, None);
+        assert!(
+            first <= POLL_BACKOFF_BASE,
+            "failure 1's ceiling must still be POLL_BACKOFF_BASE, got {first:?}"
+        );
+
+        for _ in 0..20 {
+            let tenth = next_poll_delay(10, None);
+            assert!(
+                tenth >= POLL_BACKOFF_MAX / 2 && tenth <= POLL_BACKOFF_MAX,
+                "failure 10 must be within [MAX/2, MAX], got {tenth:?}"
+            );
+        }
     }
 }

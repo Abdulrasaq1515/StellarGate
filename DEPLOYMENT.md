@@ -68,6 +68,7 @@ Never reuse the placeholders — startup rejects known placeholder values, and
 | `CORS_ALLOWED_ORIGINS` set | **Required** on `public` — boot fails without it |
 | Trustlines added for every accepted asset | Payments in an untrusted asset bounce |
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` false | Enabling it in production reopens the SSRF hole |
+| `TRUSTED_PROXY_CIDRS` set correctly | Forwarding headers are honored **only** from these proxies; unset = headers ignored (safe default) — see [Trusted proxies and client IP](#trusted-proxies-and-client-ip) |
 | `deploy/stellargate.env` is `chmod 600` | It holds every secret the service has |
 
 ---
@@ -143,7 +144,12 @@ curl https://your-domain.com/ready    # {"status":"ok"} once Horizon is reachabl
 ```
 
 `/ready` returning `503` with a `"reason"` field tells you immediately whether
-the database or Horizon is the problem.
+the database, Horizon, or the payment-detection cursor is the problem. Once a
+gateway is configured, `/ready` also requires a successful Horizon poll (or
+stream event) within `POLL_INTERVAL_SECS × CURSOR_STALENESS_MULTIPLE` — so a
+poller that died at startup surfaces as `payment detection stalled` instead of
+leaving the probe green (issue #315). `/health` fails when an expected
+background task is no longer running, naming the dead task in its `reason`.
 
 The first build compiles the whole dependency tree and takes several minutes on
 a 1-OCPU shape. Subsequent deploys reuse the Docker layer cache.
@@ -153,6 +159,42 @@ a 1-OCPU shape. Subsequent deploys reuse the Docker layer cache.
 Only Caddy binds to the host, on 80/443. The gateway itself is reachable solely
 over the internal Compose network, so there is no way to reach the API over
 plaintext by hitting the VM's IP directly.
+
+---
+
+## Trusted proxies and client IP
+
+Rate limiting and the auth logs attribute every request to a client IP.
+`X-Forwarded-For` and `X-Real-IP` are **client-supplied** — an attacker can put
+anything in them — so StellarGate ignores them unless the request's socket
+peer is one of the proxies you name in `TRUSTED_PROXY_CIDRS`
+(comma-separated CIDR blocks, IPv4 or IPv6):
+
+```bash
+# Behind a reverse proxy on the same host / private network
+TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.0.0/16
+```
+
+**The default (unset) is the safe one:** no proxy is trusted, so the headers
+are always ignored and the peer's own address is used. A directly-exposed
+gateway must never trust them, and the default doesn't.
+
+When the peer **is** a trusted proxy, the rightmost `X-Forwarded-For` value
+that is not itself a trusted proxy is taken as the client (falling back to
+`X-Real-IP`, then the peer). This is what keeps every client behind your proxy
+on its own rate-limit bucket and with its own attribution in the auth logs,
+while still ignoring anything a non-proxy caller tries to inject.
+
+Two log lines let you confirm the setup at boot:
+
+```
+INFO client IP strategy: no trusted proxies configured — X-Forwarded-For/X-Real-IP are ignored; the socket peer address is used for rate limiting and auth attribution
+INFO client IP strategy: forwarding headers are honored only from trusted proxies; all other peers are attributed by socket address  trusted_proxies=[10.0.0.0/8, 192.168.0.0/16]
+```
+
+If the peer address is ever unavailable (the router is served without connect
+info), StellarGate fails closed: every such request shares a single key and
+the headers are still ignored, with a one-time warning.
 
 ---
 
@@ -188,7 +230,8 @@ outcomes, retries, delivery latency, and auth success/failure.
 
 | Signal | Why it matters |
 |---|---|
-| `/ready` failing | Horizon or the database is unreachable — payments will not be detected |
+| `/ready` failing | Horizon or the database is unreachable, **or** the payment-detection cursor is stale — payments will not be detected |
+| `/health` failing | An expected background task (poller, stream, sweeper, retention, redrive) died — a restart is the fix |
 | `stellargate_webhook_deliveries_total{outcome="failed"}` rising | Merchants are not learning about completed payments |
 | `cursor_age_secs` climbing in logs | The listener is falling behind the chain |
 | `stellargate_auth_attempts_total{outcome="failure"}` spiking | Credential stuffing, or a broken integration |
@@ -273,6 +316,74 @@ config change: the sqlx queries and migrations are SQLite-specific today.
 
 **Vertical scaling** is the supported lever — the free ARM shape goes to 4
 OCPUs and 24 GB, editable on a running instance.
+
+### Measured write-path ceiling
+
+The single-writer lock is the thing to reason about when asking "how much
+traffic can this take?" — every write this service makes (payment creation,
+settlement, webhook delivery bookkeeping, the throttled `last_used_at`
+refresh) serializes through it.
+
+`tests/write_throughput_bench.rs` (`cargo test --release --test
+write_throughput_bench -- --ignored --nocapture`) drives 16 concurrent tasks
+inserting payments back-to-back for 10 seconds against a file-backed SQLite
+pool opened with the exact PRAGMAs production uses (WAL, `synchronous =
+NORMAL`, the tuned `wal_autocheckpoint`/`journal_size_limit` above). On the
+2-vCPU CI/dev container this was measured on:
+
+```
+payments/sec = 4464.0  (completed=44721, errors=0, concurrency=16, elapsed=10.02s)
+```
+
+Read this as an **order-of-magnitude floor on the write path itself**, not an
+end-to-end request-handling SLA:
+
+- It measures `db::create_payment` directly — no HTTP, no JSON, no auth, no
+  rate limiting, and critically none of settlement's extra writes
+  (`processed_transactions` insert, the payment status `UPDATE`) or webhook
+  dispatch. A settled payment costs more write-lock time than a bare create.
+- It ran on 2 vCPUs in a shared CI environment. The target deployment (the
+  free-tier Oracle ARM shape referenced above) has more cores and dedicated
+  I/O; real numbers there will differ in either direction depending on disk
+  latency.
+- Zero errors at this concurrency and duration — `busy_timeout` absorbed
+  every lock wait without a caller-visible failure. That is the number that
+  would start degrading first under sustained overload: watch `SQLITE_BUSY`
+  errors surfacing as `500`s before watching raw throughput.
+
+Even generously discounting this for settlement/webhook overhead and slower
+disks, it is comfortably above the request volume a single small-VM
+deployment is expected to see. If your merchant volume approaches four
+figures of payment creations *per second*, sustained, this is the number to
+re-benchmark against your actual hardware before assuming headroom.
+
+### Why there is no Postgres backend yet
+
+Issue #321 asks for two things beyond the write-pressure reductions above:
+a database access layer that isn't SQLite-specific, and a Postgres backend
+(or a documented decision explaining why not). This is that decision.
+
+`src/db.rs` is SQLite-specific throughout — `strftime`, `pragma_table_info`,
+`INSERT OR IGNORE`, `sqlx::sqlite::SqliteRow` in `row_to_payment`, `PRAGMA`
+statements — not merely because nobody has abstracted it, but because
+`db::migrate` **is** the schema, applied as idempotent `CREATE TABLE IF NOT
+EXISTS` / `ALTER TABLE ... ADD COLUMN` statements re-run on every boot, with
+no schema-version table (issue #268). A repository trait behind which a
+Postgres implementation could live is a mechanical exercise; a *second*
+migration path that reaches the same schema on a database with different
+`ALTER TABLE` semantics, different upsert syntax, and no `pragma_table_info`
+introspection, re-derived by hand from the same ad hoc sequence, is not — it
+would need to be re-verified column-by-column against the SQLite path on
+every future schema change, indefinitely, which is exactly the kind of
+drift-prone duplication a real migration tool exists to prevent.
+
+Building that on top of the current schema mechanism would mean committing
+to maintain two hand-written schema definitions in lockstep, which is worse
+than the single SQLite-specific one that exists today. Issue #268 (a real,
+versioned migration tool) is the prerequisite this needs, and is planned as
+separate, prior work. Once it lands, a repository-trait abstraction and a
+Postgres implementation behind it become a scoped, independently reviewable
+change rather than one that has to solve schema versioning as a side effect.
 
 ---
 

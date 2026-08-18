@@ -7,8 +7,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
+  (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
+  `verify()` treated that shape as native XLM — a customer could settle a USDC
+  invoice by sending XLM. Boot now refuses any non-`XLM` entry without an
+  issuer, and a native payment cannot settle a USDC intent even if that
+  misconfiguration is constructed by hand (issue #221).
+
+- **Background tasks report *why* they exited.** `spawn_task` counted a start,
+  and counted a stop when the future returned — with no way to tell "returned
+  because shutdown was signalled" from "returned early because something went
+  wrong". Several workers return permanently on a startup condition, and each
+  looked exactly like a clean shutdown: `run_retention_worker` exiting because
+  both retention windows are `0` (a deployment choice) recorded the same thing
+  as `run_stream_listener` exiting because its HTTP client would not build (a
+  `warn!` followed by a permanent end to stream-based payment detection).
+  Workers now return an explicit `TaskExit` — `ShutdownRequested`,
+  `DisabledByConfig` or `Fatal` — and the supervisor acts on it: a fatal exit is
+  logged at **`error`** naming the task and restarted, a config-disabled exit is
+  reported once at boot and is terminal, and neither is confused with an
+  ordinary stop (issue #317).
+
+- **`GET /payments` no longer runs a full `COUNT(*)` by default.** The offset
+  branch issued a second query — `SELECT COUNT(*) FROM payments WHERE
+  merchant_id = ?` (plus `AND status = ?` when filtering) — on every call,
+  purely to fill `total`. SQLite has no cached row count, so this scanned
+  every matching row every time, including the first page, for a field most
+  clients never read (they render "next page" from `next_cursor` alone).
+  `total` is now computed only when the request sets `?include_total=true`,
+  and is entirely absent from the response — not `null` — otherwise. Keyset
+  (cursor) pagination is unaffected; it has never returned `total` and
+  remains the recommended approach (issue #320).
+
 ### Added
 
+- **Explicit WAL checkpoint/growth tuning, a measured write-throughput
+  ceiling, and a documented decision on Postgres.** `wal_autocheckpoint` and
+  `journal_size_limit` are now set explicitly at pool-open time instead of
+  left at SQLite's compiled-in defaults — the latter caps on-disk `-wal` file
+  growth even when a long-lived reader defers `PASSIVE` checkpointing
+  indefinitely. `tests/write_throughput_bench.rs` (`--ignored`, not part of
+  CI) measures the single-writer path directly and DEPLOYMENT.md now states
+  the result plus why a Postgres backend isn't in this change: `db::migrate`
+  is a hand-written, unversioned schema (issue #268 is the prerequisite for a
+  second backend to track in lockstep without drifting) (issue #321).
+
+- **Expected-versus-live worker counts on `/health` and `/metrics`.** After boot
+  there was no way to answer "how many workers should be running, and how many
+  are?" — the information existed, but `stopped` was overloaded across three
+  different meanings, so the arithmetic would have been wrong even once exposed.
+  `/health` now carries a `tasks` object (`expected`, `live`, `disabled` with
+  reasons) and `/metrics` exports `stellargate_tasks_expected`,
+  `stellargate_tasks_live` and `stellargate_task_disabled`. `expected` excludes
+  deliberately-disabled workers, so a poll-only or retention-disabled deployment
+  does not read as permanently degraded, and
+  `stellargate_tasks_live < stellargate_tasks_expected` is a usable alert
+  (issues #317, #282, #103).
+
+- **`X-RateLimit-*` response headers.** Every response now carries
+  `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` for the
+  bucket it fell into, so a client can pace itself before being throttled
+  instead of discovering the limit by hitting it. All four rate-limit headers
+  (including `Retry-After`) are listed in `Access-Control-Expose-Headers` — the
+  CORS spec hides everything outside its safelist, and `Retry-After` is not on
+  it, so a browser client could previously see the `429` but none of the
+  headers explaining it. The bucket/quota model is now documented per route in
+  the README and in `openapi.yaml` (issue #327).
+- **Dead-letter view for webhook deliveries.** Once a delivery exhausted its
+  attempts it was marked `failed` and left there, findable only by knowing the
+  payment id and calling `GET /payments/:id/webhooks` — backwards, since the
+  reason to go looking is normally "a merchant says they are missing events"
+  and a payment id is exactly what the person asking does not have. Answering
+  it meant querying SQLite directly on the production volume, and a merchant
+  could not self-serve at all. `GET /v1/payments/webhooks?status=failed` now
+  lists a merchant's deliveries across every payment, cursor-paginated with the
+  same conventions as `GET /payments` and scoped by a join rather than a
+  caller-supplied filter (issue #319).
+- **Bulk webhook recovery.** `POST /v1/payments/webhooks/redeliver` requeues
+  failed deliveries — all of them, or up to 100 named ids — so a merchant who
+  has fixed their receiver can recover what they missed. It sends nothing
+  itself: rows go back to `pending` with `attempts = 0` and are retried by the
+  redrive worker, whose concurrency limit and backoff already bound the
+  outbound rate, so a bulk requeue cannot exhaust the redrive budget or
+  stampede a receiver that has only just come back up (issues #319, #235).
+
+### Changed
+
+- **Unacknowledged terminal webhook failures survive retention.** A `failed`
+  delivery was deleted after `WEBHOOK_DELIVERY_RETENTION_DAYS`, so the evidence
+  that an event was permanently lost expired on a timer whether or not anyone
+  had looked at it — precisely when it was most likely to be asked for. Such a
+  row is now exempt until it is acknowledged (requeueing acknowledges it). To
+  avoid trading one unbounded table for another, a retained failure is
+  **compacted** once past the window: the row stays, its `payload` is cleared.
+  The payload is the largest column and its only consumer is redelivery, which
+  is not something anyone does to a months-old failure, so the record stays
+  queryable indefinitely at a few hundred bytes (issue #319).
+
+### Fixed
+
+- **SSRF-blocked webhook deliveries are counted as terminal failures.** A
+  target that resolves into a blocked range can never succeed, but neither the
+  inline dispatch path nor the redrive path incremented
+  `stellargate_webhook_deliveries_total{outcome="failed"}` — leaving an entire
+  class of permanent failure invisible to the counter and to any alert built on
+  it (issues #319, #233).
+- **`openapi.yaml` declares its security schemes.** The spec had no
+  `components.securitySchemes` block and no `security` key on any operation, so
+  every route read as unauthenticated — a client generated from it exposed no
+  way to supply an API key, sent none, and got `401` on every call, leaving the
+  integrator's first impression that the API was broken rather than that the
+  spec was incomplete. It also misrepresented the security posture to anyone
+  reviewing the contract. `bearerAuth` (merchant API key) and `adminSecret`
+  (`X-Admin-Secret`) are now defined, `bearerAuth` is attached to every
+  protected payment operation, `/health` declares `security: []` explicitly,
+  and each protected operation documents its `401` shape.
+  `GET /payments/{id}` is genuinely tri-modal, so its optional-auth behaviour
+  is expressed as `[{}, {bearerAuth: []}]` with a `PublicPaymentView` schema
+  for the anonymous projection, rather than flattened to a single requirement
+  (issue #325).
+
+- **Background-task supervisor.** A panic in the poller, stream listener,
+  sweeper, retention worker, or webhook redrive used to end that task for the
+  life of the process while HTTP and `/health` kept serving. Each worker is
+  now supervised: panics are logged and counted when they happen, the task is
+  restarted with bounded exponential backoff, crash-loops fail `/health`, and
+  start/stop/fail/restart counters are exported on `/metrics` (issue #316).
+
+### Added
+
+- **`GET /payments/:id/webhooks` now paginates like the payments listing.**
+  The endpoint previously serialised every delivery row for a payment with no
+  `LIMIT`, so a payment with unbounded delivery activity (see issue #233) grew
+  the response without bound. It now supports a `status` filter
+  (`pending`/`delivered`/`failed`), a `limit` (default 20, max 100), and keyset
+  `cursor` pagination with `next_cursor` in the same contract as
+  `GET /payments` (issue #326).
 - **API versioning.** Public routes are now served under `/v1` alongside a
   documented deprecation policy. Unversioned paths keep working and return
   `Deprecation` and `Link: rel="successor-version"` headers pointing at their
@@ -64,6 +200,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removing four near-identical spawn blocks and a macro that existed only to
   work around the same repetition. Behaviour unchanged.
 - README rewritten against the actual API surface.
+- **TLS switched from native-tls to rustls.** Both `sqlx` and `reqwest` now
+  use `rustls`-based feature flags, eliminating the system OpenSSL runtime
+  dependency and simplifying static/musl builds.
+- **Listener mode validation tightened.** An invalid `STELLAR_LISTENER_MODE`
+  value now fails fast at boot with a clear error instead of defaulting
+  silently to `stream`.
+- **Placeholder secrets rejected at boot.** Known placeholder values from
+  `.env.example` (e.g., `default-secret`, `your_webhook_signing_secret`) are
+  now detected and rejected during startup with a clear error to prevent
+  accidental production use of weak credentials.
 
 ### Security
 
@@ -82,6 +228,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`GET /payments` offset pages now order rows exactly like cursor pages.**
+  The offset query sorted by `created_at DESC` alone while the keyset query
+  broke whole-second `created_at` ties on `id DESC`, so a `next_cursor` minted
+  from an offset page silently skipped the rest of the tie group when handed
+  to the cursor branch. The offset query now orders by
+  `(created_at DESC, id DESC)` — the same ordering and the same index — and a
+  short offset page returns `null` instead of a dangling cursor. The migration
+  path from offset to cursor pagination is documented in the README; offset
+  mode is marked deprecated (issues #328, #269).
+- **Expiry sweeping now batches transitions.** `expire_overdue` previously
+  issued one guarded `UPDATE` per overdue intent, costing N round-trips and N
+  write-lock acquisitions per sweep — a real burden on the single SQLite
+  writer after an outage leaves a large backlog overdue at once. It now
+  transitions a bounded batch in a single `UPDATE … RETURNING`, so each sweep
+  is one write sized by `EXPIRY_BATCH_SIZE` (default `500`) and the backlog
+  drains over several sweeps. The `status IN ('pending','underpaid')` guard and
+  the "only rows actually transitioned produce a webhook" property are
+  preserved (issue #323).
 - **The build.** `main` did not compile. An unclosed block in
   `rate_limit_middleware` plus a reversion to the pre-`moka` `Mutex` API, a
   duplicated struct field and an unterminated character literal in `config.rs`,

@@ -9,10 +9,45 @@ servers:
     description: Local development
 
 paths:
+  /:
+    get:
+      operationId: root
+      summary: Service root
+      description: >-
+        Content-negotiated on `Accept`, not User-Agent: a browser (`Accept:
+        text/html`) is redirected to the operator dashboard, and every other
+        caller — `fetch()`, `curl`, the dashboard's own version lookup, an
+        uptime check — gets the plain-text version string. This exists so a
+        hosting platform's "open in browser" link lands somewhere useful
+        instead of a bare line of text with no hint that a UI exists one path
+        away.
+      security: []
+      responses:
+        "200":
+          description: Not a browser request (or no Accept header) — plain-text version string
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: StellarGate API v0.1.0
+        "307":
+          description: >-
+            Browser request (`Accept` contains `text/html`) — temporary
+            redirect to /dashboard
+          headers:
+            Location:
+              schema:
+                type: string
+                example: /dashboard
+
   /health:
     get:
       operationId: health
       summary: Health check
+      # Explicitly unauthenticated. Stating this is not redundant: without it a
+      # reader cannot tell "no credential required" from "the spec forgot to
+      # say", which is the ambiguity this whole block exists to remove.
+      security: []
       responses:
         "200":
           description: Service is up
@@ -21,10 +56,255 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
 
+  /ready:
+    get:
+      operationId: ready
+      summary: Readiness probe
+      description: >-
+        Distinct from /health: this is what an orchestrator's readiness probe
+        should target, not /health, which returns 200 unconditionally as long
+        as the process is up (#103). Returns 200 only when the database
+        responds AND (if a Horizon gateway is configured) Horizon is reachable
+        AND the payment-detection cursor has advanced recently. A pod that
+        cannot detect on-chain payments should not receive traffic even though
+        the process itself is alive.
+      security: []
+      responses:
+        "200":
+          description: Database reachable, and Horizon + cursor freshness checks pass (or no gateway is configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+        "503":
+          description: Not ready — the database is unreachable, Horizon is unreachable, or the detection cursor has stalled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+              examples:
+                database_unreachable:
+                  summary: Database unreachable
+                  value:
+                    status: unavailable
+                    reason: database unreachable
+                cursor_stalled:
+                  summary: Payment detection stalled
+                  value:
+                    status: unavailable
+                    reason: >-
+                      payment detection stalled: no successful poll or stream
+                      event in 900s (limit 300s)
+
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus-compatible metrics snapshot
+      description: >-
+        Text-exposition-format counters and gauges covering webhook delivery,
+        authentication, and background task health. Currently unauthenticated
+        — see issue #250 for the access-control decision tracked against that.
+      security: []
+      responses:
+        "200":
+          description: Metrics snapshot
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
+
+  /merchants:
+    post:
+      operationId: provisionMerchant
+      summary: Provision a new merchant
+      description: >-
+        There is no self-service signup; minting a merchant and its first
+        credential is an operator action gated by the X-Admin-Secret header.
+        The response's `api_key` is shown exactly once — the server stores
+        only a hash, so this is the only time the raw key is ever recoverable.
+        An unset ADMIN_PROVISIONING_SECRET disables this route entirely
+        (every request gets 401), rather than leaving it open.
+      security:
+        - adminSecret: []
+      responses:
+        "201":
+          description: Merchant provisioned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProvisionMerchantResponse"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+
+  /merchants/{id}/keys:
+    post:
+      operationId: issueApiKey
+      summary: Issue an additional API key
+      description: >-
+        Rotation is issue-then-revoke, not replace-in-place: the new key is
+        live immediately while the old one keeps working, so a merchant can
+        deploy the new credential and never has a window with no valid key.
+        The response's `api_key` is shown exactly once, the same as
+        provisioning.
+      security:
+        - adminSecret: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Merchant ID
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IssueKeyRequest"
+      responses:
+        "201":
+          description: Key issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueKeyResponse"
+        "400":
+          description: Label exceeds 100 characters, or the request body has an unrecognised field
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_label:
+                  summary: Label too long
+                  value:
+                    error: label exceeds max length of 100 characters
+                    code: invalid_label
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "404":
+          description: No merchant with that ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                merchant_not_found:
+                  summary: Merchant not found
+                  value:
+                    error: merchant not found
+                    code: merchant_not_found
+
+    get:
+      operationId: listApiKeys
+      summary: List a merchant's API keys
+      description: >-
+        Metadata only — never the secret, which is unrecoverable by design.
+        `prefix` is enough for an operator to identify which key to revoke.
+      security:
+        - adminSecret: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Merchant ID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The merchant's keys
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListApiKeysResponse"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "404":
+          description: No merchant with that ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                merchant_not_found:
+                  summary: Merchant not found
+                  value:
+                    error: merchant not found
+                    code: merchant_not_found
+
+  /merchants/{id}/keys/{key_id}:
+    delete:
+      operationId: revokeApiKey
+      summary: Revoke an API key
+      description: >-
+        Refuses to revoke a merchant's last active key — this API has no
+        self-service recovery, so that would turn a routine revocation into an
+        incident. Issue a replacement first.
+      security:
+        - adminSecret: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Merchant ID
+          schema:
+            type: string
+            format: uuid
+        - name: key_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Key revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevokeApiKeyResponse"
+        "400":
+          description: This is the merchant's only active key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                last_active_key:
+                  summary: Only active key
+                  value:
+                    error: >-
+                      cannot revoke a merchant's only active key — issue a
+                      replacement first
+                    code: last_active_key
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "404":
+          description: No such merchant, or no active key with that ID for this merchant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                merchant_not_found:
+                  summary: Merchant not found
+                  value:
+                    error: merchant not found
+                    code: merchant_not_found
+                key_not_found:
+                  summary: Key not found
+                  value:
+                    error: no active key with that id for this merchant
+                    code: key_not_found
+
   /payments:
     post:
       operationId: createPayment
       summary: Create a payment intent
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -34,6 +314,13 @@ paths:
       responses:
         "201":
           description: Payment intent created
+          headers:
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/XRateLimitLimit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/XRateLimitRemaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/XRateLimitReset"
           content:
             application/json:
               schema:
@@ -55,8 +342,22 @@ paths:
                   value:
                     error: "unsupported asset 'EURC'; supported: XLM, USDC"
                     code: unsupported_asset
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "429":
-          description: Rate limit exceeded
+          description: >-
+            Rate limit exceeded. The request fell into the `payments` bucket,
+            whose quota is RATE_LIMIT_REQUESTS_PER_SEC × 1. See the Rate
+            Limiting section of the README for the full bucket/quota model.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/RetryAfter"
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/XRateLimitLimit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/XRateLimitRemaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/XRateLimitReset"
           content:
             application/json:
               schema:
@@ -71,6 +372,11 @@ paths:
     get:
       operationId: listPayments
       summary: List payments
+      description: >-
+        Scoped to the merchant that owns the API key. There is no parameter for
+        selecting a different merchant.
+      security:
+        - bearerAuth: []
       parameters:
         - name: status
           in: query
@@ -97,6 +403,18 @@ paths:
           schema:
             type: string
           description: Opaque cursor for keyset pagination (returned as next_cursor)
+        - name: include_total
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: >-
+            Offset pagination only; has no effect with cursor set. `total`
+            costs a full COUNT(*) scan over every matching row — SQLite has no
+            cached row count — so it is computed only when this is `true`,
+            and the `total` field is otherwise absent from the response
+            entirely (not `null`). Keyset (cursor) pagination is the
+            recommended approach and has never returned `total`.
       responses:
         "200":
           description: Paginated list of payments
@@ -110,11 +428,46 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /payments/{id}:
     get:
       operationId: getPayment
       summary: Get a payment by ID
+      description: >-
+        Authentication is optional here and changes what comes back, so this is
+        the one operation whose security requirement is genuinely a choice
+        rather than a gate. It stays reachable without a credential so a
+        checkout page can poll it directly.
+
+
+        **No credential** returns a minimal public projection — `id`, `status`
+        and `expires_at`. Enough to answer "has this been paid yet", and
+        nothing else. It deliberately omits `merchant_id`, every amount and
+        `tx_hash`: payment ids travel through logs, referrers and browser
+        history, so anything on this response should be treated as effectively
+        public.
+
+
+        **The owning merchant's key** returns the full record.
+
+
+        **Another merchant's key** returns `404`, the same answer an unknown id
+        gets. A `403` would confirm the payment exists and belongs to someone
+        else.
+
+
+        **An invalid or revoked key** returns `401` rather than silently
+        falling back to the public view, so a typo'd credential says so instead
+        of leaving the caller wondering why fields are missing.
+      security:
+        # An empty requirement alongside the scheme is how OpenAPI expresses
+        # "auth optional, but it changes the response". Flattening this to a
+        # single requirement would misdocument the endpoint most likely to be
+        # integrated against.
+        - {}              # anonymous  -> PublicPaymentView
+        - bearerAuth: []  # owner      -> Payment
       parameters:
         - name: id
           in: path
@@ -124,22 +477,115 @@ paths:
             format: uuid
       responses:
         "200":
-          description: Payment found
+          description: >-
+            Payment found. The schema depends on the credential: the full
+            Payment for the owning merchant, PublicPaymentView for an
+            anonymous caller.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Payment"
+                oneOf:
+                  - $ref: "#/components/schemas/Payment"
+                  - $ref: "#/components/schemas/PublicPaymentView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
-          description: Payment not found
+          description: >-
+            No such payment, or it belongs to another merchant — the two are
+            deliberately indistinguishable.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /payments/webhooks:
+    get:
+      operationId: listMerchantWebhookDeliveries
+      summary: List webhook deliveries across all of a merchant's payments
+      description: >-
+        The dead-letter view. Defaults to status=failed. Unlike
+        /payments/{id}/webhooks this does not require knowing which payment a
+        failure belongs to, which is the situation an operator is actually in
+        when a merchant reports missing events. Scoped to the authenticated
+        merchant by a join, not by a caller-supplied filter.
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/WebhookDeliveryStatus"
+          description: Filter by delivery status. Defaults to `failed`.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Page size
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor for keyset pagination (returned as next_cursor)
+      responses:
+        "200":
+          description: Paginated deliveries for this merchant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListMerchantWebhookDeliveriesResponse"
+        "400":
+          description: Invalid `status` or `cursor`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /payments/webhooks/redeliver:
+    post:
+      operationId: redeliverWebhooksBulk
+      summary: Requeue failed webhook deliveries in bulk
+      description: >-
+        Bulk recovery after a merchant has fixed their receiver. This endpoint
+        sends nothing itself: it resets matching failed deliveries to `pending`
+        with `attempts = 0` and hands them to the background redrive worker,
+        whose concurrency limit and exponential backoff bound the outbound
+        rate. Requeueing also sets `acknowledged_at`, returning the rows to
+        ordinary retention.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RedeliverBulkRequest"
+      responses:
+        "200":
+          description: Deliveries requeued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedeliverBulkResponse"
+        "400":
+          description: More than 100 delivery_ids supplied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                too_many_delivery_ids:
+                  summary: Too many ids
+                  value:
+                    error: >-
+                      at most 100 delivery_ids per request; omit the field to
+                      requeue every failed delivery
+                    code: too_many_delivery_ids
+
   /payments/{id}/webhooks:
     get:
       operationId: listWebhookDeliveries
       summary: List webhook deliveries for a payment
+      security:
+        - bearerAuth: []
       parameters:
         - name: id
           in: path
@@ -147,6 +593,25 @@ paths:
           schema:
             type: string
             format: uuid
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, delivered, failed]
+          description: Filter deliveries by status
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Page size
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor for keyset pagination (returned as next_cursor)
       responses:
         "200":
           description: Webhook delivery history
@@ -154,6 +619,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListWebhookDeliveriesResponse"
+        "400":
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           description: Payment not found
           content:
@@ -165,6 +638,8 @@ paths:
     post:
       operationId: redeliverWebhook
       summary: Re-attempt a webhook delivery
+      security:
+        - bearerAuth: []
       parameters:
         - name: id
           in: path
@@ -181,6 +656,8 @@ paths:
       responses:
         "200":
           description: Redelivery succeeded
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           description: Payment or delivery not found
           content:
@@ -207,6 +684,64 @@ paths:
                     code: webhook_delivery_failed
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Merchant API key, issued by POST /merchants or POST
+        /merchants/{id}/keys and sent as `Authorization: Bearer <key>`. The
+        merchant is derived from the key — it is never taken from a request
+        body or query parameter — so a key scopes every payment operation to
+        exactly one tenant.
+    adminSecret:
+      type: apiKey
+      in: header
+      name: X-Admin-Secret
+      description: >-
+        Operator secret from ADMIN_PROVISIONING_SECRET. Guards merchant
+        provisioning and the API-key lifecycle routes only; it is never
+        accepted on a payment route. An unset ADMIN_PROVISIONING_SECRET
+        disables those routes entirely rather than leaving them open.
+
+  responses:
+    Unauthorized:
+      description: >-
+        Missing, malformed, invalid, or revoked credential. Uses the standard
+        error envelope with code `unauthorized`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            missing_key:
+              summary: No Authorization header
+              value:
+                error: missing or invalid Authorization header
+                code: unauthorized
+            invalid_key:
+              summary: Key did not match any merchant
+              value:
+                error: invalid API key
+                code: unauthorized
+
+    AdminUnauthorized:
+      description: >-
+        Missing, wrong, or unconfigured X-Admin-Secret. Uses the standard
+        error envelope with code `unauthorized`. An unset
+        ADMIN_PROVISIONING_SECRET produces this on every request rather than
+        leaving the route open.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            missing_or_invalid_admin_secret:
+              summary: Missing or invalid X-Admin-Secret
+              value:
+                error: missing or invalid admin secret
+                code: unauthorized
+
   schemas:
     HealthResponse:
       type: object
@@ -215,6 +750,121 @@ components:
         status:
           type: string
           example: ok
+
+    ReadyResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
+        reason:
+          type: string
+          description: Present only when status is unavailable
+          example: database unreachable
+
+    ProvisionMerchantResponse:
+      type: object
+      required: [merchant_id, api_key, key_id]
+      properties:
+        merchant_id:
+          type: string
+          format: uuid
+        api_key:
+          type: string
+          example: sg_1a2b3c4d5e6f...
+          description: >-
+            Shown exactly once. The server persists only a hash, so this value
+            cannot be retrieved again through any endpoint — store it
+            immediately. If it's lost, issue a new key
+            (POST /merchants/{id}/keys) and revoke this one.
+        key_id:
+          type: string
+          format: uuid
+          description: ID of the API key created alongside the merchant
+
+    IssueKeyRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        label:
+          type: string
+          maxLength: 100
+          description: Optional free-text label to help identify this key later
+          example: rotation-2026-08
+
+    IssueKeyResponse:
+      type: object
+      required: [key_id, api_key]
+      properties:
+        key_id:
+          type: string
+          format: uuid
+        api_key:
+          type: string
+          example: sg_9f8e7d6c5b4a...
+          description: >-
+            Shown exactly once, the same as POST /merchants — the server
+            persists only a hash, so this value cannot be retrieved again.
+        prefix:
+          type: string
+          description: First characters of the key, safe to display in a list
+          example: sg_9f8e7d6c
+        label:
+          type: string
+          nullable: true
+
+    ApiKeySummary:
+      type: object
+      required: [key_id, prefix, created_at, active]
+      description: A key as exposed to an operator. Never carries the secret.
+      properties:
+        key_id:
+          type: string
+          format: uuid
+        prefix:
+          type: string
+          example: sg_9f8e7d6c
+        label:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        active:
+          type: boolean
+          description: true when revoked_at is null
+
+    ListApiKeysResponse:
+      type: object
+      required: [merchant_id, keys]
+      properties:
+        merchant_id:
+          type: string
+          format: uuid
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiKeySummary"
+
+    RevokeApiKeyResponse:
+      type: object
+      required: [key_id, revoked]
+      properties:
+        key_id:
+          type: string
+          format: uuid
+        revoked:
+          type: boolean
+          example: true
 
     PaymentStatus:
       type: string
@@ -275,9 +925,31 @@ components:
           type: string
           format: date-time
 
+    PublicPaymentView:
+      type: object
+      description: >-
+        What GET /payments/{id} returns to a caller with no credential. Enough
+        to poll for completion, with nothing that identifies the merchant or
+        the sum involved.
+      required: [id, status, expires_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/PaymentStatus"
+        expires_at:
+          type: string
+          format: date-time
+
     CreatePaymentRequest:
       type: object
       required: [amount]
+      # The server rejects any field not listed here with 400 unknown_field.
+      # `merchant_id` used to be documented but was never read — the merchant is
+      # taken from the API key — so sending it now fails loudly instead of
+      # silently binding the intent to whichever merchant owns the key.
+      additionalProperties: false
       properties:
         amount:
           type: string
@@ -287,9 +959,10 @@ components:
           type: string
           enum: [XLM, USDC]
           default: XLM
-        merchant_id:
-          type: string
-          example: my-shop
+          description: >-
+            Defaults to XLM when omitted. Because the default applies silently,
+            a misspelled field name (e.g. `assset`) would otherwise create an
+            XLM intent; it is rejected as unknown_field instead.
         webhook_url:
           type: string
           format: uri
@@ -306,7 +979,12 @@ components:
             $ref: "#/components/schemas/Payment"
         total:
           type: integer
-          description: Total matching rows (offset pagination only)
+          description: >-
+            Total matching rows. Offset pagination only, and only present when
+            the request set `include_total=true` — computing it is a full
+            `COUNT(*)` scan, so it is opt-in rather than sent on every
+            request. Omitted from the response (not `null`) when not
+            requested.
         limit:
           type: integer
         offset:
@@ -316,6 +994,75 @@ components:
           type: string
           nullable: true
           description: Pass as cursor on the next request to get the following page
+
+    WebhookDeliveryStatus:
+      type: string
+      enum: [failed, pending, delivered]
+
+    RedeliverBulkRequest:
+      type: object
+      properties:
+        delivery_ids:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+          description: >-
+            Specific deliveries to requeue. Omit, or send an empty list, to
+            requeue every failed delivery this merchant has — that form has no
+            id limit, since it needs no list.
+
+    RedeliverBulkResponse:
+      type: object
+      required: [requeued]
+      properties:
+        requeued:
+          type: integer
+          description: How many deliveries were moved back to `pending`.
+          example: 42
+        detail:
+          type: string
+
+    ListMerchantWebhookDeliveriesResponse:
+      type: object
+      required: [deliveries, status, limit]
+      properties:
+        deliveries:
+          type: array
+          items:
+            $ref: "#/components/schemas/MerchantWebhookDelivery"
+        status:
+          $ref: "#/components/schemas/WebhookDeliveryStatus"
+        limit:
+          type: integer
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as cursor on the next request to get the following page
+
+    MerchantWebhookDelivery:
+      allOf:
+        - $ref: "#/components/schemas/WebhookDelivery"
+        - type: object
+          required: [payment_id]
+          properties:
+            payment_id:
+              type: string
+              format: uuid
+              description: >-
+                Which payment this delivery belongs to. Present here because
+                the listing spans every payment the merchant owns.
+            acknowledged_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: >-
+                When this delivery was requeued or otherwise acted on. While
+                null, a `failed` delivery is exempt from
+                WEBHOOK_DELIVERY_RETENTION_DAYS and is not deleted — it is
+                compacted to a payload-less tombstone instead, so the record
+                that an event was permanently lost outlives the window.
 
     WebhookDelivery:
       type: object
@@ -348,7 +1095,7 @@ components:
 
     ListWebhookDeliveriesResponse:
       type: object
-      required: [payment_id, deliveries]
+      required: [payment_id, deliveries, limit]
       properties:
         payment_id:
           type: string
@@ -357,6 +1104,13 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/WebhookDelivery"
+        limit:
+          type: integer
+          description: Page size applied to this response
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as cursor on the next request to get the following page
 
     ErrorResponse:
       type: object
@@ -375,9 +1129,10 @@ components:
           description: >-
             Stable machine-readable error code for programmatic handling. Public
             values currently include unauthorized, internal_error,
-            invalid_request, unsupported_asset, invalid_amount,
+            invalid_request, unknown_field, unsupported_asset, invalid_amount,
             invalid_webhook_url, invalid_status, invalid_cursor,
             payment_not_found, delivery_not_found, rate_limit_exceeded,
-            not_found, webhook_target_blocked, webhook_delivery_failed, and
-            idempotency_conflict.
+            not_found, webhook_target_blocked, webhook_delivery_failed,
+            idempotency_conflict, merchant_not_found, invalid_label,
+            last_active_key, and key_not_found.
           example: invalid_amount

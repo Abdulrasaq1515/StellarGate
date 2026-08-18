@@ -80,10 +80,25 @@ where
             Err(rejection) => {
                 use axum::extract::rejection::JsonRejection;
                 match &rejection {
-                    JsonRejection::JsonDataError(_) => Err(AppError::bad_request(
-                        "invalid_request",
-                        format!("invalid request body: {}", rejection.body_text()),
-                    )),
+                    JsonRejection::JsonDataError(_) => {
+                        let detail = rejection.body_text();
+                        /* An unrecognised field is its own failure mode, not a
+                        generic deserialization error: it almost always means a
+                        typo or a client written against an older spec, and the
+                        fix is different from "the value had the wrong type".
+                        Give it a dedicated code so a client can branch on it,
+                        and keep serde's message — it names the offending field
+                        and lists the accepted ones. */
+                        let code = if detail.contains("unknown field") {
+                            "unknown_field"
+                        } else {
+                            "invalid_request"
+                        };
+                        Err(AppError::bad_request(
+                            code,
+                            format!("invalid request body: {detail}"),
+                        ))
+                    }
                     JsonRejection::JsonSyntaxError(_) => Err(AppError::bad_request(
                         "invalid_request",
                         "request body contains malformed JSON",
@@ -104,7 +119,66 @@ where
     }
 }
 
+/// The `POST /payments` body.
+///
+/// `deny_unknown_fields` because silently discarding what serde does not
+/// recognise is the wrong default for a payments API (issue #329). Without it a
+/// client could send `merchant_id` — which older revisions of `openapi.yaml`
+/// still advertised — and get a `201` describing an intent on whichever
+/// merchant owns the API key, believing it had chosen the tenant itself.
+///
+/// The interaction with `asset` is what makes silence expensive rather than
+/// merely untidy: `asset` defaults to `XLM` when absent, so `{"amount":"100",
+/// "assset":"USDC"}` — one transposed character — used to mint a 100 XLM intent
+/// and return `201`. Rejecting the field name is the only point at which that
+/// typo is still cheap to fix.
+///
+/// This matches how the rest of the API already treats input it does not
+/// understand: `status` is checked against an allow-list, an undecodable
+/// `cursor` is `400 invalid_cursor`, an unaccepted asset is `400
+/// unsupported_asset`. Strictness previously stopped at field names.
+/// A JSON body that may be omitted entirely, but must be valid when present.
+///
+/// `Option<JsonBody<T>>` cannot express this. Axum's `Option` extractor maps
+/// *every* rejection to `None`, so a body carrying a mistyped field would be
+/// discarded in exactly the same way as no body at all — reintroducing, on the
+/// one endpoint with an optional body, the silence issue #329 is about.
+///
+/// An absent or empty body is `None`; anything else is deserialized strictly
+/// and its failures surface as the [`JsonBody`] rejection they are.
+pub struct OptionalJsonBody<T>(pub Option<T>);
+
+#[async_trait]
+impl<T, S> FromRequest<S> for OptionalJsonBody<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = req.into_parts();
+
+        /* `RequestBodyLimitLayer` already caps the body well below this, and
+        exceeding it fails there rather than here; `usize::MAX` just means "no
+        second, lower limit of our own". */
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|_| {
+            AppError::bad_request("invalid_request", "could not read the request body")
+        })?;
+
+        if bytes.is_empty() {
+            return Ok(OptionalJsonBody(None));
+        }
+
+        let req = Request::from_parts(parts, axum::body::Body::from(bytes));
+        JsonBody::<T>::from_request(req, state)
+            .await
+            .map(|JsonBody(value)| OptionalJsonBody(Some(value)))
+    }
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatePaymentRequest {
     pub amount: String,
     #[serde(default = "default_asset")]
@@ -124,17 +198,30 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let asset = body.asset.to_uppercase();
     let accepted = &state.config.accepted_assets;
-    if !accepted.iter().any(|a| a.code == asset) {
-        let codes = accepted
-            .iter()
-            .map(|a| a.code.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(AppError::bad_request(
-            "unsupported_asset",
-            format!("unsupported asset '{}'; supported: {}", body.asset, codes),
-        ));
-    }
+    let matched: Vec<_> = accepted.iter().filter(|a| a.code == asset).collect();
+    let accepted_asset = match matched.as_slice() {
+        [] => {
+            let codes = accepted
+                .iter()
+                .map(|a| a.code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AppError::bad_request(
+                "unsupported_asset",
+                format!("unsupported asset '{}'; supported: {}", body.asset, codes),
+            ));
+        }
+        [one] => *one,
+        _ => {
+            return Err(AppError::bad_request(
+                "ambiguous_asset",
+                format!(
+                    "asset '{asset}' maps to more than one issuer; pin ACCEPTED_ASSETS to a single issuer per code"
+                ),
+            ));
+        }
+    };
+    let asset_issuer = accepted_asset.issuer.as_deref();
     if !money::is_valid_amount(&body.amount) {
         return Err(AppError::bad_request(
             "invalid_amount",
@@ -260,6 +347,7 @@ pub async fn create(
             memo: &memo,
             amount: &body.amount,
             asset: &asset,
+            asset_issuer,
             webhook_url: body.webhook_url.as_deref(),
             ttl_secs: state.config.payment_ttl_secs as i64,
         },
@@ -343,6 +431,12 @@ pub struct ListQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub cursor: Option<String>,
+    /// Opt in to a `total` field on the offset-paginated response. Defaults to
+    /// omitted: SQLite has no cached row count, so computing it is a full
+    /// `COUNT(*)` scan over every matching row, on every request — including
+    /// the first page — for a field most callers never read (issue #320).
+    /// Has no effect in cursor (keyset) mode, which has never returned `total`.
+    pub include_total: Option<bool>,
 }
 
 const DEFAULT_LIMIT: i64 = 20;
@@ -353,6 +447,12 @@ const MAX_LIMIT: i64 = 100;
 /// (`db::expire_overdue`). Nothing writes any other value, so anything else is
 /// a guaranteed-empty filter and is rejected as invalid.
 const VALID_STATUSES: [&str; 4] = ["pending", "completed", "underpaid", "expired"];
+
+/// Statuses a webhook delivery can hold: `pending` while attempts are still
+/// possible, `delivered` on success, `failed` when the attempt budget is
+/// exhausted. Nothing writes any other value, so a filter on anything else is
+/// a guaranteed-empty query and is rejected as invalid.
+const VALID_DELIVERY_STATUSES: [&str; 3] = ["pending", "delivered", "failed"];
 
 pub async fn list(
     State(state): State<Arc<AppState>>,
@@ -402,7 +502,7 @@ pub async fn list(
     } else {
         // Legacy offset pagination — kept for backward compatibility.
         let offset = q.offset.unwrap_or(0).max(0);
-        let (payments, total) = db::list_payments(
+        let payments = db::list_payments(
             &state.pool,
             &merchant_id,
             q.status.as_deref(),
@@ -411,16 +511,35 @@ pub async fn list(
         )
         .await?;
 
-        // Provide next_cursor to ease migration to keyset pagination.
-        let next_cursor = payments.last().map(|p| encode_cursor(&p.created_at, &p.id));
+        // A migration affordance, not a second pagination model: the caller
+        // may take this cursor as the *first* cursor and then stay in pure
+        // cursor mode from the next request on. `list_payments` orders by
+        // (created_at DESC, id DESC), identical to the keyset query, so the
+        // cursor resumes at the row after this page and never re-reads the
+        // whole-second tie group that ends it. A short page returns null,
+        // mirroring cursor mode.
+        let next_cursor = if payments.len() == limit as usize {
+            payments.last().map(|p| encode_cursor(&p.created_at, &p.id))
+        } else {
+            None
+        };
 
-        Ok(Json(json!({
+        let mut body = json!({
             "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
-            "total": total,
             "limit": limit,
             "offset": offset,
             "next_cursor": next_cursor,
-        })))
+        });
+
+        // `total` costs a full COUNT(*) scan (issue #320) — computed only when
+        // asked for, and entirely absent from the response otherwise rather
+        // than sent as null, so a caller can tell "not computed" from "zero".
+        if q.include_total == Some(true) {
+            let total = db::count_payments(&state.pool, &merchant_id, q.status.as_deref()).await?;
+            body["total"] = json!(total);
+        }
+
+        Ok(Json(body))
     }
 }
 
@@ -492,6 +611,7 @@ fn to_json(p: &db::Payment) -> Value {
         "memo": p.memo,
         "amount": canonical_amount,
         "asset": p.asset,
+        "asset_issuer": p.asset_issuer,
         "status": p.status,
         "tx_hash": p.tx_hash,
         "paid_amount": canonical_paid_amount,
@@ -501,11 +621,36 @@ fn to_json(p: &db::Payment) -> Value {
     })
 }
 
+/// Query parameters for the webhook-delivery listing. Matches the payments
+/// listing conventions: a `status` filter, a `limit` (default 20, max 100),
+/// and an opaque keyset `cursor` whose value comes from a previous response's
+/// `next_cursor`.
+#[derive(Deserialize)]
+pub struct ListDeliveryQuery {
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
 pub async fn list_webhooks(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Path(payment_id): Path<String>,
+    Query(q): Query<ListDeliveryQuery>,
 ) -> Result<Json<Value>, AppError> {
+    if let Some(s) = &q.status {
+        if !VALID_DELIVERY_STATUSES.contains(&s.as_str()) {
+            return Err(AppError::bad_request(
+                "invalid_status",
+                format!(
+                    "invalid status '{}'; valid: {}",
+                    s,
+                    VALID_DELIVERY_STATUSES.join(", ")
+                ),
+            ));
+        }
+    }
+
     // Verify payment exists and belongs to the caller. A payment owned by
     // another merchant reports the same 404 as a missing one, so this can't
     // be used to enumerate which payment ids exist for other tenants.
@@ -520,7 +665,35 @@ pub async fn list_webhooks(
             )
         })?;
 
-    let deliveries = db::list_webhook_deliveries(&state.pool, &payment_id).await?;
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+    let cursor = match q.cursor.as_deref() {
+        Some(raw_cursor) => {
+            let (ts, id) = decode_cursor(raw_cursor)
+                .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?;
+            Some((ts, id))
+        }
+        None => None,
+    };
+
+    let deliveries = db::list_webhook_deliveries_keyset(
+        &state.pool,
+        &payment_id,
+        q.status.as_deref(),
+        limit,
+        cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
+    )
+    .await?;
+
+    // A full page mints a cursor from its last row (created_at, id); a short
+    // page means we've reached the end and null signals "no more".
+    let next_cursor = if deliveries.len() == limit as usize {
+        deliveries
+            .last()
+            .map(|d| encode_cursor(&d.created_at, &d.id))
+    } else {
+        None
+    };
 
     Ok(Json(json!({
         "payment_id": payment.id,
@@ -533,7 +706,147 @@ pub async fn list_webhooks(
             "last_attempt": d.last_attempt,
             "created_at": d.created_at,
         })).collect::<Vec<_>>(),
+        "limit": limit,
+        "next_cursor": next_cursor,
     })))
+}
+
+// ── Dead-letter view (issue #319) ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ListDeliveriesQuery {
+    /// Defaults to `failed` — the dead-letter case this endpoint exists for.
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+/// `GET /payments/webhooks` — a merchant's deliveries across *all* their
+/// payments, defaulting to the failed ones.
+///
+/// Before this, a permanently-failed delivery was reachable only by knowing the
+/// payment id and calling `GET /payments/:id/webhooks`. That is backwards: the
+/// reason to go looking is almost always "a merchant says they are missing
+/// events", and a payment id is precisely what the person asking does not have.
+/// Answering it meant querying SQLite directly on the production volume, and a
+/// merchant could not self-serve at all.
+pub async fn list_merchant_webhooks(
+    State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+    Query(q): Query<ListDeliveriesQuery>,
+) -> Result<Json<Value>, AppError> {
+    let status = q.status.as_deref().unwrap_or("failed");
+    if !VALID_DELIVERY_STATUSES.contains(&status) {
+        return Err(AppError::bad_request(
+            "invalid_status",
+            format!(
+                "invalid delivery status '{}'; valid: {}",
+                status,
+                VALID_DELIVERY_STATUSES.join(", ")
+            ),
+        ));
+    }
+
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+    let cursor = match &q.cursor {
+        Some(raw) => Some(
+            decode_cursor(raw)
+                .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?,
+        ),
+        None => None,
+    };
+
+    let deliveries = db::list_deliveries_for_merchant(
+        &state.pool,
+        &merchant_id,
+        status,
+        limit,
+        cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
+    )
+    .await?;
+
+    let next_cursor = if deliveries.len() == limit as usize {
+        deliveries
+            .last()
+            .map(|d| encode_cursor(&d.created_at, &d.id))
+    } else {
+        None
+    };
+
+    Ok(Json(json!({
+        "deliveries": deliveries.iter().map(delivery_to_json).collect::<Vec<_>>(),
+        "status": status,
+        "limit": limit,
+        "next_cursor": next_cursor,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedeliverBulkRequest {
+    /// Specific deliveries to requeue. Omit (or send an empty list) to requeue
+    /// every failed delivery this merchant has.
+    pub delivery_ids: Option<Vec<String>>,
+}
+
+/// Cap on explicitly-listed ids per request, so the generated `IN (...)` stays
+/// a sane size. Requeueing *everything* is unaffected — it needs no id list.
+const MAX_BULK_DELIVERY_IDS: usize = 100;
+
+/// `POST /payments/webhooks/redeliver` — bulk recovery after a merchant has
+/// fixed their endpoint.
+///
+/// This endpoint sends nothing itself. It resets matching failed rows to
+/// `pending` with `attempts = 0` and hands them to the redrive worker, whose
+/// `WEBHOOK_REDRIVE_CONCURRENCY` and exponential backoff already bound the
+/// outbound rate. So requeueing ten thousand deliveries costs one `UPDATE`,
+/// cannot exhaust the redrive budget, and cannot stampede a receiver that has
+/// only just come back up (coordinating with issue #235).
+///
+/// Requeueing also acknowledges: somebody has now acted on these failures, so
+/// they stop being exempt from retention.
+pub async fn redeliver_webhooks_bulk(
+    State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+    OptionalJsonBody(body): OptionalJsonBody<RedeliverBulkRequest>,
+) -> Result<Json<Value>, AppError> {
+    let ids = body.and_then(|b| b.delivery_ids).unwrap_or_default();
+    if ids.len() > MAX_BULK_DELIVERY_IDS {
+        return Err(AppError::bad_request(
+            "too_many_delivery_ids",
+            format!(
+                "at most {MAX_BULK_DELIVERY_IDS} delivery_ids per request; \
+                 omit the field to requeue every failed delivery"
+            ),
+        ));
+    }
+
+    let requeued = db::requeue_failed_deliveries(&state.pool, &merchant_id, &ids).await?;
+    tracing::info!(%merchant_id, requeued, "failed webhook deliveries requeued for redrive");
+
+    Ok(Json(json!({
+        "requeued": requeued,
+        "detail": "requeued deliveries are retried by the background redrive \
+                   worker, subject to its concurrency limit and backoff",
+    })))
+}
+
+/// One delivery as the API exposes it. The stored `payload` is deliberately
+/// omitted — it is the signed event body, it can be large, and a listing is for
+/// triage rather than replay.
+fn delivery_to_json(d: &db::WebhookDelivery) -> Value {
+    json!({
+        "id": d.id,
+        "payment_id": d.payment_id,
+        "url": d.url,
+        "event": d.event(),
+        "status": d.status,
+        "attempts": d.attempts,
+        "last_attempt": d.last_attempt,
+        "acknowledged_at": d.acknowledged_at,
+        "created_at": d.created_at,
+    })
 }
 
 pub async fn redeliver_webhook(
