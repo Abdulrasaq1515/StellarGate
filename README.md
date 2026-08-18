@@ -314,6 +314,16 @@ Intents are expired in bounded batches (`EXPIRY_BATCH_SIZE`) so a large
 backlog drains over several sweeps instead of one long write lock — SQLite has
 a single writer.
 
+A poll cycle that fails no longer retries at the fixed `POLL_INTERVAL_SECS`
+cadence that may have caused it. A `429`/`503` from Horizon backs off for at
+least the `Retry-After` it sends; any other failure, or a rate limit with no
+`Retry-After`, backs off exponentially with jitter (1s up to 120s), reset to
+`POLL_INTERVAL_SECS` by the next successful cycle. Each cycle's catch-up loop
+is also capped at 25 pages (5,000 records), so a backlog built up while
+throttled cannot immediately re-trip the same limit — it drains over
+subsequent cycles instead. See `stellargate_horizon_poll_cycles_total` under
+[Observability](#observability) to track this.
+
 ### Webhooks
 
 | Variable | Description | Default |
@@ -1254,6 +1264,8 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_tasks_expected` | gauge | Workers this deployment expects to be running, excluding any disabled by configuration |
 | `stellargate_tasks_live` | gauge | Expected workers currently running |
 | `stellargate_task_disabled` | gauge | `1` if the named task exited because configuration gave it nothing to do |
+| `stellargate_horizon_poll_cycles_total` | counter | Horizon poll cycles, labelled by `outcome` (`success`, `rate_limited`, `error`) |
+| `stellargate_horizon_last_successful_poll_timestamp_seconds` | gauge | Unix timestamp of the last successful Horizon poll or stream event |
 
 **Alert on `stellargate_tasks_live < stellargate_tasks_expected`.** That
 comparison was not previously possible: `stellargate_tasks_stopped_total` was

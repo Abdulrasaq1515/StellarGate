@@ -93,6 +93,7 @@ async fn server_with_config_and_health(
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
         task_health,
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
