@@ -9,6 +9,7 @@
 //! Expiry is purely time- and database-driven, so the sweeper runs even when no
 //! Stellar gateway is configured (unlike the Horizon poller).
 
+use crate::supervise::TaskExit;
 use crate::{db, webhook, AppState};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +34,7 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
 
 /// Background loop that sweeps expired intents on the configured poll interval
 /// until the process shuts down.
-pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) -> TaskExit {
     let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
     info!(
         ttl_secs = state.config.payment_ttl_secs,
@@ -46,7 +47,7 @@ pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<boo
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("expiry sweeper shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
         match sweep_once(&state).await {

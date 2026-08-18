@@ -10,6 +10,7 @@
 //! This worker prunes both on an interval, in batches so no single statement
 //! holds the write lock long enough to stall payment traffic.
 
+use crate::supervise::TaskExit;
 use crate::{db, AppState};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,15 +25,20 @@ use tracing::{debug, info, warn};
 /// stall.
 const MAX_PER_CYCLE: u64 = 50_000;
 
-pub async fn run_retention_worker(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_retention_worker(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     let interval = Duration::from_secs(state.config.retention_interval_secs.max(1));
 
     if state.config.webhook_delivery_retention_days <= 0
         && state.config.idempotency_retention_days <= 0
     {
-        info!("retention worker disabled (both retention windows are 0)");
-        let _ = shutdown.changed().await;
-        return;
+        /* A legitimate configuration choice, not a fault — and now
+        distinguishable from one (issue #317). */
+        return TaskExit::DisabledByConfig(
+            "both WEBHOOK_DELIVERY_RETENTION_DAYS and IDEMPOTENCY_RETENTION_DAYS are 0",
+        );
     }
 
     info!(
@@ -49,7 +55,7 @@ pub async fn run_retention_worker(state: Arc<AppState>, mut shutdown: watch::Rec
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("retention worker shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
 

@@ -20,6 +20,7 @@
 //! small tolerance window. See the README "Verifying webhooks" section for the
 //! verification recipe and recommended window.
 
+use crate::supervise::TaskExit;
 use crate::{db, AppState};
 // `KeyInit` provides `new_from_slice`; it moved off `Mac` in hmac 0.13.
 use hmac::{Hmac, KeyInit, Mac};
@@ -407,7 +408,10 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
 /// the process shuts down. Runs one pass immediately on startup — before the
 /// first sleep — so a restart repairs any deliveries left `pending`/`failed`
 /// by the previous process without waiting a full interval.
-pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_redrive_worker(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     let interval = Duration::from_secs(state.config.webhook_redrive_interval_secs.max(1));
     info!(
         interval_secs = state.config.webhook_redrive_interval_secs,
@@ -424,7 +428,7 @@ pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Recei
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("webhook redrive worker shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
     }
