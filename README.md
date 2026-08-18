@@ -240,7 +240,7 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet Horizon |
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
-| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. Duplicate codes are refused: Stellar codes are not unique across issuers, and two entries sharing a code used to settle each other's intents (issue #222). | `XLM,USDC:<testnet issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated. Only native XLM may be written as a bare `CODE`. Every other asset is `CODE:ISSUER` (`USDC:GA…`). A typo like `ACCEPTED_ASSETS=XLM,USDC` used to treat native XLM as settling USDC intents; boot now refuses it (issue #221). Duplicate codes are also refused (issue #222). Each issuer is strkey-validated. Adding an asset is config-only — but see [Trustlines](#trustlines). | `XLM,USDC:<testnet issuer>` |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
 
 ### Trustlines
