@@ -26,9 +26,34 @@ fn normalize_ts(raw: &str) -> String {
 pub async fn migrate(pool: &Db) -> Result<()> {
     sqlx::migrate!("./migrations").run(pool).await?;
 
-    // Transition period: backfill processed_transactions for existing deployments.
-    // This preserves the received-amount ledger for in-flight intents.
-    // Once all deployments are on the new schema, this can be removed.
+    // Transition period: Handle columns added after baseline in old system.
+    // These probes can be removed once all deployments have migrated.
+    
+    // asset_issuer column (issue #222)
+    let has_asset_issuer: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'asset_issuer'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_asset_issuer == 0 {
+        sqlx::query("ALTER TABLE payments ADD COLUMN asset_issuer TEXT")
+            .execute(pool)
+            .await?;
+    }
+
+    // acknowledged_at column (issue #319)
+    let has_acknowledged_at: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'acknowledged_at'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_acknowledged_at == 0 {
+        sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN acknowledged_at TEXT")
+            .execute(pool)
+            .await?;
+    }
+
+    // Backfill processed_transactions for existing deployments.
     backfill_processed_transactions(pool).await?;
 
     Ok(())
