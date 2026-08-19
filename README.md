@@ -1345,26 +1345,27 @@ Compose network, so the API cannot be hit over plaintext via the VM's IP.
 
 ## Database Migrations
 
-Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), called once from `main` before the HTTP listener binds. It is hand-written Rust, not a migration runner:
+Schema is managed with **`sqlx::migrate!`**, which runs the SQL files in `migrations/` at startup — exactly once per deployment, recorded in the `_sqlx_migrations` table (issue #268).
 
-- Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
-- New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
-- A few one-time data backfills (populating `processed_transactions` from legacy rows, filling `asset_issuer` from `ACCEPTED_ASSETS`, normalising pre-RFC 3339 timestamps) run alongside them.
+`db::migrate` in [`src/db.rs`](src/db.rs) calls `sqlx::migrate!("./migrations").run(pool)` before the HTTP listener binds. Each file is applied in lexicographic order and never re-run.
 
-Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
+**Migration files**
 
-> [!IMPORTANT]
-> The `migrations/` directory is **not read at runtime.** Nothing in the codebase calls `sqlx::migrate!`, and the SQL in that directory has drifted from the live schema — it is missing `merchants`, `api_keys`, `processed_transactions`, and the `webhook_deliveries.event_type` column. Treat `db::migrate` as the only source of schema truth until this is resolved.
->
-> Tracked in #92 (this documentation), #93 (the two diverging sources), and #268 (adopting a recorded schema version).
+| File | What it adds |
+|---|---|
+| `0001_initial_schema.sql` | `payments`, `webhook_deliveries`, `kv_state`, `idempotency_keys` and their indexes |
+| `0002_add_merchants.sql` | `merchants` table |
+| `0003_add_asset_issuer.sql` | `payments.asset_issuer` column (issue #222) |
+| `0004_add_processed_transactions.sql` | `processed_transactions` table (issue #119) |
+| `0005_add_api_keys.sql` | `api_keys` table, indexes, and legacy-key backfill |
+| `0006_add_webhook_delivery_columns.sql` | `webhook_deliveries.event_type`, `acknowledged_at`, and `idx_webhook_deliveries_payment` (issues #160, #319, #112) |
 
-**Changing the schema**
+**Adding a new migration**
 
-1. Add the statement to `db::migrate` in `src/db.rs`, keeping it idempotent — it will run on every startup of every existing deployment.
-2. For a new column on an existing table, follow the `pragma_table_info` probe pattern already used for `expires_at` and `event_type`. SQLite rejects a non-constant `DEFAULT` on `ALTER TABLE ... ADD COLUMN`, so add the column nullable and backfill it in a second statement.
+1. Create `migrations/NNNN_description.sql` where `NNNN` is the next number in sequence.
+2. Write idempotent SQL when possible (`IF NOT EXISTS`, `INSERT OR IGNORE`).
 3. Run `cargo test` — the suite calls `db::migrate` against an in-memory database, so syntax errors surface immediately.
-
-Because there is no version tracking, a change that is *not* safe to re-run cannot currently be expressed. If you need one, resolve #268 first rather than working around it.
+4. sqlx records the checksum; altering an already-applied file will cause startup to abort.
 
 ---
 

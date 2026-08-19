@@ -23,55 +23,17 @@ fn normalize_ts(raw: &str) -> String {
     s.to_string()
 }
 
-/// `LIKE` pattern every stored timestamp must match: strict RFC 3339 UTC with
-/// a `Z` suffix and no fractional seconds, e.g. `2026-04-29T15:00:00Z`. `_`
-/// matches exactly one character, so this pins the length and the position of
-/// every separator without needing per-digit character classes SQLite's
-/// dialect of `LIKE` cannot express.
-///
-/// Backing every timestamp `CHECK` constraint below (issue #314): every write
-/// path already produces exactly this format via `strftime('%Y-%m-%dT%H:%M:%SZ',
-/// ...)`, so this makes that a guarantee SQLite enforces rather than a
-/// convention a future write path could silently break — which is exactly how
-/// `expires_at` ended up compared as a lexical string against rows in the
-/// legacy `"YYYY-MM-DD HH:MM:SS"` form (no `T`, no `Z`), which sorts *before*
-/// every compliant timestamp and so reads as permanently expired.
-///
-/// Applies only to newly created tables: `CREATE TABLE IF NOT EXISTS` does not
-/// retroactively add a constraint to a table that already exists, so an
-/// upgrade of a running deployment does not gain this guarantee for rows
-/// already on disk — the startup normalisation below is what repairs those.
-const TS_PATTERN: &str = "____-__-__T__:__:__Z";
-
 pub async fn migrate(pool: &Db) -> Result<()> {
-    sqlx::query(&format!(
-        "CREATE TABLE IF NOT EXISTS payments (
-            id TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL DEFAULT 'anonymous',
-            destination_address TEXT NOT NULL,
-            memo TEXT NOT NULL UNIQUE,
-            amount TEXT NOT NULL,
-            asset TEXT NOT NULL DEFAULT 'XLM',
-            asset_issuer TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            webhook_url TEXT,
-            tx_hash TEXT,
-            paid_amount TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}'),
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (updated_at LIKE '{TS_PATTERN}'),
-            expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
-                CHECK (expires_at LIKE '{TS_PATTERN}')
-        )",
-    ))
-    .execute(pool)
-    .await?;
+    // Run all versioned migrations from migrations/*.sql — applied exactly once
+    // per deployment and recorded in _sqlx_migrations (issue #268).
+    sqlx::migrate!("./migrations").run(pool).await?;
 
-    /* Bring pre-existing payment tables up to schema. New databases already have
-    `expires_at` from the CREATE TABLE above; older ones need it added in
-    place. SQLite rejects a non-constant DEFAULT on ALTER ... ADD COLUMN, so we
-    add it nullable and backfill below. */
+    // Transition-period probes for columns that predate sqlx::migrate!.
+    // These ALTER TABLE calls are idempotent no-ops once every deployment has
+    // run the baseline migration; they can be removed in a later cleanup.
+
+    // expires_at (issue #314) — SQLite rejects a non-constant DEFAULT on
+    // ALTER TABLE ADD COLUMN, so add it nullable and backfill below.
     let has_expires_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
     )
@@ -82,9 +44,9 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .execute(pool)
             .await?;
     }
-    /* Backfill any row without an expiry (legacy rows, or rows inserted in the
-    brief window before the column existed). `created_at + 1h` mirrors the
-    default TTL; SQLite's date functions accept the stored RFC 3339 `Z` form. */
+    // Backfill any row without an expiry (legacy rows, or rows inserted in the
+    // brief window before the column existed). `created_at + 1h` mirrors the
+    // default TTL; SQLite's date functions accept the stored RFC 3339 `Z` form.
     sqlx::query(
         "UPDATE payments
             SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour')
@@ -93,9 +55,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
-    /* Pin each intent to the issuer it was priced in. Rows written before this
-    column existed only stored the asset *code*; `backfill_asset_issuers` fills
-    them from the current allow-list after config loads (issue #222). */
+    // asset_issuer (issue #222)
     let has_asset_issuer: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'asset_issuer'",
     )
@@ -107,41 +67,8 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .await?;
     }
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
-        .execute(pool)
-        .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
-        .execute(pool)
-        .await?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(&format!(
-        "CREATE TABLE IF NOT EXISTS webhook_deliveries (
-            id TEXT PRIMARY KEY,
-            payment_id TEXT NOT NULL,
-            url TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            event_type TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            attempts INTEGER NOT NULL DEFAULT 0,
-            last_attempt TEXT CHECK (last_attempt IS NULL OR last_attempt LIKE '{TS_PATTERN}'),
-            acknowledged_at TEXT CHECK (acknowledged_at IS NULL OR acknowledged_at LIKE '{TS_PATTERN}'),
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}')
-        )",
-    ))
-    .execute(pool)
-    .await?;
-
-    /* Bring pre-existing delivery tables up to schema. `event_type` records
-    which event the payload represents so a redelivery can echo the original
-    `X-StellarGate-Event` header instead of guessing. Rows written before this
-    column existed stay NULL; readers fall back to the `event` field inside the
-    stored payload. */
+    // event_type (issue #160) — records which event the payload represents so a
+    // redelivery can reproduce the original X-StellarGate-Event header.
     let has_event_type: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'event_type'",
     )
@@ -153,12 +80,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .await?;
     }
 
-    /* `acknowledged_at` records that somebody has seen a terminal failure and
-    acted on it — set by the bulk requeue/acknowledge endpoint. It exists so
-    retention can distinguish "this failure was dealt with" from "nobody has
-    looked at this yet", and refuse to delete the latter (issue #319). Rows
-    that predate the column are NULL, i.e. unacknowledged, which is the safe
-    reading: we do not know that anyone saw them. */
+    // acknowledged_at (issue #319)
     let has_acknowledged_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'acknowledged_at'",
     )
@@ -170,128 +92,8 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .await?;
     }
 
-    /* Durable key/value state — used by the Horizon poller to persist its
-    paging cursor so it resumes exactly where it left off across restarts. */
-    sqlx::query(&format!(
-        "CREATE TABLE IF NOT EXISTS kv_state (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (updated_at LIKE '{TS_PATTERN}')
-        )",
-    ))
-    .execute(pool)
-    .await?;
-
-    /* Merchants are provisioned via POST /merchants. The raw API key is never
-    stored; only its SHA-256 hex digest is persisted so a DB breach does not
-    expose live credentials. */
-    sqlx::query(&format!(
-        "CREATE TABLE IF NOT EXISTS merchants (
-            id TEXT PRIMARY KEY,
-            api_key_hash TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}')
-        )",
-    ))
-    .execute(pool)
-    .await?;
-
-    /* API keys, one row per credential rather than one per merchant, so a key
-    can be rotated (issue a second, revoke the first) and revoked individually
-    without disturbing the merchant record.
-
-    Only the SHA-256 digest is stored; `prefix` keeps the first few characters
-    of the raw key so an operator can tell two keys apart in a list without the
-    secret being recoverable. `revoked_at` is a tombstone rather than a delete
-    so an audit trail survives revocation. */
-    sqlx::query(&format!(
-        "CREATE TABLE IF NOT EXISTS api_keys (
-            id TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL,
-            key_hash TEXT NOT NULL UNIQUE,
-            prefix TEXT NOT NULL,
-            label TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}'),
-            last_used_at TEXT CHECK (last_used_at IS NULL OR last_used_at LIKE '{TS_PATTERN}'),
-            revoked_at TEXT CHECK (revoked_at IS NULL OR revoked_at LIKE '{TS_PATTERN}')
-        )",
-    ))
-    .execute(pool)
-    .await?;
-
-    /* Authentication looks a key up by hash on every request, so this index is
-    load-bearing rather than an optimisation. */
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
-        .execute(pool)
-        .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_merchant ON api_keys(merchant_id)")
-        .execute(pool)
-        .await?;
-
-    /* Carry pre-existing single-key merchants across. Their raw key is not
-    recoverable, but the hash is all authentication needs, so keys issued
-    before this table existed keep working. The prefix is unknown for those
-    rows — mark them rather than inventing one. */
-    sqlx::query(
-        "INSERT OR IGNORE INTO api_keys (id, merchant_id, key_hash, prefix, label, created_at)
-         SELECT lower(hex(randomblob(16))), id, api_key_hash, 'legacy', 'migrated', created_at
-           FROM merchants
-          WHERE api_key_hash IS NOT NULL AND api_key_hash <> ''",
-    )
-    .execute(pool)
-    .await?;
-
-    /* `webhook_deliveries` is queried by payment_id on every delivery listing
-    and by the redrive worker; without this it is a full scan (issue #112). */
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment
-         ON webhook_deliveries(payment_id)",
-    )
-    .execute(pool)
-    .await?;
-
-    /* Idempotency keys for payment creation. A key is unique per merchant and
-    maps to the payment id minted for the first request that used it, so a
-    client retrying after a network blip gets the original payment back
-    instead of a duplicate intent. */
-    sqlx::query(&format!(
-        "CREATE TABLE IF NOT EXISTS idempotency_keys (
-            merchant_id TEXT NOT NULL,
-            idempotency_key TEXT NOT NULL,
-            payment_id TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}'),
-            PRIMARY KEY (merchant_id, idempotency_key)
-        )",
-    ))
-    .execute(pool)
-    .await?;
-
-    /* Every on-chain transaction we credit to an intent, one row per
-    (payment_id, tx_hash). The cumulative received amount for an intent is the
-    SUM of `amount_stroops` over its rows, so re-seeing a transaction (on a
-    later poll cycle, over the stream, or from a concurrent reconciler) is an
-    idempotent no-op instead of a double-credit. `amount_stroops` is the
-    integer stroop value so SUM is exact. */
-    sqlx::query(&format!(
-        "CREATE TABLE IF NOT EXISTS processed_transactions (
-            payment_id TEXT NOT NULL,
-            tx_hash TEXT NOT NULL,
-            amount_stroops INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-                CHECK (created_at LIKE '{TS_PATTERN}'),
-            PRIMARY KEY (payment_id, tx_hash)
-        )",
-    ))
-    .execute(pool)
-    .await?;
-
-    /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
-    and a cumulative `paid_amount`, so upgrading preserves the received-amount
-    ledger for intents that are still in flight. Idempotent via ON CONFLICT, so
-    it is safe to run on every startup. */
+    // Backfill processed_transactions from legacy payments that stored only the
+    // most-recent tx_hash + cumulative paid_amount. Idempotent via ON CONFLICT.
     let legacy = sqlx::query(
         "SELECT id, tx_hash, paid_amount FROM payments
          WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
@@ -316,32 +118,22 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         }
     }
 
-    /* Normalise legacy rows that were written by the old datetime('now') default,
-    which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
-    startup — the WHERE clause skips rows that are already RFC 3339.
-
-    `expires_at` is included for the same reason as the others (issue #314):
-    left in the legacy space-separated form, it sorts *before* every compliant
-    "…T…Z" timestamp — 'T' (0x54) > ' ' (0x20) — so `expires_at > strftime(...)`
-    in list_pending/expire_overdue/find_pending_by_memo reads such a row as
-    already expired. It would never surface as a detectable payment again and
-    would be swept on the very next expiry cycle. */
-    for tbl_col in [
+    // Normalise legacy timestamps (issue #314). Runs on every startup; the
+    // WHERE clause makes each UPDATE a no-op for rows already in RFC 3339.
+    for (table, col) in [
         ("payments", "created_at"),
         ("payments", "updated_at"),
         ("payments", "expires_at"),
         ("webhook_deliveries", "created_at"),
+        ("webhook_deliveries", "last_attempt"),
     ] {
         let sql = format!(
-            "UPDATE {} SET {col} = replace({col}, ' ', 'T') || 'Z' WHERE {col} NOT LIKE '%T%'",
-            tbl_col.0,
-            col = tbl_col.1
+            "UPDATE {table} SET {col} = Replace({col}, ' ', 'T') || 'Z' WHERE {col} NOT LIKE '%T%'"
         );
         sqlx::query(&sql).execute(pool).await?;
     }
 
     Ok(())
-}
 
 /// Fill `asset_issuer` on rows that only stored a code, using the current
 /// allow-list. Duplicate codes are rejected at boot, so each code maps to at
