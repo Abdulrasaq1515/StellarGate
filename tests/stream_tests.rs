@@ -340,6 +340,11 @@ async fn open_greeting_and_keep_alive_are_ignored() {
 /// After a dropped connection the listener reconnects, and the reconnect
 /// request carries the last-seen cursor (the `id:` from the final received
 /// event) in the `cursor` query parameter.
+///
+/// Timing note: `run_stream_listener` resets its backoff to `base_backoff`
+/// (1 second) when the cursor advances. We therefore need to wait at least
+/// 1 second after the first stream closes before the reconnect fires.
+/// We wait 2 seconds to give CI headroom, then shut down.
 #[tokio::test]
 async fn dropped_connection_reconnects_with_last_seen_cursor() {
     let server = MockServer::start().await;
@@ -347,12 +352,11 @@ async fn dropped_connection_reconnects_with_last_seen_cursor() {
     // First connection: one event with id=CURSOR_42, then the server closes.
     let first_body = sse_body(&[("", "CURSOR_42", &payment_json())]);
 
-    // Second connection (reconnect): empty stream so the test doesn't need a
-    // second intent; just enough to verify the cursor was sent.
-    let second_body = String::new();
+    // Second connection (reconnect): keep-alive so the connection stays open
+    // until we send the shutdown signal.
+    let second_body = sse_body(&[("", "", ": keep-alive")]);
 
-    // First request: no cursor query param (initial "now" cursor is passed
-    // as cursor=now, so match that).
+    // First request — initial cursor is "now".
     Mock::given(method("GET"))
         .and(path("/accounts/GDESTINATION/payments"))
         .and(query_param("cursor", "now"))
@@ -365,7 +369,7 @@ async fn dropped_connection_reconnects_with_last_seen_cursor() {
         .mount(&server)
         .await;
 
-    // Second request: cursor must be the last event id from the first connection.
+    // Second request — cursor must be the last event id from the first stream.
     Mock::given(method("GET"))
         .and(path("/accounts/GDESTINATION/payments"))
         .and(query_param("cursor", "CURSOR_42"))
@@ -385,15 +389,19 @@ async fn dropped_connection_reconnects_with_last_seen_cursor() {
     let state_clone = state.clone();
     let handle = tokio::spawn(async move { horizon::run_stream_listener(state_clone, rx).await });
 
-    // Allow enough time for: first stream → close → reconnect → second stream.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Wait long enough for:
+    //   - first stream to be read and closed (~instant)
+    //   - base_backoff of 1s to elapse (cursor advanced, so backoff resets to 1s)
+    //   - reconnect request to be made
+    // 2 seconds gives CI comfortable headroom beyond the 1s backoff.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     tx.send(true).unwrap();
 
     let _ = tokio::time::timeout(Duration::from_secs(3), handle)
         .await
         .expect("listener must shut down promptly");
 
-    // Verify wiremock recorded the reconnect with the cursor.
+    // Verify wiremock recorded the reconnect with the updated cursor.
     let requests = server.received_requests().await.unwrap();
     let reconnect = requests.iter().any(|r| {
         r.url
