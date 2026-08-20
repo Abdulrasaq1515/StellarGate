@@ -12,9 +12,12 @@ CREATE TABLE IF NOT EXISTS payments (
     webhook_url TEXT,
     tx_hash TEXT,
     paid_amount TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        CHECK (created_at LIKE '____-__-__T%:__:__Z'),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        CHECK (updated_at LIKE '____-__-__T%:__:__Z'),
     expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
+        CHECK (expires_at LIKE '____-__-__T%:__:__Z')
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo);
@@ -29,8 +32,9 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     event_type TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     attempts INTEGER NOT NULL DEFAULT 0,
-    last_attempt TEXT,
+    last_attempt TEXT CHECK (last_attempt IS NULL OR last_attempt LIKE '____-__-__T%:__:__Z'),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        CHECK (created_at LIKE '____-__-__T%:__:__Z')
 );
 
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment ON webhook_deliveries(payment_id);
@@ -39,12 +43,14 @@ CREATE TABLE IF NOT EXISTS kv_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        CHECK (updated_at LIKE '____-__-__T%:__:__Z')
 );
 
 CREATE TABLE IF NOT EXISTS merchants (
     id TEXT PRIMARY KEY,
     api_key_hash TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        CHECK (created_at LIKE '____-__-__T%:__:__Z')
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -53,9 +59,10 @@ CREATE TABLE IF NOT EXISTS api_keys (
     key_hash TEXT NOT NULL UNIQUE,
     prefix TEXT NOT NULL,
     label TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-    last_used_at TEXT,
-    revoked_at TEXT
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        CHECK (created_at LIKE '____-__-__T%:__:__Z'),
+    last_used_at TEXT CHECK (last_used_at IS NULL OR last_used_at LIKE '____-__-__T%:__:__Z'),
+    revoked_at TEXT CHECK (revoked_at IS NULL OR revoked_at LIKE '____-__-__T%:__:__Z')
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
@@ -65,7 +72,8 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     merchant_id TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     payment_id TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        CHECK (created_at LIKE '____-__-__T%:__:__Z'),
     PRIMARY KEY (merchant_id, idempotency_key)
 );
 
@@ -73,6 +81,7 @@ CREATE TABLE IF NOT EXISTS processed_transactions (
     payment_id TEXT NOT NULL,
     tx_hash TEXT NOT NULL,
     amount_stroops INTEGER NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        CHECK (created_at LIKE '____-__-__T%:__:__Z'),
     PRIMARY KEY (payment_id, tx_hash)
 );

@@ -23,32 +23,31 @@ fn normalize_ts(raw: &str) -> String {
     s.to_string()
 }
 
-/// `LIKE` pattern every stored timestamp must match: strict RFC 3339 UTC with
-/// a `Z` suffix and no fractional seconds, e.g. `2026-04-29T15:00:00Z`. `_`
-/// matches exactly one character, so this pins the length and the position of
-/// every separator without needing per-digit character classes SQLite's
-/// dialect of `LIKE` cannot express.
-///
-/// Backing every timestamp `CHECK` constraint below (issue #314): every write
-/// path already produces exactly this format via `strftime('%Y-%m-%dT%H:%M:%SZ',
-/// ...)`, so this makes that a guarantee SQLite enforces rather than a
-/// convention a future write path could silently break — which is exactly how
-/// `expires_at` ended up compared as a lexical string against rows in the
-/// legacy `"YYYY-MM-DD HH:MM:SS"` form (no `T`, no `Z`), which sorts *before*
-/// every compliant timestamp and so reads as permanently expired.
-///
-/// Applies only to newly created tables: `CREATE TABLE IF NOT EXISTS` does not
-/// retroactively add a constraint to a table that already exists, so an
-/// upgrade of a running deployment does not gain this guarantee for rows
-/// already on disk — the startup normalisation below is what repairs those.
-const TS_PATTERN: &str = "____-__-__T__:__:__Z";
-
 pub async fn migrate(pool: &Db) -> Result<()> {
     // Run all versioned migrations from migrations/*.sql
     sqlx::migrate!("./migrations").run(pool).await?;
 
-    // Transition period: columns added before sqlx::migrate! was adopted.
-    // These probes can be removed once all deployments have run the migrations.
+    // Transition-period probes for columns that predate sqlx::migrate!.
+    // These ALTER TABLE calls are idempotent no-ops once every deployment has
+    // run the baseline migration; they can be removed in a later cleanup.
+
+    // expires_at — SQLite rejects a non-constant DEFAULT on ALTER TABLE, so
+    // add it nullable and backfill below.
+    let has_expires_at: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_expires_at == 0 {
+        sqlx::query("ALTER TABLE payments ADD COLUMN expires_at TEXT")
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE payments SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour') WHERE expires_at IS NULL",
+    )
+    .execute(pool)
+    .await?;
 
     // asset_issuer column (issue #222) — included in baseline migration but
     // may be absent on databases created before this was added.
@@ -59,6 +58,19 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .await?;
     if has_asset_issuer == 0 {
         sqlx::query("ALTER TABLE payments ADD COLUMN asset_issuer TEXT")
+            .execute(pool)
+            .await?;
+    }
+
+    // event_type column on webhook_deliveries — included in baseline migration
+    // but may be absent on databases created before this was added.
+    let has_event_type: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'event_type'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_event_type == 0 {
+        sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
             .execute(pool)
             .await?;
     }
@@ -100,6 +112,22 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .execute(pool)
             .await?;
         }
+    }
+
+    // Normalise legacy timestamps (issue #314). Runs on every startup; the
+    // WHERE clause makes each UPDATE a no-op for rows already in RFC 3339.
+    for (table, col) in [
+        ("payments", "created_at"),
+        ("payments", "updated_at"),
+        ("payments", "expires_at"),
+        ("webhook_deliveries", "created_at"),
+        ("webhook_deliveries", "last_attempt"),
+        ("webhook_deliveries", "acknowledged_at"),
+    ] {
+        let sql = format!(
+            "UPDATE {table} SET {col} = Replace({col}, ' ', 'T') || 'Z' WHERE {col} NOT LIKE '%T%'"
+        );
+        sqlx::query(&sql).execute(pool).await?;
     }
 
     Ok(())
